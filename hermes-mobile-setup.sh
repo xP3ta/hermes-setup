@@ -67,7 +67,10 @@ fi
 curl -fsSL "$REPO_RAW/hermes_bridge.py" -o "$HH/hermes_bridge.py"
 printf 'BRIDGE_HOST=0.0.0.0\nBRIDGE_PORT=9131\nBRIDGE_SCOPES=read,memory,soul,skills,cron,config,command\nBRIDGE_READ_ONLY=false\nBRIDGE_TOKEN=%s\n' "$KEY" > "$HH/bridge.env"
 printf '[Unit]\nDescription=Hermes Mobile Bridge\nAfter=network.target\n[Service]\nEnvironmentFile=%s/bridge.env\nExecStart=%s %s/hermes_bridge.py --i-know-what-im-doing\nWorkingDirectory=%s\nRestart=on-failure\n[Install]\nWantedBy=default.target\n' "$HH" "$VP" "$HH" "$HH" > "$HOME/.config/systemd/user/hermes-bridge.service"
-systemctl --user daemon-reload; systemctl --user enable --now hermes-bridge; sleep 3
+# enable + restart (NO `enable --now`): --now no reinicia un servicio YA
+# activo, y este script tambien es el camino de ACTUALIZACION del bridge —
+# sin restart, el proceso viejo seguia sirviendo la version anterior.
+systemctl --user daemon-reload; systemctl --user enable hermes-bridge >/dev/null 2>&1; systemctl --user restart hermes-bridge; sleep 3
 systemctl --user is-active hermes-bridge >/dev/null && echo "Bridge 9131 OK" || echo "AVISO bridge"
 
 # 5) dashboard: fijar clave inicial via bridge para que bindee (la app la rota)
