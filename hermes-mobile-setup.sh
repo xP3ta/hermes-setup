@@ -21,13 +21,20 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 loginctl enable-linger "$(id -un)" 2>/dev/null || true
 i=0; while [ $i -lt 10 ]; do [ -S "$XDG_RUNTIME_DIR/bus" ] && break; sleep 1; i=$((i+1)); done
 
-# 0) Hermes si falta (sin asistente, sin navegador)
+# 0) Hermes si falta (sin asistente, sin navegador). No basta que exista un
+#    `hermes` en el PATH: puede ser un lanzador ROTO de una desinstalacion a
+#    medias (visto en la practica: ~/.local/bin/hermes apuntando a un venv
+#    borrado → gateway y bridge en crash-loop con un "OK" falso). Solo cuenta
+#    un hermes que RESPONDA; si no, se instala.
 HB="$HH/hermes-agent/venv/bin/hermes"
-if [ ! -x "$HB" ] && ! command -v hermes >/dev/null 2>&1; then
-  echo "Instalando Hermes Agent..."
-  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup --non-interactive --skip-browser
+if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
+  HB="$(command -v hermes 2>/dev/null || true)"
+  if [ -z "$HB" ] || ! "$HB" --version >/dev/null 2>&1; then
+    echo "Instalando Hermes Agent..."
+    curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup --non-interactive --skip-browser
+    HB="$HH/hermes-agent/venv/bin/hermes"
+  fi
 fi
-[ -x "$HB" ] || HB="$(command -v hermes 2>/dev/null || echo hermes)"
 
 # 1) token
 KEY="$(grep -E '^API_SERVER_KEY=' "$HH/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')"
@@ -48,13 +55,26 @@ if [ -z "$HOST" ]; then
   if [ -n "$HOST" ]; then PUBLIC=1; else HOST="127.0.0.1"; fi
 fi
 
-VP="$HH/hermes-agent/venv/bin/python3"; [ -x "$VP" ] || VP="$(command -v python3)"
+# Python para el bridge: el del venv del usuario o, si Hermes vive en otra
+# ruta (instalacion global), el python que acompanya a ESE hermes — el bridge
+# necesita aiohttp y el python del sistema no suele tenerlo.
+VP="$HH/hermes-agent/venv/bin/python3"
+[ -x "$VP" ] || VP="$(dirname "$(readlink -f "$HB")")/python3"
+[ -x "$VP" ] || VP="$(command -v python3)"
+"$VP" -c 'import aiohttp' 2>/dev/null || echo "AVISO: $VP no tiene aiohttp; el bridge puede no arrancar"
 mkdir -p "$HOME/.config/systemd/user"
 
 # 3) gateway 8642
 if ! (ss -tlnH 2>/dev/null | grep -q ':8642 '); then
   printf '[Unit]\nDescription=Hermes Gateway API\nAfter=network.target\n[Service]\nEnvironment=API_SERVER_HOST=0.0.0.0\nEnvironment=API_SERVER_PORT=8642\nExecStart=%s gateway run\nWorkingDirectory=%s\nRestart=on-failure\n[Install]\nWantedBy=default.target\n' "$HB" "$HH" > "$HOME/.config/systemd/user/hermes-gateway.service"
-  systemctl --user daemon-reload; systemctl --user enable --now hermes-gateway && sleep 4 && echo "Gateway 8642 OK" || echo "AVISO gateway"
+  # is-active tras la espera: `enable --now` devuelve 0 aunque el proceso
+  # muera al segundo (lanzador roto, venv incompleto) — daba un OK falso.
+  systemctl --user daemon-reload; systemctl --user enable --now hermes-gateway; sleep 4
+  if systemctl --user is-active hermes-gateway >/dev/null 2>&1; then
+    echo "Gateway 8642 OK"
+  else
+    echo "AVISO gateway: no arranco. Mira: journalctl --user -u hermes-gateway -n 20"
+  fi
 fi
 
 # 3b) dashboard 9119 (solo crear; se arranca al fijarle la clave via bridge)
