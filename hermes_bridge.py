@@ -29,7 +29,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 HERMES_HOME = Path(os.environ.get("BRIDGE_HERMES_HOME",
                                   Path.home() / ".hermes")).resolve()
 BACKUP_DIR = HERMES_HOME / "backups" / "bridge"
@@ -2256,15 +2256,23 @@ async def skills_find(request):
 # Construye el catálogo de modelos con la MISMA función que usa el Dashboard
 # (`/api/model/options`), así la app recibe idéntica forma. El sentinela acota el
 # JSON por si el import escribe warnings a stdout.
+#
+# picker_hints=True: cada fila trae el `authenticated`/`auth_type`/`key_env`/
+# `warning` REALES que calcula Hermes. Antes se estampaba authenticated=True a
+# todo, y la app enseñaba como "configurados" proveedores que Hermes solo
+# DESCUBRIÓ en la máquina (OAuth de Claude Code, `gh` logueado → anthropic y
+# github fantasma en un servidor recién instalado; spec 028).
+#
+# probe_custom_providers=False: recomendación del propio upstream para pickers
+# GUI — sin esto cada petición sondea por red los endpoints custom y la
+# primera carga en frío superaba el timeout de la app.
+_MODEL_OPTIONS_CACHE = None  # (monotonic_ts, payload) — ver model_options().
+
 _MODEL_OPTIONS_SNIPPET = (
     "import json,sys\n"
     "from hermes_cli.inventory import build_models_payload, load_picker_context\n"
-    "d = build_models_payload(load_picker_context())\n"
-    "provs = d.get('providers')\n"
-    "items = provs.values() if isinstance(provs, dict) else (provs or [])\n"
-    "for p in items:\n"
-    "    if isinstance(p, dict):\n"
-    "        p.setdefault('authenticated', True)\n"
+    "d = build_models_payload(load_picker_context(), picker_hints=True,\n"
+    "                         probe_custom_providers=False)\n"
     "sys.stdout.write('@@JSON@@')\n"
     "json.dump(d, sys.stdout)\n"
 )
@@ -2278,6 +2286,13 @@ async def model_options(request):
     sin depender del login del Dashboard. Scope: read."""
     if (e := _check_auth(request, "read")):
         return e
+    # Cache en memoria con TTL corto: construir el catalogo lanza un
+    # interprete Python frio que importa todo hermes_cli (varios segundos);
+    # sin cache, cada visita a la pantalla de modelos pagaba ese arranque.
+    global _MODEL_OPTIONS_CACHE
+    cached = _MODEL_OPTIONS_CACHE
+    if cached and (time.monotonic() - cached[0]) < 60.0:
+        return web.json_response(cached[1])
     rc, out = await _run([_VENV_PY, "-c", _MODEL_OPTIONS_SNIPPET], timeout=90)
     raw = out or ""
     i = raw.rfind("@@JSON@@")
@@ -2292,9 +2307,10 @@ async def model_options(request):
     except Exception as ex:
         return _err("model_options_parse",
                     f"Catálogo de modelos no parseable: {ex}", 500)
-    if isinstance(data, dict):
-        return web.json_response({"ok": True, **data})
-    return web.json_response({"ok": True, "providers": data})
+    body = {"ok": True, **data} if isinstance(data, dict) else {
+        "ok": True, "providers": data}
+    _MODEL_OPTIONS_CACHE = (time.monotonic(), body)
+    return web.json_response(body)
 
 
 _DASH_CREDS_GET_SNIPPET = (
