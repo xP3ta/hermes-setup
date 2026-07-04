@@ -33,10 +33,20 @@ fi
 KEY="$(grep -E '^API_SERVER_KEY=' "$HH/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')"
 [ -n "$KEY" ] || { KEY="$(openssl rand -hex 32)"; printf 'API_SERVER_KEY=%s\n' "$KEY" >> "$HH/.env"; }
 
-# 2) host alcanzable
+# 2) host alcanzable, por orden de preferencia:
+#    mesh (Tailscale via CLI; NetBird/Tailscale/etc. via rango CGNAT
+#    100.64.0.0/10) > LAN privada (RFC1918, cubre ZeroTier y VPN clasicas) >
+#    IP publica directa (VPS pelado — funciona, pero se avisa de la
+#    exposicion) > loopback (ultimo recurso, solo util en el propio equipo).
+IPS="$(ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^127\.')"
 HOST="$(tailscale ip -4 2>/dev/null | head -1)"
-[ -n "$HOST" ] || HOST="$(ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -E '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' | grep -v '^127\.' | head -1)"
-[ -n "$HOST" ] || HOST="127.0.0.1"
+[ -n "$HOST" ] || HOST="$(echo "$IPS" | grep -E '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' | head -1)"
+[ -n "$HOST" ] || HOST="$(echo "$IPS" | grep -E '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' | head -1)"
+PUBLIC=""
+if [ -z "$HOST" ]; then
+  HOST="$(echo "$IPS" | head -1)"
+  if [ -n "$HOST" ]; then PUBLIC=1; else HOST="127.0.0.1"; fi
+fi
 
 VP="$HH/hermes-agent/venv/bin/python3"; [ -x "$VP" ] || VP="$(command -v python3)"
 mkdir -p "$HOME/.config/systemd/user"
@@ -78,3 +88,14 @@ else
   "$UV" run --with qrcode python -c "import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)" "$LINK" 2>/dev/null || echo "(instala qrencode para ver el QR)"
 fi
 echo ""; echo "Enlace: $LINK"
+if [ -n "$PUBLIC" ]; then
+  echo ""
+  echo "ATENCION: no hay red privada (VPN mesh o LAN); el enlace usa la IP publica $HOST."
+  echo "Gateway (8642), dashboard (9119) y bridge (9131) quedan expuestos a internet,"
+  echo "protegidos solo por el token. Recomendado: Tailscale/NetBird o un firewall que"
+  echo "limite esos puertos a tus dispositivos."
+fi
+if [ "$HOST" = "127.0.0.1" ]; then
+  echo ""
+  echo "ATENCION: no se encontro ninguna IP de red; el enlace solo funciona desde este equipo."
+fi
