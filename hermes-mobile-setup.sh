@@ -104,13 +104,27 @@ ss -tlnH 2>/dev/null | grep -q ':9119 ' && DASH="&dashboard=http://$HOST:9119"
 # 6) QR + link
 LINK="hermes://pair?host=$HOST&port=8642&token=$KEY$DASH"
 echo ""; echo "== SCAN THIS QR WITH THE APP (or copy the link) =="; echo ""
+# QR renderers, most to least likely: qrencode > uv (ephemeral qrcode) >
+# hermes venv python (installing the tiny pure-python `qrcode` if missing) >
+# plain link only. The QR must show even on servers without qrencode.
+QRPY="import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)"
 if command -v qrencode >/dev/null 2>&1; then
   qrencode -t ANSIUTF8 "$LINK"
 else
   UV="$HH/bin/uv"; [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || echo uv)"
-  "$UV" run --with qrcode python -c "import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)" "$LINK" 2>/dev/null || echo "(install qrencode to see the QR)"
+  if ! "$UV" run --with qrcode python -c "$QRPY" "$LINK" 2>/dev/null; then
+    if [ -x "$VP" ]; then
+      "$VP" -c "import qrcode" 2>/dev/null || "$VP" -m pip install -q qrcode >/dev/null 2>&1 || true
+      "$VP" -c "$QRPY" "$LINK" 2>/dev/null || echo "(no QR renderer available — copy the link below)"
+    else
+      echo "(no QR renderer available — copy the link below)"
+    fi
+  fi
 fi
 echo ""; echo "Link: $LINK"
+echo ""
+echo "To show this QR again later (no reinstall):"
+echo "  curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-pair.sh | sh"
 if [ -n "$PUBLIC" ]; then
   echo ""
   echo "CAUTION: no private network found (mesh VPN or LAN); the link uses the public IP $HOST."
