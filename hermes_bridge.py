@@ -29,7 +29,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 HERMES_HOME = Path(os.environ.get("BRIDGE_HERMES_HOME",
                                   Path.home() / ".hermes")).resolve()
 BACKUP_DIR = HERMES_HOME / "backups" / "bridge"
@@ -2268,11 +2268,26 @@ async def skills_find(request):
 # primera carga en frío superaba el timeout de la app.
 _MODEL_OPTIONS_CACHE = None  # (monotonic_ts, payload) — ver model_options().
 
+# Degradacion por version del servidor: los kwargs nuevos no existen en
+# Hermes viejos (TypeError). En el modo mas viejo (sin picker_hints) no llega
+# `authenticated` real: se restaura el comportamiento pre-1.11 (todo
+# autenticado) para no esconder proveedores configurados en esos servidores.
 _MODEL_OPTIONS_SNIPPET = (
     "import json,sys\n"
     "from hermes_cli.inventory import build_models_payload, load_picker_context\n"
-    "d = build_models_payload(load_picker_context(), picker_hints=True,\n"
-    "                         probe_custom_providers=False)\n"
+    "ctx = load_picker_context()\n"
+    "try:\n"
+    "    d = build_models_payload(ctx, picker_hints=True, probe_custom_providers=False)\n"
+    "except TypeError:\n"
+    "    try:\n"
+    "        d = build_models_payload(ctx, picker_hints=True)\n"
+    "    except TypeError:\n"
+    "        d = build_models_payload(ctx)\n"
+    "        provs = d.get('providers')\n"
+    "        items = provs.values() if isinstance(provs, dict) else (provs or [])\n"
+    "        for p in items:\n"
+    "            if isinstance(p, dict):\n"
+    "                p.setdefault('authenticated', True)\n"
     "sys.stdout.write('@@JSON@@')\n"
     "json.dump(d, sys.stdout)\n"
 )
