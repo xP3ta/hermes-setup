@@ -29,7 +29,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.11.4"
+VERSION = "1.12.0"
 HERMES_HOME = Path(os.environ.get("BRIDGE_HERMES_HOME",
                                   Path.home() / ".hermes")).resolve()
 BACKUP_DIR = HERMES_HOME / "backups" / "bridge"
@@ -2214,6 +2214,62 @@ async def model_get(request):
     })
 
 
+# Imágenes generadas por el agente (toolset image_gen): el agente las guarda
+# en este directorio y responde citando la ruta; la app las descarga por aquí.
+IMAGES_DIR = (HERMES_HOME / "cache" / "images").resolve()
+_IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_IMAGE_EXT_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+_IMAGE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+async def image_get(request):
+    """Sirve UNA imagen generada por el agente (spec 030), solo lectura.
+
+    GET /bridge/image?name=<basename>. Endurecido a propósito: `name` es solo
+    un basename (sin separadores ni `..`), se re-resuelve canónico bajo
+    IMAGES_DIR (symlinks incluidos), extensión en allowlist y tope de 20 MB.
+    Todos los fallos de validación devuelven EL MISMO error genérico: que un
+    atacante no distinga "no existe" de "fuera del directorio".
+    """
+    if (e := _check_auth(request, "read")):
+        return e
+
+    def _denied():
+        return _err("not_found", "No disponible", 404)
+
+    name = (request.query.get("name", "") or "").strip()
+    if (not name or "/" in name or "\\" in name or ".." in name
+            or not _IMAGE_NAME_RE.match(name)):
+        return _denied()
+    ctype = _IMAGE_EXT_TYPES.get(Path(name).suffix.lower())
+    if ctype is None:
+        return _denied()
+    try:
+        target = (IMAGES_DIR / name).resolve()
+    except OSError:
+        return _denied()
+    if not str(target).startswith(str(IMAGES_DIR) + os.sep):
+        return _denied()
+    if not target.is_file():
+        return _denied()
+    try:
+        size = target.stat().st_size
+    except OSError:
+        return _denied()
+    if size > _IMAGE_MAX_BYTES:
+        return _denied()
+    try:
+        data = target.read_bytes()
+    except OSError:
+        return _denied()
+    return web.Response(body=data, content_type=ctype)
+
+
 async def skills_find(request):
     """Busca skills en el registro de Hermes proxyando `skills search` (sin shell).
 
@@ -2550,6 +2606,7 @@ def build_app():
     app.router.add_post("/bridge/model/set", model_set)
     app.router.add_get("/bridge/model/get", model_get)
     app.router.add_get("/bridge/model/options", model_options)
+    app.router.add_get("/bridge/image", image_get)
     app.router.add_get("/bridge/dashboard/credentials", dashboard_credentials)
     app.router.add_post("/bridge/dashboard/credentials", dashboard_credentials)
     app.router.add_get("/bridge/diag/local", diag_local)
