@@ -29,7 +29,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 HERMES_HOME = Path(os.environ.get("BRIDGE_HERMES_HOME",
                                   Path.home() / ".hermes")).resolve()
 BACKUP_DIR = HERMES_HOME / "backups" / "bridge"
@@ -2277,10 +2277,11 @@ _MODEL_OPTIONS_SNIPPET = (
     "from hermes_cli.inventory import build_models_payload, load_picker_context\n"
     "ctx = load_picker_context()\n"
     "try:\n"
-    "    d = build_models_payload(ctx, picker_hints=True, probe_custom_providers=False)\n"
+    "    d = build_models_payload(ctx, picker_hints=True, include_unconfigured=True,\n"
+    "                             probe_custom_providers=False)\n"
     "except TypeError:\n"
     "    try:\n"
-    "        d = build_models_payload(ctx, picker_hints=True)\n"
+    "        d = build_models_payload(ctx, picker_hints=True, include_unconfigured=True)\n"
     "    except TypeError:\n"
     "        d = build_models_payload(ctx)\n"
     "        provs = d.get('providers')\n"
