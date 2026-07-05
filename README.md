@@ -28,11 +28,24 @@ Everything is **idempotent**: anything already installed and running is left unt
 - No telemetry, no third-party services. The only credential involved is your own server's token.
 - The script is short, plain POSIX `sh`, and meant to be read before you run it: [`hermes-mobile-setup.sh`](hermes-mobile-setup.sh).
 
+## Show the pairing QR again
+
+Already installed and just need to pair another phone (or re-pair)? This
+prints the QR + link again without installing or restarting anything:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-pair.sh | sh
+```
+
+It warns you if the gateway or the bridge aren't running, and renders the QR
+even without `qrencode` installed.
+
 ## Contents
 
 | File | What it is |
 |---|---|
 | `hermes-mobile-setup.sh` | The installer (readable top to bottom) |
+| `hermes-pair.sh` | Prints the pairing QR/link on demand (no reinstall) |
 | `hermes_bridge.py` | The Mobile Bridge the installer deploys to `~/.hermes/` |
 
 ## Maintenance
