@@ -29,7 +29,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.11.3"
+VERSION = "1.11.4"
 HERMES_HOME = Path(os.environ.get("BRIDGE_HERMES_HOME",
                                   Path.home() / ".hermes")).resolve()
 BACKUP_DIR = HERMES_HOME / "backups" / "bridge"
@@ -2183,6 +2183,12 @@ async def model_set(request):
 
     _audit("model_set", {"provider": provider, "model": model}, "ok",
            {"changed": changed, "backup_id": backup_id})
+    # Invalida el catálogo cacheado: sin esto, model_options() sigue sirviendo
+    # hasta 60s el proveedor/modelo VIEJO justo después de fijar uno nuevo, y la
+    # app (que recarga el catálogo tras aplicar) muestra el cambio como si no
+    # hubiera surtido efecto.
+    global _MODEL_OPTIONS_CACHE
+    _MODEL_OPTIONS_CACHE = None
     return web.json_response({
         "ok": True, "provider": provider, "model": model, "base_url": base_url,
         "changed": changed,
