@@ -29,7 +29,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.11.2"
+VERSION = "1.11.3"
 HERMES_HOME = Path(os.environ.get("BRIDGE_HERMES_HOME",
                                   Path.home() / ".hermes")).resolve()
 BACKUP_DIR = HERMES_HOME / "backups" / "bridge"
@@ -384,7 +384,7 @@ async def rollback(request):
     return web.json_response({"ok": True, "restored": str(path)})
 
 
-async def _run(args, timeout=120, stdin_text=None, env=None):
+async def _run(args, timeout=120, stdin_text=None, env=None, max_out=8000):
     if env is None:
         # Las invocaciones del venv de Hermes necesitan LD_PRELOAD/LD_LIBRARY_PATH
         # (cryptography); el resto va con el entorno mínimo seguro.
@@ -401,7 +401,11 @@ async def _run(args, timeout=120, stdin_text=None, env=None):
         proc.kill()
         return 124, "timeout"
     text = (out or b"").decode("utf-8", "replace")
-    return proc.returncode, text[-8000:]
+    # max_out=None → salida COMPLETA: obligatorio cuando el stdout es un JSON
+    # a parsear. El tail-truncado por defecto decapitaba el catálogo de
+    # modelos en servidores con muchos proveedores (>8KB) y el parse moría
+    # con "Expecting value: char 0" (visto en produccion con 42 proveedores).
+    return proc.returncode, (text if max_out is None else text[-max_out:])
 
 
 def _safe_env():
@@ -2309,7 +2313,8 @@ async def model_options(request):
     cached = _MODEL_OPTIONS_CACHE
     if cached and (time.monotonic() - cached[0]) < 60.0:
         return web.json_response(cached[1])
-    rc, out = await _run([_VENV_PY, "-c", _MODEL_OPTIONS_SNIPPET], timeout=90)
+    rc, out = await _run([_VENV_PY, "-c", _MODEL_OPTIONS_SNIPPET], timeout=90,
+                         max_out=None)
     raw = out or ""
     i = raw.rfind("@@JSON@@")
     payload = raw[i + len("@@JSON@@"):].strip() if i >= 0 else raw.strip()
