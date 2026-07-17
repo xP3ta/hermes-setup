@@ -23,6 +23,7 @@ make_app() {
   local app="$1"
   local version="$2"
   mkdir -p "$app/assets/bridge" "$app/scripts"
+  printf 'version: 1.0.0+903\n' > "$app/pubspec.yaml"
   printf 'VERSION = "%s"\nprint("bridge fixture")\n' "$version" \
     > "$app/assets/bridge/hermes_bridge.py"
   printf '#!/bin/sh\necho setup-%s\n' "$version" \
@@ -109,7 +110,7 @@ test_local_commit_and_explicit_publish() {
   jq -e \
     --arg sha "$expected_sha" \
     --argjson size "$expected_size" \
-    '.schema == 1 and .version == "5.6.7" and .sha256 == $sha and .size == $size and (keys | sort == ["schema", "sha256", "size", "version"])' \
+    '.schema == 1 and .version == "5.6.7" and .min_app_build == 903 and .sha256 == $sha and .size == $size and (keys | sort == ["min_app_build", "schema", "sha256", "size", "version"])' \
     "$repo/bridge-release.json" >/dev/null || fail 'invalid bridge manifest'
 
   HERMES_APP_DIR="$app" "$repo/sync-from-app.sh" --publish >/dev/null

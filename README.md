@@ -47,7 +47,7 @@ even without `qrencode` installed.
 | `hermes-mobile-setup.sh` | The installer (readable top to bottom) |
 | `hermes-pair.sh` | Prints the pairing QR/link on demand (no reinstall) |
 | `hermes_bridge.py` | The Mobile Bridge the installer deploys to `~/.hermes/` |
-| `bridge-release.json` | Machine-readable Bridge version, SHA-256 and byte size |
+| `bridge-release.json` | Machine-readable Bridge version, compatible app build, SHA-256 and byte size |
 | `sync-from-app.sh` | Maintainer-only synchronization and release helper |
 
 ## Maintenance
@@ -75,5 +75,8 @@ explicit form:
 ./sync-from-app.sh --publish
 ```
 
-The generated manifest has schema `1` and records `version`, `sha256` and
-`size` for the exact bytes of `hermes_bridge.py` served by this repository.
+The generated manifest has schema `1` and records `version`, `min_app_build`,
+`sha256` and `size` for the exact bytes of `hermes_bridge.py` served by this
+repository. `min_app_build` defaults to the app build in `pubspec.yaml` and can
+be deliberately lowered for a backwards-compatible Bridge with
+`BRIDGE_MIN_APP_BUILD=<build>`.

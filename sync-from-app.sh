@@ -71,8 +71,13 @@ done
 
 BRIDGE_SOURCE="$(source_path hermes_bridge.py)"
 VERSION="$(sed -nE 's/^VERSION = "([^"]+)".*/\1/p' "$BRIDGE_SOURCE" | head -n1)"
-if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.-]+)?$ ]]; then
+if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   echo "ERROR: VERSION inválida o ausente en $BRIDGE_SOURCE" >&2
+  exit 1
+fi
+APP_BUILD="${BRIDGE_MIN_APP_BUILD:-$(sed -nE 's/^version:[[:space:]]*[^+]+\+([0-9]+).*/\1/p' "$APP_DIR/pubspec.yaml" | head -n1)}"
+if [[ ! "$APP_BUILD" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: min_app_build inválido o ausente (pubspec/BRIDGE_MIN_APP_BUILD)" >&2
   exit 1
 fi
 
@@ -84,8 +89,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-printf '{\n  "schema": 1,\n  "version": "%s",\n  "sha256": "%s",\n  "size": %s\n}\n' \
-  "$VERSION" "$BRIDGE_SHA256" "$BRIDGE_SIZE" > "$MANIFEST_TMP"
+printf '{\n  "schema": 1,\n  "version": "%s",\n  "min_app_build": %s,\n  "sha256": "%s",\n  "size": %s\n}\n' \
+  "$VERSION" "$APP_BUILD" "$BRIDGE_SHA256" "$BRIDGE_SIZE" > "$MANIFEST_TMP"
 
 CHANGED_FILES=()
 for dest in "${SOURCE_FILES[@]}"; do
