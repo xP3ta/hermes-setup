@@ -47,12 +47,33 @@ even without `qrencode` installed.
 | `hermes-mobile-setup.sh` | The installer (readable top to bottom) |
 | `hermes-pair.sh` | Prints the pairing QR/link on demand (no reinstall) |
 | `hermes_bridge.py` | The Mobile Bridge the installer deploys to `~/.hermes/` |
+| `bridge-release.json` | Machine-readable Bridge version, SHA-256 and byte size |
+| `sync-from-app.sh` | Maintainer-only synchronization and release helper |
 
 ## Maintenance
 
-The source of truth for both files lives in the app repository
-(`scripts/hermes-mobile-setup.sh` and `assets/bridge/hermes_bridge.py`).
-Whenever either changes there, this repo must be updated in the same release:
+The source of truth for the three public runtime files lives in the app repository
+(`scripts/hermes-mobile-setup.sh`, `scripts/hermes-pair.sh` and
+`assets/bridge/hermes_bridge.py`). Whenever any of them changes there, this repo
+must be updated in the same release:
 the app hands out this exact `curl` command during onboarding **and** when
 offering bridge updates, so this repo has to stay in sync with the bridge
 asset shipped inside the published app.
+
+Preview a synchronization without modifying the working tree or Git index:
+
+```sh
+./sync-from-app.sh --dry-run
+```
+
+Running `./sync-from-app.sh` without options copies only the three canonical
+sources, regenerates `bridge-release.json`, stages only those release files and
+creates a local commit. It never pushes implicitly. Publishing requires the
+explicit form:
+
+```sh
+./sync-from-app.sh --publish
+```
+
+The generated manifest has schema `1` and records `version`, `sha256` and
+`size` for the exact bytes of `hermes_bridge.py` served by this repository.
