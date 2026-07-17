@@ -14,10 +14,13 @@ Principios (ver docs/BRIDGE_SECURITY_MODEL.md):
   - bind a interfaz privada; rehúsa 0.0.0.0 sin flag explícito
 """
 import asyncio
+import base64
 import difflib
+import hashlib
 import hmac
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -29,13 +32,27 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.12.0"
+VERSION = "1.16.0"
 HERMES_HOME = Path(os.environ.get("BRIDGE_HERMES_HOME",
                                   Path.home() / ".hermes")).resolve()
 BACKUP_DIR = HERMES_HOME / "backups" / "bridge"
 AUDIT_LOG = HERMES_HOME / "logs" / "bridge_audit.log"
 TOKEN_FILE = HERMES_HOME / "bridge_token"
 MAX_WRITE_BYTES = 256 * 1024
+MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+MAX_ATTACHMENT_STORE_BYTES = 100 * 1024 * 1024
+ATTACHMENT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+ATTACHMENTS_DIR = (HERMES_HOME / "uploads" / "mobile").resolve()
+NEUTTS_DIR = (HERMES_HOME / "voices" / "neutts").resolve()
+NEUTTS_REF_AUDIO = (NEUTTS_DIR / "reference.wav").resolve()
+NEUTTS_REF_TEXT = (NEUTTS_DIR / "reference.txt").resolve()
+NEUTTS_TEST_PROOF = (NEUTTS_DIR / ".last-successful-test.json").resolve()
+NEUTTS_MODEL = "neuphonic/neutts-air-q4-gguf"
+NEUTTS_DEVICES = {"cpu", "cuda", "mps"}
+_ATTACHMENT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
+_BLOCKED_ATTACHMENT_EXTS = {
+    ".apk", ".exe", ".sh", ".bat", ".bin", ".so", ".dll", ".msi", ".deb",
+}
 # Ventana de contexto REAL que reserva Ollama (`model.ollama_num_ctx`). Hermes
 # exige `model.context_length` >= 64000 o deja el chat mudo, pero ese gate es
 # lógico: lo que de verdad reserva KV-cache al cargar es ollama_num_ctx, y 64K
@@ -50,6 +67,10 @@ SKILL_RE = re.compile(
     r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+){1,4}(@[A-Za-z0-9_.-]+)?$")
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 SKILL_QUERY_RE = re.compile(r"^[A-Za-z0-9 _.\-]{1,60}$")
+# IDs/nombres de cron aceptados por el CLI. El primer carácter alfanumérico
+# evita que un valor controlado por el cliente se interprete como una opción.
+# Aunque create_subprocess_exec no usa shell, mantenemos una allowlist estricta.
+CRON_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 # Nombre de perfil de agente: lista blanca estricta (coincide con la validación
 # de la app). Sin punto para no permitir `..`; primer carácter alfanumérico.
 PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -70,6 +91,19 @@ SKILLS_DIRS = [
     if p.strip()
 ]
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Una sola operación NeuTTS pesada a la vez. El estado es deliberadamente
+# efímero: después de reiniciar el bridge, GET status vuelve a comprobar el
+# paquete y la referencia reales en disco.
+_NEUTTS_LOCK = asyncio.Lock()
+_NEUTTS_INSTALL_TASK = None
+_NEUTTS_INSTALL_STATE = {
+    "running": False,
+    "exit_code": None,
+    "detail": "",
+    "started_at": None,
+    "finished_at": None,
+}
 
 # Allowlist de destinos: nombre lógico -> (ruta relativa, scope, modo).
 #   modo "rw"          : leer y escribir (texto/markdown/JSON)
@@ -236,6 +270,7 @@ async def capabilities(request):
             "soul_write": can_write_target("soul"),
             "memory_write": can_write_target("memory"),
             "cron_write": can_write_target("cron"),
+            "cron_delete": can_write_target("cron"),
             "fallback_write": can_write and "config" in SCOPES,
             "skills_install": can_write and "skills" in SCOPES,
             "skills_remove": can_write and "skills" in SCOPES,
@@ -246,6 +281,7 @@ async def capabilities(request):
             "chat_profile": "command" in SCOPES,
             "logs_extended": True,
             "audit_read": True,
+            "tts_neutts": can_write and "config" in SCOPES,
         },
         "targets": targets,
         "write_targets": write_targets,
@@ -658,6 +694,89 @@ def _build_chat_prompt(prompt, history):
         f"Usuario: {prompt}\n"
         "Asistente:"
     )
+
+
+def _gc_mobile_attachments(keep=None):
+    """Cota el almacén de uploads del móvil por edad y tamaño total."""
+    try:
+        files = []
+        now = time.time()
+        for path in ATTACHMENTS_DIR.iterdir():
+            if not path.is_file() or path.name.endswith(".part"):
+                continue
+            try:
+                stat = path.stat()
+                if path != keep and now - stat.st_mtime > ATTACHMENT_MAX_AGE_SECONDS:
+                    path.unlink(missing_ok=True)
+                else:
+                    files.append((path, stat.st_mtime, stat.st_size))
+            except OSError:
+                pass
+        files.sort(key=lambda item: item[1], reverse=True)
+        total = 0
+        for path, _, size in files:
+            total += size
+            if total > MAX_ATTACHMENT_STORE_BYTES and path != keep:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+async def attachment_upload(request):
+    """Recibe un adjunto binario por streaming y devuelve una ruta confinada.
+
+    No usa base64 ni mantiene el archivo completo en RAM. La escritura es
+    atómica y el almacén tiene GC por cuota/edad para que un cliente con cortes
+    no llene el servidor con parciales o uploads abandonados.
+    """
+    if (e := _check_auth(request, "command")):
+        return e
+    if READ_ONLY:
+        return _err("bridge_read_only", "Modo solo lectura", 403)
+    name = (request.headers.get("X-Hermes-Filename") or "").strip()
+    if (not _ATTACHMENT_NAME_RE.match(name) or ".." in name
+            or Path(name).suffix.lower() in _BLOCKED_ATTACHMENT_EXTS):
+        return _err("bad_attachment_name", "Nombre de adjunto no válido", 400)
+    declared = request.content_length
+    if declared is not None and (declared <= 0 or declared > MAX_ATTACHMENT_BYTES):
+        return _err("attachment_too_large", "Adjunto vacío o demasiado grande", 413)
+
+    ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    unique = f"{time.time_ns()}_{secrets.token_hex(4)}_{name}"
+    target = (ATTACHMENTS_DIR / unique).resolve()
+    if not str(target).startswith(str(ATTACHMENTS_DIR) + os.sep):
+        return _err("bad_attachment_name", "Nombre de adjunto no válido", 400)
+    partial = target.with_name(target.name + ".part")
+    total = 0
+    try:
+        with partial.open("xb") as out:
+            async for chunk in request.content.iter_chunked(64 * 1024):
+                total += len(chunk)
+                if total > MAX_ATTACHMENT_BYTES:
+                    raise ValueError("too_large")
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        if total <= 0:
+            raise ValueError("empty")
+        os.replace(partial, target)
+    except ValueError:
+        partial.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+        return _err("attachment_too_large", "Adjunto vacío o demasiado grande", 413)
+    except (OSError, asyncio.CancelledError) as ex:
+        partial.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+        if isinstance(ex, asyncio.CancelledError):
+            raise
+        return _err("attachment_write_failed", "No se pudo guardar el adjunto", 500)
+
+    _gc_mobile_attachments(keep=target)
+    _audit("attachment_upload", {"name": name, "bytes": total}, "ok")
+    return web.json_response({"ok": True, "path": str(target), "bytes": total})
 
 
 async def chat(request):
@@ -1936,6 +2055,85 @@ async def skills_install(request):
                               "rc": rc, "log": log})
 
 
+def _cron_home(profile=None):
+    return HERMES_HOME if profile is None else HERMES_HOME / "profiles" / profile
+
+
+def _cron_job_present(job_id, profile=None):
+    """True/False si podemos confirmar el job en jobs.json; None si no se lee.
+
+    El archivo se usa únicamente como comprobación posterior de solo lectura.
+    La mutación siempre pasa por el comando oficial de Hermes.
+    """
+    try:
+        path = _cron_home(profile) / "cron" / "jobs.json"
+        data = json.loads(path.read_text())
+        jobs = data.get("jobs", []) if isinstance(data, dict) else data
+        return any(
+            isinstance(job, dict)
+            and job_id in {str(job.get("id", "")), str(job.get("name", ""))}
+            for job in (jobs or [])
+        )
+    except Exception:
+        return None
+
+
+def _cron_profile(request):
+    """Perfil validado de query o error; nunca degrada uno inválido a default."""
+    raw = request.query.get("profile")
+    if raw is None or not str(raw).strip() or str(raw).strip() == "default":
+        return None, None
+    profile = _resolve_profile({"profile": str(raw)})
+    if profile is None:
+        return None, _err("bad_profile", "Perfil de cron inválido")
+    return profile, None
+
+
+async def cron_remove(request):
+    """DELETE /bridge/cron/jobs/{id}: elimina un cron con el CLI oficial.
+
+    Es idempotente: si el job ya no existe, el estado final solicitado ya se
+    cumple. Requiere el scope cron y respeta el modo global de solo lectura.
+    """
+    if (e := _check_auth(request, "cron")):
+        return e
+    if READ_ONLY:
+        return _err("bridge_read_only", "Modo solo lectura", 403)
+    job_id = str(request.match_info.get("job_id", "")).strip()
+    if not CRON_JOB_ID_RE.fullmatch(job_id):
+        return _err("bad_job_id", "ID de cron inválido")
+    profile, profile_error = _cron_profile(request)
+    if profile_error is not None:
+        return profile_error
+
+    was_present = _cron_job_present(job_id, profile)
+    rc, log = await _run(
+        _hermes(profile) + ["cron", "remove", job_id], timeout=60)
+    still_present = _cron_job_present(job_id, profile)
+    # Hermes no propaga de forma fiable el exit code, pero tampoco basta con que
+    # el job no figure en un almacén: el CLI debe confirmar que lo eliminó o que
+    # ya estaba ausente. Exigimos ambas señales para no declarar éxito contra un
+    # layout de jobs distinto o una invocación que falló silenciosamente.
+    low_log = log.lower()
+    cli_confirmed = any(
+        marker in low_log for marker in ("removed", "deleted", "not found")
+    )
+    ok = still_present is False and cli_confirmed
+    _audit("cron_remove", {"job_id": job_id, "profile": profile},
+           "ok" if ok else "fail",
+           {"rc": rc, "was_present": was_present,
+            "still_present": still_present, "log_tail": log[-160:]})
+    if not ok:
+        return _err("cron_remove_failed",
+                    "Hermes no confirmó la eliminación del cron", 502)
+    return web.json_response({
+        "ok": True,
+        "job_id": job_id,
+        "profile": profile or "default",
+        "already_absent": was_present is False,
+    })
+
+
 def _find_skill_dir(name):
     """Localiza en disco el directorio de una skill instalada, confinado bajo los
     SKILLS_DIRS. Devuelve un Path validado o None. [name] ya viene validado por
@@ -2212,6 +2410,440 @@ async def model_get(request):
         "model": m.get("default", ""),
         "base_url": m.get("base_url", ""),
     })
+
+
+# ── NeuTTS guiado ────────────────────────────────────────────────────────
+
+def _neutts_preflight():
+    """Preflight sin mutaciones y sin importar el paquete pesado."""
+    agent_root = HERMES_HOME / "hermes-agent"
+    venv_python = agent_root / "venv" / "bin" / "python3"
+    setup_file = agent_root / "hermes_cli" / "setup.py"
+    synth_file = agent_root / "tools" / "neutts_synth.py"
+    os_supported = (
+        sys.platform.startswith("linux")
+        or sys.platform == "darwin"
+        or sys.platform == "win32"
+    )
+    espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+    prefix = os.environ.get("PREFIX", "")
+    if "com.termux" in prefix:
+        espeak_command = "pkg install espeak-ng"
+    elif sys.platform == "darwin":
+        espeak_command = "brew install espeak-ng"
+    elif sys.platform == "win32":
+        espeak_command = "choco install espeak-ng"
+    else:
+        espeak_command = "sudo apt install espeak-ng"
+    supported = bool(
+        os_supported and venv_python.exists() and setup_file.exists()
+        and synth_file.exists()
+    )
+    reason = ""
+    if not os_supported:
+        reason = "Sistema operativo no compatible con el instalador de NeuTTS."
+    elif not venv_python.exists():
+        reason = "No se encontró el entorno Python de Hermes."
+    elif not setup_file.exists() or not synth_file.exists():
+        reason = "Esta versión de Hermes no incluye el soporte oficial de NeuTTS."
+    return {
+        "supported": supported,
+        "reason": reason,
+        "platform": sys.platform,
+        "architecture": platform.machine().lower(),
+        "venv": venv_python.exists(),
+        "helper": setup_file.exists() and synth_file.exists(),
+        "espeak": bool(espeak),
+        "espeak_command": espeak_command,
+    }
+
+
+async def _neutts_is_installed():
+    if not (HERMES_HOME / "hermes-agent" / "venv" / "bin" / "python3").exists():
+        return False
+    code = (
+        "import importlib.util,sys;"
+        "sys.exit(0 if importlib.util.find_spec('neutts') else 1)"
+    )
+    rc, _ = await _run([_VENV_PY, "-c", code], timeout=20, max_out=500)
+    return rc == 0
+
+
+def _neutts_config():
+    """Devuelve solo las claves TTS no secretas necesarias para el asistente."""
+    try:
+        if not _ensure_ruamel() or not CONFIG_PATH.exists():
+            return {}
+        from ruamel.yaml import YAML
+        with CONFIG_PATH.open() as stream:
+            data = YAML().load(stream) or {}
+        tts = data.get("tts") or {}
+        local = tts.get("neutts") or {}
+        return {
+            "provider": str(tts.get("provider") or "edge"),
+            "ref_audio": str(local.get("ref_audio") or ""),
+            "ref_text": str(local.get("ref_text") or ""),
+            "model": str(local.get("model") or NEUTTS_MODEL),
+            "device": str(local.get("device") or "cpu"),
+        }
+    except Exception:
+        return {}
+
+
+def _neutts_reference_ready():
+    try:
+        if not NEUTTS_REF_AUDIO.is_file() or not NEUTTS_REF_TEXT.is_file():
+            return False
+        if NEUTTS_REF_AUDIO.stat().st_size < 44:
+            return False
+        with NEUTTS_REF_AUDIO.open("rb") as stream:
+            header = stream.read(12)
+        return (
+            header[:4] == b"RIFF" and header[8:12] == b"WAVE"
+            and bool(NEUTTS_REF_TEXT.read_text(encoding="utf-8").strip())
+        )
+    except Exception:
+        return False
+
+
+def _neutts_reference_fingerprint():
+    """Identifica la referencia y el runtime exactos que superaron la prueba."""
+    if not _neutts_reference_ready():
+        return None
+    try:
+        digest = hashlib.sha256()
+        for path in (NEUTTS_REF_AUDIO, NEUTTS_REF_TEXT):
+            with path.open("rb") as stream:
+                while chunk := stream.read(64 * 1024):
+                    digest.update(chunk)
+        cfg = _neutts_config()
+        digest.update(str(cfg.get("model") or NEUTTS_MODEL).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(cfg.get("device") or "cpu").encode("utf-8"))
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def _neutts_test_proof_valid():
+    current = _neutts_reference_fingerprint()
+    if current is None:
+        return False
+    try:
+        if NEUTTS_TEST_PROOF.is_symlink() or not NEUTTS_TEST_PROOF.is_file():
+            return False
+        data = json.loads(NEUTTS_TEST_PROOF.read_text(encoding="utf-8"))
+        recorded = data.get("fingerprint") if isinstance(data, dict) else None
+        return isinstance(recorded, str) and hmac.compare_digest(recorded, current)
+    except Exception:
+        return False
+
+
+def _record_neutts_test_proof():
+    fingerprint = _neutts_reference_fingerprint()
+    if fingerprint is None:
+        raise RuntimeError("NeuTTS reference is not ready")
+    NEUTTS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp = NEUTTS_DIR / f".last-test-{secrets.token_hex(6)}.tmp"
+    try:
+        temp.write_text(json.dumps({
+            "fingerprint": fingerprint,
+            "tested_at": int(time.time()),
+        }), encoding="utf-8")
+        temp.chmod(0o600)
+        os.replace(temp, NEUTTS_TEST_PROOF)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+async def _neutts_status_payload():
+    preflight = _neutts_preflight()
+    installed = await _neutts_is_installed() if preflight["venv"] else False
+    cfg = _neutts_config()
+    reference = _neutts_reference_ready()
+    return {
+        "object": "hermes.bridge.tts.neutts.status",
+        **preflight,
+        "installed": installed,
+        "reference_configured": reference,
+        "test_verified": _neutts_test_proof_valid(),
+        "provider": cfg.get("provider", "edge"),
+        "active": cfg.get("provider") == "neutts",
+        "model": cfg.get("model", NEUTTS_MODEL),
+        "device": cfg.get("device", "cpu"),
+        "install": dict(_NEUTTS_INSTALL_STATE),
+    }
+
+
+async def neutts_status(request):
+    if (e := _check_auth(request, "read")):
+        return e
+    return web.json_response(await _neutts_status_payload())
+
+
+async def _neutts_install_worker():
+    global _NEUTTS_INSTALL_STATE
+    _NEUTTS_INSTALL_STATE = {
+        "running": True,
+        "exit_code": None,
+        "detail": "Instalando el paquete oficial de NeuTTS…",
+        "started_at": _now_iso(),
+        "finished_at": None,
+    }
+    async with _NEUTTS_LOCK:
+        code = (
+            "from hermes_cli.setup import _install_neutts_deps;"
+            "raise SystemExit(0 if _install_neutts_deps() else 1)"
+        )
+        try:
+            rc, _ = await _run([_VENV_PY, "-c", code], timeout=420, max_out=2000)
+            installed = rc == 0 and await _neutts_is_installed()
+            final_rc = 0 if installed else (rc or 1)
+            detail = (
+                "NeuTTS quedó instalado."
+                if installed else
+                "Hermes no pudo completar la instalación de NeuTTS."
+            )
+            _NEUTTS_INSTALL_STATE = {
+                "running": False,
+                "exit_code": final_rc,
+                "detail": detail,
+                "started_at": _NEUTTS_INSTALL_STATE.get("started_at"),
+                "finished_at": _now_iso(),
+            }
+            _audit("neutts_install", {}, "ok" if installed else "fail",
+                   {"rc": final_rc})
+        except Exception:
+            _NEUTTS_INSTALL_STATE = {
+                "running": False,
+                "exit_code": 1,
+                "detail": "La instalación de NeuTTS terminó con un error.",
+                "started_at": _NEUTTS_INSTALL_STATE.get("started_at"),
+                "finished_at": _now_iso(),
+            }
+            _audit("neutts_install", {}, "error")
+
+
+async def neutts_install(request):
+    global _NEUTTS_INSTALL_TASK
+    if (e := _check_auth(request, "config")):
+        return e
+    if READ_ONLY:
+        return _err("bridge_read_only", "Modo solo lectura", 403)
+    preflight = _neutts_preflight()
+    if not preflight["supported"]:
+        return _err("neutts_unsupported", preflight["reason"], 409)
+    if not preflight["espeak"]:
+        return web.json_response({
+            "error": "espeak_missing",
+            "message": "Instala espeak-ng en el servidor y vuelve a intentarlo.",
+            "command": preflight["espeak_command"],
+        }, status=409)
+    if await _neutts_is_installed():
+        return web.json_response({"ok": True, "already_installed": True})
+    if _NEUTTS_INSTALL_TASK is not None and not _NEUTTS_INSTALL_TASK.done():
+        return web.json_response({"ok": True, "running": True}, status=202)
+    _NEUTTS_INSTALL_TASK = asyncio.create_task(_neutts_install_worker())
+    _audit("neutts_install_start", {}, "accepted")
+    return web.json_response({"ok": True, "running": True}, status=202)
+
+
+def _restore_config_backup(backup_id):
+    if not backup_id:
+        return
+    backup = BACKUP_DIR / f"{backup_id}.yaml"
+    if backup.exists():
+        shutil.copy2(backup, CONFIG_PATH)
+
+
+async def _set_neutts_config_values(values):
+    """Configura únicamente claves fijas usando el CLI canónico de Hermes."""
+    allowed = {
+        "tts.neutts.ref_audio", "tts.neutts.ref_text",
+        "tts.neutts.model", "tts.neutts.device", "tts.provider",
+    }
+    if not values or any(key not in allowed for key in values):
+        raise ValueError("clave de configuración NeuTTS no permitida")
+    backup_id = _backup_config() if CONFIG_PATH.exists() else None
+    try:
+        for key, value in values.items():
+            rc, _ = await _run(
+                _hermes() + ["config", "set", key, str(value)],
+                timeout=60, max_out=2000,
+            )
+            if rc != 0:
+                raise RuntimeError(f"no se pudo fijar {key}")
+    except Exception:
+        _restore_config_backup(backup_id)
+        raise
+    return backup_id
+
+
+def _validated_neutts_upload(raw_path):
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("Falta la muestra WAV subida por la app.")
+    source = Path(raw_path).expanduser().resolve()
+    try:
+        source.relative_to(ATTACHMENTS_DIR)
+    except (ValueError, OSError):
+        raise ValueError("La muestra no pertenece al almacén seguro de uploads.")
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("La muestra WAV no existe.")
+    size = source.stat().st_size
+    if size < 44 or size > MAX_ATTACHMENT_BYTES:
+        raise ValueError("La muestra WAV está vacía o supera 8 MB.")
+    with source.open("rb") as stream:
+        header = stream.read(12)
+    if header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+        raise ValueError("El archivo no es un WAV RIFF válido.")
+    return source
+
+
+async def neutts_configure(request):
+    if (e := _check_auth(request, "config")):
+        return e
+    if READ_ONLY:
+        return _err("bridge_read_only", "Modo solo lectura", 403)
+    try:
+        body = await request.json()
+        source = _validated_neutts_upload(body.get("upload_path"))
+        transcript = str(body.get("transcript", "")).strip()
+        device = str(body.get("device", "cpu")).strip().lower()
+    except ValueError as ex:
+        return _err("invalid_reference", str(ex))
+    except Exception:
+        return _err("bad_json", "Cuerpo no es JSON válido")
+    if not transcript or len(transcript) > 2000 or "\x00" in transcript:
+        return _err("invalid_transcript",
+                    "La transcripción debe tener entre 1 y 2000 caracteres.")
+    if device not in NEUTTS_DEVICES:
+        return _err("invalid_device", "Dispositivo NeuTTS no permitido.")
+    if not await _neutts_is_installed():
+        return _err("neutts_not_installed", "Instala NeuTTS antes de configurarlo.", 409)
+
+    async with _NEUTTS_LOCK:
+        NEUTTS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        NEUTTS_DIR.chmod(0o700)
+        suffix = secrets.token_hex(6)
+        audio_tmp = NEUTTS_DIR / f".reference-{suffix}.wav"
+        text_tmp = NEUTTS_DIR / f".reference-{suffix}.txt"
+        old_audio = NEUTTS_REF_AUDIO.read_bytes() if NEUTTS_REF_AUDIO.exists() else None
+        old_text = NEUTTS_REF_TEXT.read_bytes() if NEUTTS_REF_TEXT.exists() else None
+        try:
+            shutil.copyfile(source, audio_tmp)
+            audio_tmp.chmod(0o600)
+            text_tmp.write_text(transcript + "\n", encoding="utf-8")
+            text_tmp.chmod(0o600)
+            os.replace(audio_tmp, NEUTTS_REF_AUDIO)
+            os.replace(text_tmp, NEUTTS_REF_TEXT)
+            await _set_neutts_config_values({
+                "tts.neutts.ref_audio": str(NEUTTS_REF_AUDIO),
+                "tts.neutts.ref_text": str(NEUTTS_REF_TEXT),
+                "tts.neutts.model": NEUTTS_MODEL,
+                "tts.neutts.device": device,
+            })
+        except Exception:
+            for temp in (audio_tmp, text_tmp):
+                temp.unlink(missing_ok=True)
+            if old_audio is None:
+                NEUTTS_REF_AUDIO.unlink(missing_ok=True)
+            else:
+                NEUTTS_REF_AUDIO.write_bytes(old_audio)
+                NEUTTS_REF_AUDIO.chmod(0o600)
+            if old_text is None:
+                NEUTTS_REF_TEXT.unlink(missing_ok=True)
+            else:
+                NEUTTS_REF_TEXT.write_bytes(old_text)
+                NEUTTS_REF_TEXT.chmod(0o600)
+            _audit("neutts_configure", {"device": device}, "error")
+            return _err("neutts_config_failed",
+                        "No se pudo guardar la referencia; se restauró la configuración.", 500)
+        source.unlink(missing_ok=True)
+        _audit("neutts_configure", {"device": device}, "ok")
+    return web.json_response({"ok": True, "reference_configured": True,
+                              "device": device, "model": NEUTTS_MODEL})
+
+
+async def neutts_test(request):
+    if (e := _check_auth(request, "read")):
+        return e
+    try:
+        body = await request.json()
+        text = str(body.get("text", "")).strip()
+    except Exception:
+        return _err("bad_json", "Cuerpo no es JSON válido")
+    if not text or len(text) > 300 or "\x00" in text:
+        return _err("invalid_text", "La prueba debe tener entre 1 y 300 caracteres.")
+    if not await _neutts_is_installed() or not _neutts_reference_ready():
+        return _err("neutts_not_ready", "NeuTTS todavía no está preparado.", 409)
+    script = HERMES_HOME / "hermes-agent" / "tools" / "neutts_synth.py"
+    if not script.exists():
+        return _err("neutts_unsupported", "Hermes no incluye el sintetizador NeuTTS.", 409)
+    cfg = _neutts_config()
+    device = cfg.get("device", "cpu")
+    if device not in NEUTTS_DEVICES:
+        device = "cpu"
+    output = NEUTTS_DIR / f".test-{secrets.token_hex(8)}.wav"
+    async with _NEUTTS_LOCK:
+        try:
+            rc, _ = await _run([
+                _VENV_PY, str(script), "--text", text, "--out", str(output),
+                "--ref-audio", str(NEUTTS_REF_AUDIO),
+                "--ref-text", str(NEUTTS_REF_TEXT),
+                "--model", NEUTTS_MODEL, "--device", device,
+            ], timeout=600, max_out=2000)
+            if rc != 0 or not output.exists():
+                raise RuntimeError("synthesis failed")
+            audio = output.read_bytes()
+            if (not audio or len(audio) > MAX_ATTACHMENT_BYTES
+                    or audio[:4] != b"RIFF"):
+                raise RuntimeError("invalid audio")
+            _record_neutts_test_proof()
+            _audit("neutts_test", {"device": device}, "ok")
+            return web.json_response({
+                "ok": True,
+                "provider": "neutts",
+                "mime_type": "audio/wav",
+                "data_url": "data:audio/wav;base64," + base64.b64encode(audio).decode("ascii"),
+            })
+        except Exception:
+            _audit("neutts_test", {"device": device}, "error")
+            return _err("neutts_test_failed",
+                        "NeuTTS no pudo generar la prueba. El proveedor actual no cambió.", 500)
+        finally:
+            output.unlink(missing_ok=True)
+
+
+async def neutts_activate(request):
+    if (e := _check_auth(request, "config")):
+        return e
+    if READ_ONLY:
+        return _err("bridge_read_only", "Modo solo lectura", 403)
+    try:
+        body = await request.json()
+        active = body.get("active", True) is True
+    except Exception:
+        return _err("bad_json", "Cuerpo no es JSON válido")
+    if active and (not await _neutts_is_installed() or not _neutts_reference_ready()):
+        return _err("neutts_not_ready", "Instala y prueba una referencia antes de activar.", 409)
+    if active and not _neutts_test_proof_valid():
+        return _err(
+            "neutts_test_required",
+            "La referencia actual debe superar una prueba antes de activar NeuTTS.",
+            409,
+        )
+    previous = _neutts_config().get("provider", "edge")
+    provider = "neutts" if active else "edge"
+    async with _NEUTTS_LOCK:
+        try:
+            await _set_neutts_config_values({"tts.provider": provider})
+        except Exception:
+            _audit("neutts_activate", {"active": active}, "error")
+            return _err("neutts_activate_failed",
+                        "No se pudo cambiar el proveedor TTS; se restauró la configuración.", 500)
+    _audit("neutts_activate", {"active": active}, "ok")
+    return web.json_response({"ok": True, "provider": provider,
+                              "previous_provider": previous})
 
 
 # Imágenes generadas por el agente (toolset image_gen): el agente las guarda
@@ -2586,16 +3218,18 @@ async def logs(request):
 
 
 def build_app():
-    app = web.Application(client_max_size=512 * 1024)
+    app = web.Application(client_max_size=MAX_ATTACHMENT_BYTES + 1024)
     app.router.add_get("/bridge/health", health)
     app.router.add_get("/bridge/capabilities", capabilities)
     app.router.add_post("/bridge/provision", provision)
     app.router.add_post("/bridge/chat", chat)
     app.router.add_post("/bridge/chat/stream", chat_stream)
+    app.router.add_post("/bridge/attachments", attachment_upload)
     app.router.add_get("/bridge/read/{target}", read_file)
     app.router.add_post("/bridge/memory/write", write_file)
     app.router.add_post("/bridge/soul/write", write_file)
     app.router.add_post("/bridge/rollback", rollback)
+    app.router.add_delete("/bridge/cron/jobs/{job_id}", cron_remove)
     app.router.add_post("/bridge/skills/install", skills_install)
     app.router.add_post("/bridge/skills/remove", skills_remove)
     app.router.add_get("/bridge/skills/state", skills_state)
@@ -2606,6 +3240,11 @@ def build_app():
     app.router.add_post("/bridge/model/set", model_set)
     app.router.add_get("/bridge/model/get", model_get)
     app.router.add_get("/bridge/model/options", model_options)
+    app.router.add_get("/bridge/tts/neutts/status", neutts_status)
+    app.router.add_post("/bridge/tts/neutts/install", neutts_install)
+    app.router.add_post("/bridge/tts/neutts/configure", neutts_configure)
+    app.router.add_post("/bridge/tts/neutts/test", neutts_test)
+    app.router.add_post("/bridge/tts/neutts/activate", neutts_activate)
     app.router.add_get("/bridge/image", image_get)
     app.router.add_get("/bridge/dashboard/credentials", dashboard_credentials)
     app.router.add_post("/bridge/dashboard/credentials", dashboard_credentials)
