@@ -83,15 +83,63 @@ if ! (ss -tlnH 2>/dev/null | grep -q ':9119 '); then
   systemctl --user daemon-reload; systemctl --user enable hermes-dashboard 2>/dev/null || true
 fi
 
-# 4) bridge: download from the repo (same source of truth as the app) + flag
-curl -fsSL "$REPO_RAW/hermes_bridge.py" -o "$HH/hermes_bridge.py"
+# 4) bridge: descarga fija + manifiesto cerrado, verificación y swap atómico.
+TARGET="$HH/hermes_bridge.py"
+NEW="$HH/hermes_bridge.py.new"
+BACKUP="$HH/hermes_bridge.py.rollback"
+MANIFEST="$HH/bridge-release.json.new"
+cleanup_bridge_downloads() { rm -f "$NEW" "$MANIFEST"; }
+trap cleanup_bridge_downloads EXIT HUP INT TERM
+curl -fsSL "$REPO_RAW/bridge-release.json" -o "$MANIFEST"
+curl -fsSL "$REPO_RAW/hermes_bridge.py" -o "$NEW"
+"$VP" - "$MANIFEST" "$NEW" <<'PY'
+import hashlib, json, pathlib, re, sys
+manifest_path, bridge_path = map(pathlib.Path, sys.argv[1:])
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if set(manifest) != {"schema", "version", "min_app_build", "sha256", "size"}:
+    raise SystemExit("Invalid Bridge release manifest fields")
+version = manifest.get("version")
+digest = manifest.get("sha256")
+size = manifest.get("size")
+if (manifest.get("schema") != 1
+        or not isinstance(version, str)
+        or not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version)
+        or not isinstance(manifest.get("min_app_build"), int)
+        or manifest["min_app_build"] <= 0
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", digest)
+        or not isinstance(size, int) or size <= 0 or size > 512 * 1024):
+    raise SystemExit("Invalid Bridge release manifest")
+payload = bridge_path.read_bytes()
+if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+    raise SystemExit("Bridge release integrity check failed")
+source = payload.decode("utf-8", errors="strict")
+versions = re.findall(
+    r'''^VERSION\s*=\s*["']((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))["']\s*(?:#.*)?$''',
+    source, re.MULTILINE)
+if versions != [version]:
+    raise SystemExit("Bridge source VERSION mismatch")
+compile(source, str(bridge_path), "exec")
+PY
+chmod 600 "$NEW"
+"$VP" -m py_compile "$NEW"
+[ ! -f "$TARGET" ] || cp -p "$TARGET" "$BACKUP"
+mv "$NEW" "$TARGET"
 printf 'BRIDGE_HOST=0.0.0.0\nBRIDGE_PORT=9131\nBRIDGE_SCOPES=read,memory,soul,skills,cron,config,command\nBRIDGE_READ_ONLY=false\nBRIDGE_TOKEN=%s\n' "$KEY" > "$HH/bridge.env"
 printf '[Unit]\nDescription=Hermes Mobile Bridge\nAfter=network.target\n[Service]\nEnvironmentFile=%s/bridge.env\nExecStart=%s %s/hermes_bridge.py --i-know-what-im-doing\nWorkingDirectory=%s\nRestart=on-failure\n[Install]\nWantedBy=default.target\n' "$HH" "$VP" "$HH" "$HH" > "$HOME/.config/systemd/user/hermes-bridge.service"
 # enable + restart (NOT `enable --now`): --now does not restart an ALREADY
 # running service, and this script is also the bridge UPDATE path — without
 # restart, the old process kept serving the previous version.
 systemctl --user daemon-reload; systemctl --user enable hermes-bridge >/dev/null 2>&1; systemctl --user restart hermes-bridge; sleep 3
-systemctl --user is-active hermes-bridge >/dev/null && echo "Bridge 9131 OK" || echo "WARNING: the bridge did not start (journalctl --user -u hermes-bridge -n 20)"
+if systemctl --user is-active hermes-bridge >/dev/null 2>&1; then
+  echo "Bridge 9131 OK"
+else
+  echo "WARNING: the bridge did not start; restoring the previous version"
+  if [ -f "$BACKUP" ]; then
+    mv "$BACKUP" "$TARGET"
+    systemctl --user restart hermes-bridge >/dev/null 2>&1 || true
+  fi
+fi
 
 # 5) dashboard: set an initial password via bridge so it binds (the app rotates it)
 DASH=""
@@ -105,21 +153,28 @@ ss -tlnH 2>/dev/null | grep -q ':9119 ' && DASH="&dashboard=http://$HOST:9119"
 LINK="hermes://pair?host=$HOST&port=8642&token=$KEY$DASH"
 echo ""; echo "== SCAN THIS QR WITH THE APP (or copy the link) =="; echo ""
 # QR renderers, most to least likely: qrencode > uv (ephemeral qrcode) >
-# hermes venv python (installing the tiny pure-python `qrcode` if missing) >
-# plain link only. The QR must show even on servers without qrencode.
+# Hermes venv Python (installing the tiny pure-python `qrcode` if missing).
+# A successful run MUST render a QR; the link remains the emergency fallback.
 QRPY="import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)"
-if command -v qrencode >/dev/null 2>&1; then
-  qrencode -t ANSIUTF8 "$LINK"
+QR_RENDERED=""
+if command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$LINK"; then
+  QR_RENDERED=1
 else
   UV="$HH/bin/uv"; [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || echo uv)"
-  if ! "$UV" run --with qrcode python -c "$QRPY" "$LINK" 2>/dev/null; then
+  if "$UV" run --with qrcode python -c "$QRPY" "$LINK" 2>/dev/null; then
+    QR_RENDERED=1
+  else
     if [ -x "$VP" ]; then
       "$VP" -c "import qrcode" 2>/dev/null || "$VP" -m pip install -q qrcode >/dev/null 2>&1 || true
-      "$VP" -c "$QRPY" "$LINK" 2>/dev/null || echo "(no QR renderer available — copy the link below)"
-    else
-      echo "(no QR renderer available — copy the link below)"
+      if "$VP" -c "$QRPY" "$LINK" 2>/dev/null; then QR_RENDERED=1; fi
     fi
   fi
+fi
+if [ -z "$QR_RENDERED" ]; then
+  echo "ERROR: the server could not prepare a QR renderer."
+  echo "Copy the pairing link below into Hermes Console instead:"
+  echo "Link: $LINK"
+  exit 1
 fi
 echo ""; echo "Link: $LINK"
 echo ""

@@ -40,22 +40,30 @@ LINK="hermes://pair?host=$HOST&port=8642&token=$KEY$DASH"
 echo ""; echo "== SCAN THIS QR WITH THE APP (or copy the link) =="; echo ""
 
 # QR renderers, most to least likely: qrencode > uv (ephemeral qrcode) >
-# hermes venv python (installing the tiny pure-python `qrcode` into the venv
-# if missing) > plain link only.
+# Hermes venv Python (installing the tiny pure-python `qrcode` if missing).
+# A successful run MUST render a QR; the link remains the emergency fallback.
 QRPY="import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)"
-if command -v qrencode >/dev/null 2>&1; then
-  qrencode -t ANSIUTF8 "$LINK"
+QR_RENDERED=""
+if command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$LINK"; then
+  QR_RENDERED=1
 else
   UV="$HH/bin/uv"; [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || echo uv)"
-  if ! "$UV" run --with qrcode python -c "$QRPY" "$LINK" 2>/dev/null; then
+  if "$UV" run --with qrcode python -c "$QRPY" "$LINK" 2>/dev/null; then
+    QR_RENDERED=1
+  else
     VP="$HH/hermes-agent/venv/bin/python3"
+    [ -x "$VP" ] || VP="$(command -v python3 2>/dev/null || true)"
     if [ -x "$VP" ]; then
       "$VP" -c "import qrcode" 2>/dev/null || "$VP" -m pip install -q qrcode >/dev/null 2>&1 || true
-      "$VP" -c "$QRPY" "$LINK" 2>/dev/null || echo "(no QR renderer available — copy the link below)"
-    else
-      echo "(no QR renderer available — copy the link below)"
+      if "$VP" -c "$QRPY" "$LINK" 2>/dev/null; then QR_RENDERED=1; fi
     fi
   fi
+fi
+if [ -z "$QR_RENDERED" ]; then
+  echo "ERROR: the server could not prepare a QR renderer."
+  echo "Copy the pairing link below into Hermes Console instead:"
+  echo "Link: $LINK"
+  exit 1
 fi
 echo ""; echo "Link: $LINK"
 if [ -n "$PUBLIC" ]; then

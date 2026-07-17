@@ -24,6 +24,7 @@ import platform
 import re
 import secrets
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -32,13 +33,14 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.16.0"
+VERSION = "1.17.0"
 HERMES_HOME = Path(os.environ.get("BRIDGE_HERMES_HOME",
                                   Path.home() / ".hermes")).resolve()
 BACKUP_DIR = HERMES_HOME / "backups" / "bridge"
 AUDIT_LOG = HERMES_HOME / "logs" / "bridge_audit.log"
 TOKEN_FILE = HERMES_HOME / "bridge_token"
 MAX_WRITE_BYTES = 256 * 1024
+MAX_SELF_UPDATE_BYTES = 512 * 1024
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 MAX_ATTACHMENT_STORE_BYTES = 100 * 1024 * 1024
 ATTACHMENT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
@@ -74,6 +76,12 @@ CRON_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 # Nombre de perfil de agente: lista blanca estricta (coincide con la validación
 # de la app). Sin punto para no permitir `..`; primer carácter alfanumérico.
 PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+BRIDGE_VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+BRIDGE_SOURCE_VERSION_RE = re.compile(
+    r'''^VERSION\s*=\s*["']((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))["']\s*(?:#.*)?$''',
+    re.MULTILINE,
+)
+BRIDGE_SCRIPT_PATH = Path(__file__).resolve()
 
 # Directorios donde viven las skills instaladas en disco. Se usan SOLO para el
 # borrado directo de skills NO hub-installed (el CLI rehúsa desinstalarlas). El
@@ -212,6 +220,127 @@ def _check_auth(request, scope):
     return None
 
 
+def _version_tuple(value):
+    if not isinstance(value, str) or not BRIDGE_VERSION_RE.fullmatch(value):
+        raise ValueError("invalid version")
+    return tuple(int(part) for part in value.split("."))
+
+
+def _self_update_path_allowed():
+    expected = (HERMES_HOME / "hermes_bridge.py").resolve()
+    return BRIDGE_SCRIPT_PATH == expected and not BRIDGE_SCRIPT_PATH.is_symlink()
+
+
+def _stage_self_update(body):
+    """Valida, compila y sustituye el script; devuelve (target, backup, version)."""
+    if not isinstance(body, dict) or set(body) != {
+            "version", "sha256", "source_b64"}:
+        raise ValueError("bad fields")
+    version = body.get("version")
+    expected_hash = body.get("sha256")
+    encoded = body.get("source_b64")
+    if (_version_tuple(version) <= _version_tuple(VERSION)
+            or not isinstance(expected_hash, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", expected_hash)
+            or not isinstance(encoded, str)):
+        raise ValueError("bad metadata")
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+        source = payload.decode("utf-8", errors="strict")
+    except Exception as ex:
+        raise ValueError("bad payload") from ex
+    if not payload or len(payload) > MAX_SELF_UPDATE_BYTES:
+        raise ValueError("bad size")
+    if not hmac.compare_digest(hashlib.sha256(payload).hexdigest(),
+                               expected_hash):
+        raise ValueError("bad hash")
+    versions = BRIDGE_SOURCE_VERSION_RE.findall(source)
+    if versions != [version]:
+        raise ValueError("bad source version")
+    try:
+        compile(source, str(BRIDGE_SCRIPT_PATH), "exec")
+    except SyntaxError as ex:
+        raise ValueError("bad syntax") from ex
+    if not _self_update_path_allowed() or not BRIDGE_SCRIPT_PATH.is_file():
+        raise ValueError("unsupported path")
+
+    target = BRIDGE_SCRIPT_PATH
+    pending = target.with_name(target.name + ".new")
+    backup = target.with_name(target.name + ".rollback")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(pending), flags, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(payload)
+            out.flush()
+            os.fsync(out.fileno())
+        shutil.copy2(target, backup)
+        backup.chmod(0o600)
+        os.replace(pending, target)
+        target.chmod(0o600)
+    except Exception:
+        try:
+            pending.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    return target, backup, version
+
+
+_SELF_UPDATE_WATCHDOG = r'''
+import json, os, subprocess, sys, time, urllib.request
+target, backup, version, health = sys.argv[1:5]
+for _ in range(10):
+    time.sleep(2)
+    try:
+        with urllib.request.urlopen(health, timeout=2) as response:
+            data = json.loads(response.read(65536).decode("utf-8"))
+        if data.get("status") == "ok" and data.get("version") == version:
+            raise SystemExit(0)
+    except Exception:
+        pass
+if os.path.isfile(backup):
+    os.replace(backup, target)
+    subprocess.run(["systemctl", "--user", "restart", "hermes-bridge"],
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, check=False)
+'''
+
+
+def _self_update_health_url():
+    host = os.environ.get("BRIDGE_HOST", "127.0.0.1").strip()
+    if host in {"", "0.0.0.0", "::", "localhost"}:
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = int(os.environ.get("BRIDGE_PORT", "9131"))
+    return f"http://{host}:{port}/bridge/health"
+
+
+def _launch_self_update_watchdog(target, backup, version):
+    subprocess.Popen(
+        [sys.executable, "-c", _SELF_UPDATE_WATCHDOG, str(target),
+         str(backup), version, _self_update_health_url()],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+
+
+async def _restart_bridge_service():
+    await asyncio.sleep(0.5)
+    proc = await asyncio.create_subprocess_exec(
+        "systemctl", "--user", "restart", "hermes-bridge",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+
+
 def _resolve_target(name):
     """(path, scope, mode, None) del destino allowlisted, o (None,None,None,err)."""
     entry = TARGETS.get(name)
@@ -282,11 +411,41 @@ async def capabilities(request):
             "logs_extended": True,
             "audit_read": True,
             "tts_neutts": can_write and "config" in SCOPES,
+            "self_update": can_write and "config" in SCOPES
+                           and _self_update_path_allowed(),
         },
         "targets": targets,
         "write_targets": write_targets,
         "backups": {"enabled": True},
     })
+
+
+async def self_update(request):
+    """Actualiza solo el script canónico del Bridge, con rollback vigilado."""
+    if (e := _check_auth(request, "config")):
+        return e
+    if READ_ONLY:
+        return _err("read_only", "El bridge está en modo solo lectura", 403)
+    try:
+        body = await request.json()
+    except Exception:
+        return _err("bad_json", "Cuerpo no es JSON válido")
+    try:
+        target, backup, version = _stage_self_update(body)
+        _launch_self_update_watchdog(target, backup, version)
+    except ValueError:
+        return _err("invalid_release", "Release del bridge no válida", 400)
+    except Exception as ex:
+        _audit("self_update", {}, "error", {"detail": type(ex).__name__})
+        return _err("self_update_failed", "No se pudo preparar la actualización", 500)
+
+    _audit("self_update", {"version": version}, "accepted")
+    asyncio.create_task(_restart_bridge_service())
+    return web.json_response({
+        "ok": True,
+        "version": version,
+        "restarting": True,
+    }, status=202)
 
 
 async def provision(request):
@@ -3221,6 +3380,7 @@ def build_app():
     app = web.Application(client_max_size=MAX_ATTACHMENT_BYTES + 1024)
     app.router.add_get("/bridge/health", health)
     app.router.add_get("/bridge/capabilities", capabilities)
+    app.router.add_post("/bridge/self-update", self_update)
     app.router.add_post("/bridge/provision", provision)
     app.router.add_post("/bridge/chat", chat)
     app.router.add_post("/bridge/chat/stream", chat_stream)
