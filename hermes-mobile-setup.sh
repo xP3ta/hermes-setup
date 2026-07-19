@@ -789,14 +789,30 @@ if ! wait_probe dashboard http://127.0.0.1:9119 60; then
 fi
 echo "Dashboard health + Gateway state OK ($SERVICE_MANAGER)"
 
+SUDO_READY=0
 run_privileged() {
   if [ "$(id -u)" -eq 0 ]; then
     "$@"
     return
   fi
-  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-    sudo -n "$@"
-    return
+  if command -v sudo >/dev/null 2>&1; then
+    if [ "$SUDO_READY" = 1 ] || sudo -n true >/dev/null 2>&1; then
+      SUDO_READY=1
+      sudo -n "$@"
+      return
+    fi
+    # `curl ... | sh` occupies stdin with the script itself. Read the sudo
+    # password from the controlling terminal so an ordinary interactive user
+    # can finish firewall setup in one run. Agents/non-interactive shells still
+    # fail closed and receive the exact manual commands below.
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+      echo "Hermes Console needs administrator approval for a private firewall rule." >/dev/tty
+      if sudo -v </dev/tty; then
+        SUDO_READY=1
+        sudo -n "$@"
+        return
+      fi
+    fi
   fi
   return 126
 }

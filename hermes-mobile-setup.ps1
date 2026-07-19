@@ -422,6 +422,48 @@ function Test-RestrictedFirewallRule([string]$DisplayName, [string]$Kind) {
     return $false
 }
 
+function Install-RestrictedFirewallRuleElevated([string]$Kind) {
+    # Elevate only the firewall mutation. The main installer keeps running as
+    # the original user, so Hermes, Scheduled Tasks and LOCALAPPDATA never end
+    # up under a different administrator profile.
+    $helper = Join-Path ([IO.Path]::GetTempPath()) (
+        "hermes-console-firewall-$([Guid]::NewGuid().ToString('N')).ps1"
+    )
+    $content = @'
+param([ValidateSet("mesh", "lan")][string]$Kind)
+$ErrorActionPreference = "Stop"
+Import-Module NetSecurity -ErrorAction Stop
+$display = if ($Kind -eq "mesh") {
+    "Hermes Console Tailscale"
+} else {
+    "Hermes Console private network"
+}
+Get-NetFirewallRule -DisplayName $display -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule -ErrorAction Stop
+if ($Kind -eq "mesh") {
+    New-NetFirewallRule -DisplayName $display -Direction Inbound -Action Allow `
+        -Protocol TCP -LocalPort 8642, 9119, 9131 -Profile Any `
+        -RemoteAddress "100.64.0.0/10" | Out-Null
+} else {
+    New-NetFirewallRule -DisplayName $display -Direction Inbound -Action Allow `
+        -Protocol TCP -LocalPort 8642, 9119, 9131 -Profile Private `
+        -RemoteAddress LocalSubnet | Out-Null
+}
+'@
+    [IO.File]::WriteAllText($helper, $content, $Utf8NoBom)
+    try {
+        Write-Info "Windows will request administrator approval for the restricted firewall rule."
+        $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$helper`" -Kind $Kind"
+        $process = Start-Process -FilePath (Get-PowerShellExecutable) -Verb RunAs `
+            -ArgumentList $arguments -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "The elevated firewall helper exited with code $($process.ExitCode)."
+        }
+    } finally {
+        Remove-Item -LiteralPath $helper -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
     if ($Pairing.Scheme -eq "https") { return }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -432,12 +474,27 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
     } else {
         "Hermes Console private network"
     }
+    if ($Pairing.Kind -eq "lan" -and $Pairing.InterfaceIndex) {
+        $profile = Get-NetConnectionProfile -InterfaceIndex $Pairing.InterfaceIndex -ErrorAction SilentlyContinue
+        if ($profile -and $profile.NetworkCategory -ne "Private") {
+            throw "The selected LAN is '$($profile.NetworkCategory)'. Mark it Private or use Tailscale before exposing Hermes."
+        }
+    }
     if (-not $admin) {
         if (Test-RestrictedFirewallRule $display $Pairing.Kind) {
             Write-Ok "Existing restricted Windows Firewall rule verified"
             return
         }
-        throw "Windows Firewall needs a restricted inbound rule. Re-run this same command in PowerShell as Administrator; no QR was generated."
+        try {
+            Install-RestrictedFirewallRuleElevated $Pairing.Kind
+        } catch {
+            throw "Windows Firewall needs a restricted inbound rule and elevation was not completed: $($_.Exception.Message) No QR was generated."
+        }
+        if (-not (Test-RestrictedFirewallRule $display $Pairing.Kind)) {
+            throw "The elevated Windows Firewall rule could not be verified; no QR was generated."
+        }
+        Write-Ok "Restricted Windows Firewall rule installed and verified"
+        return
     }
     try {
         Import-Module NetSecurity -ErrorAction Stop
@@ -448,12 +505,6 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
                 -RemoteAddress "100.64.0.0/10" | Out-Null
             Write-Ok "Tailscale-only Windows Firewall rule installed"
         } else {
-            if ($Pairing.InterfaceIndex) {
-                $profile = Get-NetConnectionProfile -InterfaceIndex $Pairing.InterfaceIndex -ErrorAction SilentlyContinue
-                if ($profile -and $profile.NetworkCategory -ne "Private") {
-                    throw "The selected LAN is '$($profile.NetworkCategory)'. Mark it Private or use Tailscale before exposing Hermes."
-                }
-            }
             New-NetFirewallRule -DisplayName $display -Direction Inbound -Action Allow `
                 -Protocol TCP -LocalPort 8642, 9119, 9131 -Profile Private `
                 -RemoteAddress LocalSubnet | Out-Null
