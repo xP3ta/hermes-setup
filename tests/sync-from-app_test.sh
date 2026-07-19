@@ -28,8 +28,12 @@ make_app() {
     > "$app/assets/bridge/hermes_bridge.py"
   printf '#!/bin/sh\necho setup-%s\n' "$version" \
     > "$app/scripts/hermes-mobile-setup.sh"
+  printf 'Write-Output "setup-%s"\n' "$version" \
+    > "$app/scripts/hermes-mobile-setup.ps1"
   printf '#!/bin/sh\necho pair-%s\n' "$version" \
     > "$app/scripts/hermes-pair.sh"
+  printf 'Write-Output "pair-%s"\n' "$version" \
+    > "$app/scripts/hermes-pair.ps1"
 }
 
 make_repo() {
@@ -39,7 +43,9 @@ make_repo() {
   chmod +x "$repo/sync-from-app.sh"
   printf 'VERSION = "0.0.1"\n' > "$repo/hermes_bridge.py"
   printf '#!/bin/sh\necho old-setup\n' > "$repo/hermes-mobile-setup.sh"
+  printf 'Write-Output "old-setup"\n' > "$repo/hermes-mobile-setup.ps1"
   printf '#!/bin/sh\necho old-pair\n' > "$repo/hermes-pair.sh"
+  printf 'Write-Output "old-pair"\n' > "$repo/hermes-pair.ps1"
   printf 'tracked notes\n' > "$repo/notes.txt"
   git -C "$repo" init -q -b main
   git -C "$repo" config user.name 'Sync Test'
@@ -55,12 +61,14 @@ test_dry_run_is_non_destructive() {
   make_repo "$repo"
 
   printf '# local QR work\n' >> "$repo/hermes-mobile-setup.sh"
+  printf '# local Windows work\n' >> "$repo/hermes-mobile-setup.ps1"
   printf '# local QR work\n' >> "$repo/hermes-pair.sh"
+  printf '# local Windows work\n' >> "$repo/hermes-pair.ps1"
   printf 'untracked\n' > "$repo/scratch.txt"
 
   local status_before hashes_before head_before
   status_before="$(git -C "$repo" status --porcelain=v1)"
-  hashes_before="$(sha256sum "$repo/hermes-mobile-setup.sh" "$repo/hermes-pair.sh")"
+  hashes_before="$(sha256sum "$repo/hermes-mobile-setup.sh" "$repo/hermes-mobile-setup.ps1" "$repo/hermes-pair.sh" "$repo/hermes-pair.ps1")"
   head_before="$(git -C "$repo" rev-parse HEAD)"
 
   HERMES_APP_DIR="$app" "$repo/sync-from-app.sh" --dry-run >/dev/null
@@ -68,7 +76,7 @@ test_dry_run_is_non_destructive() {
   assert_eq "$status_before" "$(git -C "$repo" status --porcelain=v1)" \
     'dry-run status'
   assert_eq "$hashes_before" \
-    "$(sha256sum "$repo/hermes-mobile-setup.sh" "$repo/hermes-pair.sh")" \
+    "$(sha256sum "$repo/hermes-mobile-setup.sh" "$repo/hermes-mobile-setup.ps1" "$repo/hermes-pair.sh" "$repo/hermes-pair.ps1")" \
     'dry-run dirty file hashes'
   assert_eq "$head_before" "$(git -C "$repo" rev-parse HEAD)" 'dry-run HEAD'
   [[ ! -e "$repo/bridge-release.json" ]] || fail 'dry-run created manifest'
@@ -99,7 +107,7 @@ test_local_commit_and_explicit_publish() {
     'default mode pushed unexpectedly'
 
   commit_files="$(git -C "$repo" show --pretty=format: --name-only HEAD | sed '/^$/d' | sort)"
-  assert_eq $'bridge-release.json\nhermes-mobile-setup.sh\nhermes-pair.sh\nhermes_bridge.py' \
+  assert_eq $'bridge-release.json\nhermes-mobile-setup.ps1\nhermes-mobile-setup.sh\nhermes-pair.ps1\nhermes-pair.sh\nhermes_bridge.py' \
     "$commit_files" 'canonical commit paths'
   staged_files="$(git -C "$repo" diff --cached --name-only)"
   assert_eq 'notes.txt' "$staged_files" 'unrelated staged change preservation'

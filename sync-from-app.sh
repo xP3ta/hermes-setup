@@ -9,7 +9,9 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_FILES=(
   hermes_bridge.py
   hermes-mobile-setup.sh
+  hermes-mobile-setup.ps1
   hermes-pair.sh
+  hermes-pair.ps1
 )
 CANONICAL_FILES=(
   "${SOURCE_FILES[@]}"
@@ -56,7 +58,9 @@ source_path() {
   case "$1" in
     hermes_bridge.py) printf '%s\n' "$APP_DIR/assets/bridge/hermes_bridge.py" ;;
     hermes-mobile-setup.sh) printf '%s\n' "$APP_DIR/scripts/hermes-mobile-setup.sh" ;;
+    hermes-mobile-setup.ps1) printf '%s\n' "$APP_DIR/scripts/hermes-mobile-setup.ps1" ;;
     hermes-pair.sh) printf '%s\n' "$APP_DIR/scripts/hermes-pair.sh" ;;
+    hermes-pair.ps1) printf '%s\n' "$APP_DIR/scripts/hermes-pair.ps1" ;;
     *) return 1 ;;
   esac
 }
