@@ -1,5 +1,5 @@
 #!/bin/sh
-# Hermes Console — cross-platform Unix setup (Linux, macOS, WSL2, Termux).
+# Hermes Console — verified Unix setup (Linux, macOS, Termux and explicit WSL).
 # Native Windows uses hermes-mobile-setup.ps1 from the same public repository.
 set -eu
 
@@ -17,9 +17,25 @@ case "$(uname -s 2>/dev/null || echo unknown)" in
   *) PLATFORM="unix" ;;
 esac
 
+# WSL normally exposes a NAT address that an Android phone cannot reach.
+# Native PowerShell can also configure Windows Firewall and persistent tasks,
+# so it is the reliable default. Routed WSL installations may opt in with an
+# explicit address.
+if [ "$PLATFORM" = "linux" ] && { [ -n "${WSL_INTEROP:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; }; then
+  if [ -z "${HERMES_PAIR_HOST:-}" ]; then
+    echo "WSL detected. Its automatic IP is not reliably reachable from a phone."
+    echo "Run the native Windows installer in PowerShell instead:"
+    echo "  $WINDOWS_COMMAND"
+    echo "Advanced routed WSL setups may set HERMES_PAIR_HOST explicitly."
+    exit 2
+  fi
+fi
+
 HH="${HERMES_HOME:-$HOME/.hermes}"
 SERVICES="$HH/console-services"
 LOGS="$HH/logs"
+PROBE="$SERVICES/hermes-service-probe.py"
+PAIR_ENV="$SERVICES/pairing.env"
 mkdir -p "$HH" "$SERVICES" "$LOGS"
 
 port_listening() {
@@ -31,6 +47,31 @@ port_listening() {
   else
     netstat -an 2>/dev/null | grep -E "[.:]$port[[:space:]].*LISTEN" >/dev/null
   fi
+}
+
+show_port_owner() {
+  port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sed -n '1,4p' || true
+  elif command -v ss >/dev/null 2>&1; then
+    ss -ltnp "sport = :$port" 2>/dev/null | sed -n '1,4p' || true
+  fi
+}
+
+service_failure() {
+  name="$1"
+  port="$2"
+  log_name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  echo "ERROR: $name did not pass its authenticated Hermes health checks on TCP $port."
+  if port_listening "$port"; then
+    echo "TCP $port is occupied, but it is not the expected healthy $name service:"
+    show_port_owner "$port"
+    echo "The installer did not kill that process. Stop the conflict and run setup again."
+  else
+    echo "Nothing is listening on TCP $port."
+  fi
+  echo "Inspect $LOGS/$log_name.log or the platform service logs, then retry."
+  exit 1
 }
 
 # Resolve the best available per-user service manager. A portable supervisor
@@ -63,7 +104,8 @@ if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
   if [ -z "$HB" ] || ! "$HB" --version >/dev/null 2>&1; then
     echo "Installing Hermes Agent for $PLATFORM..."
     curl -fsSL https://hermes-agent.nousresearch.com/install.sh | \
-      bash -s -- --skip-setup --non-interactive --skip-browser
+      bash -s -- --skip-setup --non-interactive --skip-browser \
+      --hermes-home "$HH" --dir "$HH/hermes-agent"
     HB="$HH/hermes-agent/venv/bin/hermes"
     [ -x "$HB" ] || HB="$(command -v hermes 2>/dev/null || true)"
   fi
@@ -77,7 +119,11 @@ fi
 VP="$HH/hermes-agent/venv/bin/python3"
 [ -x "$VP" ] || VP="$HH/hermes-agent/venv/bin/python"
 if [ ! -x "$VP" ]; then
-  HB_DIR="$(CDPATH= cd -- "$(dirname -- "$HB")" 2>/dev/null && pwd -P || dirname -- "$HB")"
+  HB_REAL="$HB"
+  if command -v realpath >/dev/null 2>&1; then
+    HB_REAL="$(realpath "$HB" 2>/dev/null || printf '%s' "$HB")"
+  fi
+  HB_DIR="$(CDPATH= cd -- "$(dirname -- "$HB_REAL")" 2>/dev/null && pwd -P || dirname -- "$HB_REAL")"
   VP="$HB_DIR/python3"
   [ -x "$VP" ] || VP="$HB_DIR/python"
 fi
@@ -91,35 +137,362 @@ fi
   exit 1
 }
 
-# Shared gateway/bridge token. Existing values are never rotated.
-KEY="$(grep -E '^API_SERVER_KEY=' "$HH/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')"
-if [ -z "$KEY" ]; then
-  if command -v openssl >/dev/null 2>&1; then
-    KEY="$(openssl rand -hex 32)"
-  else
-    KEY="$("$VP" -c 'import secrets; print(secrets.token_hex(32))')"
-  fi
-  printf 'API_SERVER_KEY=%s\n' "$KEY" >> "$HH/.env"
-fi
+# Preserve one usable existing API key. Blank, placeholder or too-short legacy
+# values cannot start modern Hermes, so those are repaired atomically.
+# Conflicting duplicate strong values fail closed instead of guessing.
+KEY="$("$VP" - "$HH/.env" <<'PY'
+import os, pathlib, secrets, sys
+
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+values = []
+for line in lines:
+    if line.startswith("API_SERVER_KEY="):
+        values.append(line.split("=", 1)[1].strip().strip('"').strip("'"))
+placeholders = {"changeme", "change-me", "your-api-key", "replace-me", "secret"}
+strong = [v for v in values if len(v) >= 16 and v.lower() not in placeholders]
+if len(set(strong)) > 1:
+    raise SystemExit(
+        "ERROR: conflicting API_SERVER_KEY entries exist in .env; "
+        "keep exactly one and retry"
+    )
+key = strong[0] if strong else secrets.token_hex(32)
+out, inserted = [], False
+for line in lines:
+    if line.startswith("API_SERVER_KEY="):
+        if not inserted:
+            out.append("API_SERVER_KEY=" + key)
+            inserted = True
+        continue
+    out.append(line)
+if not inserted:
+    out.append("API_SERVER_KEY=" + key)
+tmp = path.with_name(path.name + ".new")
+tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print(key)
+PY
+)"
 chmod 600 "$HH/.env" 2>/dev/null || true
 
-# Reachable host: mesh VPN > private LAN > public address > loopback.
+# Reachable host: mesh VPN > private LAN. Public HTTP and loopback never
+# produce a QR because the Android release rejects or cannot reach them.
 IPS=""
 if command -v ip >/dev/null 2>&1; then
-  IPS="$(ip -o -4 addr show 2>/dev/null | awk '$2 !~ /^(lo|docker|br-|veth|virbr|podman|cni|lxc)/ {split($4,a,"/"); if (a[1] !~ /^127\./) print a[1]}' || true)"
+  IPS="$(ip -o -4 addr show 2>/dev/null | awk '$2 !~ /^(lo|docker|br-|veth|virbr|podman|cni|lxc)/ {if ($4 !~ /^(127\.|169\.254\.)/) print $4}' || true)"
 elif command -v ifconfig >/dev/null 2>&1; then
-  IPS="$(ifconfig 2>/dev/null | awk '/^[[:alnum:]]/ {iface=$1; sub(":$","",iface)} /inet / && iface !~ /^(lo|bridge|vmenet|docker|utun|awdl|llw)/ {ip=$2; sub(/^addr:/,"",ip); if (ip !~ /^127\./) print ip}' || true)"
+  IPS="$(ifconfig 2>/dev/null | awk '/^[[:alnum:]]/ {iface=$1; sub(":$","",iface)} /inet / && iface !~ /^(lo|bridge|vmenet|docker|utun|awdl|llw)/ {ip=$2; sub(/^addr:/,"",ip); if (ip !~ /^(127\.|169\.254\.)/) print ip "/"}' || true)"
 elif command -v hostname >/dev/null 2>&1; then
-  IPS="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -v '^127\.' || true)"
+  IPS="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -Ev '^(127\.|169\.254\.)' | sed 's|$|/|' || true)"
 fi
-HOST="$(tailscale ip -4 2>/dev/null | head -1 || true)"
-[ -n "$HOST" ] || HOST="$(printf '%s\n' "$IPS" | grep -E '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' | head -1 || true)"
-[ -n "$HOST" ] || HOST="$(printf '%s\n' "$IPS" | grep -E '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' | head -1 || true)"
-PUBLIC=""
+
+HOST="${HERMES_PAIR_HOST:-}"
+NETWORK_KIND="override"
+HOST_RECORD=""
 if [ -z "$HOST" ]; then
-  HOST="$(printf '%s\n' "$IPS" | head -1)"
-  if [ -n "$HOST" ]; then PUBLIC=1; else HOST="127.0.0.1"; fi
+  HOST="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+  if [ -n "$HOST" ]; then
+    NETWORK_KIND="mesh"
+  else
+    HOST_RECORD="$(printf '%s\n' "$IPS" | grep -E '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' | head -1 || true)"
+    if [ -n "$HOST_RECORD" ]; then
+      HOST="${HOST_RECORD%%/*}"
+      NETWORK_KIND="mesh"
+    else
+      HOST_RECORD="$(printf '%s\n' "$IPS" | grep -E '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' | head -1 || true)"
+      if [ -n "$HOST_RECORD" ]; then
+        HOST="${HOST_RECORD%%/*}"
+        NETWORK_KIND="lan"
+      fi
+    fi
+  fi
 fi
+
+PAIR_SCHEME="${HERMES_PAIR_SCHEME:-http}"
+case "$PAIR_SCHEME" in
+  http|https) ;;
+  *) echo "ERROR: HERMES_PAIR_SCHEME must be http or https."; exit 1 ;;
+esac
+PAIR_PORT="${HERMES_PAIR_PORT:-}"
+if [ -z "$PAIR_PORT" ]; then
+  if [ "$PAIR_SCHEME" = "https" ]; then PAIR_PORT=443; else PAIR_PORT=8642; fi
+fi
+case "$PAIR_PORT" in
+  *[!0-9]*|'') echo "ERROR: HERMES_PAIR_PORT must be a TCP port."; exit 1 ;;
+esac
+if [ "$PAIR_PORT" -lt 1 ] || [ "$PAIR_PORT" -gt 65535 ]; then
+  echo "ERROR: HERMES_PAIR_PORT is out of range."
+  exit 1
+fi
+if [ -z "$HOST" ]; then
+  echo "ERROR: no private LAN or Tailscale address was found, so no safe mobile QR can be created."
+  echo "Connect Tailscale or join the phone to this LAN. For a public server, configure HTTPS"
+  echo "and rerun with HERMES_PAIR_HOST=<name> HERMES_PAIR_SCHEME=https."
+  exit 1
+fi
+case "$HOST" in
+  *[!A-Za-z0-9._:-]*|*/*|*://*)
+    echo "ERROR: HERMES_PAIR_HOST is not a valid host name or IP address."
+    exit 1
+    ;;
+esac
+
+HOST_INFO="$("$VP" - "$HOST" "$PAIR_SCHEME" "$HOST_RECORD" <<'PY'
+import ipaddress, socket, sys
+
+host, scheme, record = sys.argv[1:]
+try:
+    ip = ipaddress.ip_address(host)
+except ValueError:
+    try:
+        ip = ipaddress.ip_address(socket.gethostbyname(host))
+    except Exception:
+        ip = None
+private_name = (
+    host.lower().endswith((".local", ".ts.net"))
+    or "." not in host
+    or host.lower().endswith((".test", ".example"))
+)
+cgnat = bool(
+    ip and ip.version == 4
+    and ipaddress.ip_address("100.64.0.0") <= ip
+    <= ipaddress.ip_address("100.127.255.255")
+)
+allowed_http = bool(ip and (ip.is_private or ip.is_loopback or cgnat)) or private_name
+if host.lower() == "localhost" or (ip and ip.is_loopback):
+    raise SystemExit(
+        "ERROR: loopback is not reachable from a phone; use a LAN/Tailscale address"
+    )
+if scheme == "http" and not allowed_http:
+    raise SystemExit(
+        "ERROR: public HTTP is blocked; use Tailscale/LAN or HERMES_PAIR_SCHEME=https"
+    )
+kind = "mesh" if cgnat else "lan"
+source = "100.64.0.0/10" if cgnat else ""
+if not source and ip and ip.version == 4:
+    prefix = None
+    if record and "/" in record:
+        try:
+            prefix = int(record.rsplit("/", 1)[1])
+        except ValueError:
+            pass
+    if prefix is not None:
+        source = str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+    elif ip in ipaddress.ip_network("10.0.0.0/8"):
+        source = "10.0.0.0/8"
+    elif ip in ipaddress.ip_network("172.16.0.0/12"):
+        source = "172.16.0.0/12"
+    elif ip in ipaddress.ip_network("192.168.0.0/16"):
+        source = "192.168.0.0/16"
+if scheme == "http" and not source:
+    raise SystemExit(
+        "ERROR: could not determine a private firewall source for this host; use HTTPS"
+    )
+print(kind + "|" + source)
+PY
+)"
+[ "$NETWORK_KIND" = "override" ] && NETWORK_KIND="${HOST_INFO%%|*}"
+FIREWALL_SOURCE="${HOST_INFO#*|}"
+
+BASE_HOST="$HOST"
+case "$BASE_HOST" in *:*) BASE_HOST="[$BASE_HOST]" ;; esac
+GATEWAY_BASE="$PAIR_SCHEME://$BASE_HOST:$PAIR_PORT"
+if [ "$PAIR_SCHEME" = "http" ]; then
+  DASHBOARD_BASE="${HERMES_DASHBOARD_URL:-http://$BASE_HOST:9119}"
+  BRIDGE_BASE="${HERMES_BRIDGE_URL:-http://$BASE_HOST:9131}"
+  BIND_HOST="${HERMES_SERVICE_BIND_HOST:-0.0.0.0}"
+else
+  DASHBOARD_BASE="${HERMES_DASHBOARD_URL:-$GATEWAY_BASE}"
+  BRIDGE_BASE="${HERMES_BRIDGE_URL:-$GATEWAY_BASE}"
+  BIND_HOST="${HERMES_SERVICE_BIND_HOST:-127.0.0.1}"
+fi
+case "$BIND_HOST" in
+  0.0.0.0|127.0.0.1) ;;
+  *) echo "ERROR: HERMES_SERVICE_BIND_HOST must be 0.0.0.0 or 127.0.0.1."; exit 1 ;;
+esac
+
+# Setup and the pair-only command share this installed, fail-closed verifier.
+# It validates JSON identity and authentication instead of an open TCP socket.
+cat > "$PROBE" <<'PY'
+#!/usr/bin/env python3
+import ipaddress
+import json
+import socket
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+kind, base, token = sys.argv[1:4]
+expected = sys.argv[4] if len(sys.argv) > 4 else ""
+phone_facing = len(sys.argv) > 5 and sys.argv[5] == "phone"
+base = base.rstrip("/")
+
+
+def private_address(value):
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return False
+    if ip.version == 6:
+        return ip in ipaddress.ip_network("fc00::/7")
+    return any(
+        ip in network
+        for network in (
+            ipaddress.ip_network("10.0.0.0/8"),
+            ipaddress.ip_network("172.16.0.0/12"),
+            ipaddress.ip_network("192.168.0.0/16"),
+            ipaddress.ip_network("100.64.0.0/10"),
+        )
+    )
+
+
+def assert_phone_url():
+    try:
+        parsed = urllib.parse.urlsplit(base)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        raise RuntimeError("invalid phone-facing service URL") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("invalid phone-facing service URL")
+    host = parsed.hostname.lower()
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if host == "localhost" or (literal and literal.is_loopback):
+        raise RuntimeError("loopback is not reachable from the phone")
+    if parsed.scheme == "https":
+        return
+    private_name = host.endswith((".local", ".ts.net")) or "." not in host
+    if literal is not None:
+        addresses = [literal]
+    else:
+        try:
+            addresses = {
+                ipaddress.ip_address(item[4][0])
+                for item in socket.getaddrinfo(
+                    host,
+                    port,
+                    type=socket.SOCK_STREAM,
+                )
+            }
+        except OSError:
+            addresses = set()
+    if addresses and all(private_address(str(address)) for address in addresses):
+        return
+    if not addresses and private_name:
+        return
+    raise RuntimeError("public HTTP is blocked; use LAN/Tailscale or HTTPS")
+
+
+def fetch(path, auth=False):
+    headers = {"Accept": "application/json"}
+    if auth:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(base + path, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=6) as response:
+            status = response.status
+            raw = response.read(1024 * 1024)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"{path} returned HTTP {exc.code}") from None
+    except Exception as exc:
+        raise RuntimeError(
+            f"{path} is unreachable ({type(exc).__name__})"
+        ) from None
+    if status != 200:
+        raise RuntimeError(f"{path} returned HTTP {status}")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise RuntimeError(f"{path} did not return JSON") from None
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{path} returned the wrong JSON shape")
+    return value
+
+
+try:
+    if phone_facing:
+        assert_phone_url()
+    if kind == "gateway":
+        health = fetch("/health")
+        if health.get("status") != "ok" or health.get("platform") != "hermes-agent":
+            raise RuntimeError("/health is not Hermes Gateway")
+        sessions = fetch("/api/sessions", auth=True)
+        if sessions.get("object") != "list" or not isinstance(
+            sessions.get("data"), list
+        ):
+            raise RuntimeError(
+                "/api/sessions is not the authenticated Hermes API"
+            )
+    elif kind == "bridge":
+        health = fetch("/bridge/health")
+        if health.get("status") != "ok" or not isinstance(
+            health.get("version"), str
+        ):
+            raise RuntimeError("/bridge/health is not Hermes Mobile Bridge")
+        if expected and health.get("version") != expected:
+            raise RuntimeError(
+                f"Bridge version is {health.get('version')}, expected {expected}"
+            )
+        caps = fetch("/bridge/capabilities", auth=True)
+        operations = caps.get("operations")
+        scopes = caps.get("scopes")
+        if (
+            caps.get("object") != "hermes.bridge.capabilities"
+            or not isinstance(operations, dict)
+            or operations.get("self_update") is not True
+            or not isinstance(scopes, list)
+            or "read" not in scopes
+            or "config" not in scopes
+        ):
+            raise RuntimeError(
+                "Bridge auth/config/self-update capability check failed"
+            )
+    elif kind == "dashboard":
+        status = fetch("/api/status")
+        if not isinstance(status.get("version"), str) or not isinstance(
+            status.get("gateway_running"), bool
+        ):
+            raise RuntimeError("/api/status is not Hermes Dashboard")
+        if status.get("gateway_running") is not True:
+            raise RuntimeError("Dashboard reports that Hermes Gateway is stopped")
+    else:
+        raise RuntimeError("unknown service kind")
+except RuntimeError as exc:
+    print(f"{kind}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+chmod 700 "$PROBE"
+
+wait_probe() {
+  kind="$1"
+  base="$2"
+  seconds="$3"
+  expected="${4:-}"
+  mode="${5:-}"
+  i=0
+  while [ "$i" -lt "$seconds" ]; do
+    if "$VP" "$PROBE" "$kind" "$base" "$KEY" "$expected" "$mode" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  "$VP" "$PROBE" "$kind" "$base" "$KEY" "$expected" "$mode" || true
+  return 1
+}
 
 # Verified Bridge release: closed manifest, exact size/hash/version, compile,
 # backup and atomic swap. No bytes execute before every check passes.
@@ -131,7 +504,7 @@ cleanup_downloads() { rm -f "$NEW" "$MANIFEST"; }
 trap cleanup_downloads EXIT HUP INT TERM
 curl -fsSL "$REPO_RAW/bridge-release.json" -o "$MANIFEST"
 curl -fsSL "$REPO_RAW/hermes_bridge.py" -o "$NEW"
-"$VP" - "$MANIFEST" "$NEW" <<'PY'
+BRIDGE_VERSION="$("$VP" - "$MANIFEST" "$NEW" <<'PY'
 import hashlib, json, pathlib, re, sys
 manifest_path, bridge_path = map(pathlib.Path, sys.argv[1:])
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -159,14 +532,22 @@ versions = re.findall(
 if versions != [version]:
     raise SystemExit("Bridge source VERSION mismatch")
 compile(source, str(bridge_path), "exec")
+print(version)
 PY
+)"
 chmod 600 "$NEW"
 "$VP" -m py_compile "$NEW"
-[ ! -f "$TARGET" ] || cp -p "$TARGET" "$BACKUP"
+HAD_BRIDGE_TARGET=0
+if [ -f "$TARGET" ]; then
+  HAD_BRIDGE_TARGET=1
+  cp -p "$TARGET" "$BACKUP"
+else
+  rm -f "$BACKUP"
+fi
 mv "$NEW" "$TARGET"
 
 ENV_FILE="$HH/bridge.env"
-printf 'BRIDGE_HOST=0.0.0.0\nBRIDGE_PORT=9131\nBRIDGE_SCOPES=read,memory,soul,skills,cron,config,command\nBRIDGE_READ_ONLY=false\nBRIDGE_TOKEN=%s\n' "$KEY" > "$ENV_FILE"
+printf 'BRIDGE_HOST=%s\nBRIDGE_PORT=9131\nBRIDGE_SCOPES=read,memory,soul,skills,cron,config,command\nBRIDGE_READ_ONLY=false\nBRIDGE_TOKEN=%s\n' "$BIND_HOST" "$KEY" > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 GATEWAY_RUNNER="$SERVICES/hermes-gateway.sh"
@@ -177,16 +558,16 @@ HELPER="$SERVICES/service-manager.sh"
 cat > "$GATEWAY_RUNNER" <<EOF
 #!/bin/sh
 export HERMES_HOME="$HH"
-export API_SERVER_HOST=0.0.0.0
+export API_SERVER_HOST="$BIND_HOST"
 export API_SERVER_PORT=8642
 cd "$HH"
-exec "$HB" gateway run
+exec "$HB" gateway run --replace
 EOF
 cat > "$DASHBOARD_RUNNER" <<EOF
 #!/bin/sh
 export HERMES_HOME="$HH"
 cd "$HH"
-exec "$HB" dashboard --host 0.0.0.0 --port 9119 --no-open
+exec "$HB" dashboard --host "$BIND_HOST" --port 9119 --no-open
 EOF
 HELPER_EXPORT=""
 [ "$SERVICE_MANAGER" = "portable" ] && HELPER_EXPORT="export BRIDGE_SERVICE_HELPER=\"$HELPER\""
@@ -211,9 +592,9 @@ set -eu
 ACTION="\${1:-}"
 NAME="\${2:-}"
 case "\$NAME" in
-  gateway) RUNNER="$GATEWAY_RUNNER" ;;
-  dashboard) RUNNER="$DASHBOARD_RUNNER" ;;
-  bridge) RUNNER="$BRIDGE_RUNNER" ;;
+  gateway) RUNNER="$GATEWAY_RUNNER"; EXPECTED_EXE="$HB"; EXPECTED_ARGS="gateway run --replace" ;;
+  dashboard) RUNNER="$DASHBOARD_RUNNER"; EXPECTED_EXE="$HB"; EXPECTED_ARGS="dashboard --host" ;;
+  bridge) RUNNER="$BRIDGE_RUNNER"; EXPECTED_EXE="$TARGET"; EXPECTED_ARGS="--i-know-what-im-doing" ;;
   *) exit 2 ;;
 esac
 PIDFILE="$SERVICES/\$NAME.pid"
@@ -224,8 +605,15 @@ stop_service() {
   case "\$PID" in *[!0-9]*|'') rm -f "\$PIDFILE"; return 0 ;; esac
   if kill -0 "\$PID" 2>/dev/null; then
     CMD="\$(ps -p "\$PID" -o command= 2>/dev/null || true)"
-    case "\$CMD" in *"\$RUNNER"*|*hermes_bridge.py*|*" dashboard "*|*" gateway run"*) kill "\$PID" 2>/dev/null || true ;; *) exit 3 ;; esac
-    i=0; while kill -0 "\$PID" 2>/dev/null && [ "\$i" -lt 3 ]; do sleep 1; i=\$((i + 1)); done
+    case "\$CMD" in
+      *"\$EXPECTED_EXE"*"\$EXPECTED_ARGS"*) kill "\$PID" 2>/dev/null || true ;;
+      *) echo "Refusing to stop PID \$PID: it is not the expected Hermes \$NAME service." >&2; exit 3 ;;
+    esac
+    i=0; while kill -0 "\$PID" 2>/dev/null && [ "\$i" -lt 5 ]; do sleep 1; i=\$((i + 1)); done
+    if kill -0 "\$PID" 2>/dev/null; then
+      echo "Hermes \$NAME did not stop cleanly; refusing to start a duplicate." >&2
+      return 1
+    fi
   fi
   rm -f "\$PIDFILE"
 }
@@ -250,7 +638,8 @@ install_systemd_unit() {
   cat > "$unit" <<EOF
 [Unit]
 Description=Hermes Console $name
-After=network.target
+After=network-online.target
+Wants=network-online.target
 [Service]
 ExecStart="$runner"
 WorkingDirectory="$HH"
@@ -265,17 +654,18 @@ install_launchd_job() {
   name="$1"
   label="$2"
   runner="$3"
-  start_now="$4"
+  run_at_load="$4"
+  start_now="$5"
   plist="$HOME/Library/LaunchAgents/$label.plist"
   mkdir -p "$HOME/Library/LaunchAgents"
-  "$VP" - "$plist" "$label" "$runner" "$HH" "$LOGS/$name.log" "$start_now" <<'PY'
+  "$VP" - "$plist" "$label" "$runner" "$HH" "$LOGS/$name.log" "$run_at_load" <<'PY'
 import pathlib, plistlib, sys
-path, label, runner, workdir, log, start = sys.argv[1:]
+path, label, runner, workdir, log, run_at_load = sys.argv[1:]
 payload = {
     "Label": label,
     "ProgramArguments": [runner],
     "WorkingDirectory": workdir,
-    "RunAtLoad": start == "yes",
+    "RunAtLoad": run_at_load == "yes",
     "KeepAlive": {"SuccessfulExit": False},
     "ProcessType": "Background",
     "StandardOutPath": log,
@@ -314,59 +704,184 @@ case "$SERVICE_MANAGER" in
     install_systemd_unit bridge "$BRIDGE_RUNNER"
     systemctl --user daemon-reload
     systemctl --user enable hermes-gateway hermes-dashboard hermes-bridge >/dev/null 2>&1
-    port_listening 8642 || systemctl --user restart hermes-gateway
+    systemctl --user restart hermes-gateway
     systemctl --user restart hermes-bridge
     ;;
   launchd)
-    if ! port_listening 8642; then
-      install_launchd_job gateway dev.xpetalab.hermes-console.gateway "$GATEWAY_RUNNER" yes
-    fi
-    if ! port_listening 9119; then
-      install_launchd_job dashboard dev.xpetalab.hermes-console.dashboard "$DASHBOARD_RUNNER" no
-    fi
-    install_launchd_job bridge dev.xpetalab.hermes-console.bridge "$BRIDGE_RUNNER" yes
+    install_launchd_job gateway dev.xpetalab.hermes-console.gateway "$GATEWAY_RUNNER" yes yes
+    install_launchd_job dashboard dev.xpetalab.hermes-console.dashboard "$DASHBOARD_RUNNER" yes no
+    install_launchd_job bridge dev.xpetalab.hermes-console.bridge "$BRIDGE_RUNNER" yes yes
     ;;
   portable)
-    port_listening 8642 || "$HELPER" restart gateway
+    "$HELPER" restart gateway
     "$HELPER" restart bridge
-    echo "WARNING: no supported persistent service manager was available."
-    echo "Gateway and Bridge are running for this session; configure systemd/launchd"
-    echo "or your platform's startup manager to keep them across reboots."
+    echo "WARNING: no supported persistent service manager is available."
+    echo "Services work in this session but will not survive a reboot until a startup manager is configured."
     ;;
 esac
 
-i=0
-while [ "$i" -lt 15 ] && ! port_listening 9131; do sleep 1; i=$((i + 1)); done
-if port_listening 9131; then
-  echo "Bridge 9131 OK ($SERVICE_MANAGER)"
-else
-  echo "ERROR: the bridge did not start. Check $LOGS/bridge.log or your service logs."
-  if [ -f "$BACKUP" ]; then mv "$BACKUP" "$TARGET"; start_named_service bridge || true; fi
+if ! wait_probe gateway http://127.0.0.1:8642 40; then
+  service_failure Gateway 8642
+fi
+echo "Gateway authenticated health OK ($SERVICE_MANAGER)"
+
+if ! wait_probe bridge http://127.0.0.1:9131 40 "$BRIDGE_VERSION"; then
+  if [ -f "$BACKUP" ]; then
+    mv "$BACKUP" "$TARGET"
+    start_named_service bridge >/dev/null 2>&1 || true
+  elif [ "$HAD_BRIDGE_TARGET" = 0 ]; then
+    rm -f "$TARGET"
+  fi
+  service_failure Bridge 9131
+fi
+echo "Mobile Bridge $BRIDGE_VERSION auth + self-update OK ($SERVICE_MANAGER)"
+
+# Ensure a strong initial Dashboard password through the authenticated Bridge.
+# Existing credentials are preserved on repair/update; setup never prints them.
+"$HB" dashboard --stop >/dev/null 2>&1 || true
+DASH_PASS="$("$VP" -c 'import secrets; print(secrets.token_urlsafe(24))')"
+if ! "$VP" - "http://127.0.0.1:9131" "$KEY" "$DASH_PASS" <<'PY'
+import json, sys, urllib.request
+
+base, token, password = sys.argv[1:]
+headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+try:
+    request = urllib.request.Request(
+        base + "/bridge/dashboard/credentials", headers=headers
+    )
+    with urllib.request.urlopen(request, timeout=65) as response:
+        status = response.status
+        value = json.loads(response.read(1024 * 1024).decode())
+    if status != 200 or value.get("ok") is not True:
+        raise RuntimeError("credential endpoint rejected the read")
+    if value.get("password_set") is not True:
+        body = json.dumps(
+            {"username": value.get("username") or "admin", "password": password}
+        ).encode()
+        request = urllib.request.Request(
+            base + "/bridge/dashboard/credentials",
+            data=body,
+            headers={
+                "Authorization": "Bearer " + token,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=65) as response:
+            status = response.status
+            value = json.loads(response.read(1024 * 1024).decode())
+        if status != 200 or value.get("ok") is not True:
+            raise RuntimeError("credential endpoint rejected the change")
+except Exception as exc:
+    print(
+        "Dashboard credential setup failed: " + type(exc).__name__,
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+then
+  echo "ERROR: Dashboard authentication could not be configured; no pairing QR will be shown."
+  exit 1
+fi
+start_named_service dashboard >/dev/null 2>&1 || true
+if ! wait_probe dashboard http://127.0.0.1:9119 60; then
+  service_failure Dashboard 9119
+fi
+echo "Dashboard health + Gateway state OK ($SERVICE_MANAGER)"
+
+run_privileged() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo -n "$@"
+    return
+  fi
+  return 126
+}
+
+ensure_private_firewall() {
+  [ "$PAIR_SCHEME" = "http" ] || return 0
+  if command -v ufw >/dev/null 2>&1; then
+    UFW_ACTIVE=""
+    if [ -r /etc/ufw/ufw.conf ] && grep -Eqi '^ENABLED=yes' /etc/ufw/ufw.conf; then
+      UFW_ACTIVE=1
+    else
+      UFW_STATUS="$(run_privileged ufw status 2>/dev/null || true)"
+      if printf '%s\n' "$UFW_STATUS" | grep -qi '^Status: active'; then UFW_ACTIVE=1; fi
+    fi
+    if [ -n "$UFW_ACTIVE" ]; then
+      for port in 8642 9119 9131; do
+        if ! run_privileged ufw allow from "$FIREWALL_SOURCE" to any port "$port" proto tcp comment 'Hermes Console' >/dev/null; then
+          echo "ERROR: UFW is active and a private rule could not be installed."
+          echo "Run these commands, then rerun setup:"
+          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port 8642 proto tcp"
+          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port 9119 proto tcp"
+          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port 9131 proto tcp"
+          return 1
+        fi
+      done
+      echo "UFW rules installed for private source $FIREWALL_SOURCE"
+    fi
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    for port in 8642 9119 9131; do
+      rule="rule family=ipv4 source address=$FIREWALL_SOURCE port port=$port protocol=tcp accept"
+      if ! run_privileged firewall-cmd --permanent --add-rich-rule="$rule" >/dev/null; then
+        echo "ERROR: firewalld is active and a private rule could not be installed."
+        echo "Add private TCP rules for 8642, 9119 and 9131 from $FIREWALL_SOURCE, then rerun setup."
+        return 1
+      fi
+    done
+    run_privileged firewall-cmd --reload >/dev/null
+    echo "firewalld rules installed for private source $FIREWALL_SOURCE"
+  fi
+}
+
+ensure_private_firewall
+
+# Decisive gate: use exactly the URLs encoded in the QR. A loopback-only bind,
+# wrong listener, bad token, broken reverse proxy or dead Dashboard stops here.
+if ! wait_probe gateway "$GATEWAY_BASE" 12 "" phone; then
+  echo "ERROR: Gateway works locally but not through $GATEWAY_BASE."
+  echo "Check bind, VPN/LAN routing, reverse proxy and host/cloud firewall."
+  exit 1
+fi
+if ! wait_probe bridge "$BRIDGE_BASE" 12 "$BRIDGE_VERSION" phone; then
+  echo "ERROR: Mobile Bridge works locally but not through $BRIDGE_BASE."
+  echo "Check routing/proxy rules for /bridge/*."
+  exit 1
+fi
+if ! wait_probe dashboard "$DASHBOARD_BASE" 12 "" phone; then
+  echo "ERROR: Dashboard works locally but not through $DASHBOARD_BASE."
+  echo "Check routing/proxy rules for /api/status."
   exit 1
 fi
 
-if port_listening 8642; then
-  echo "Gateway 8642 OK"
-else
-  echo "WARNING: the gateway did not start; check $LOGS/gateway.log or your service logs."
-fi
+printf 'PAIRING_SCHEMA=1\nPAIR_HOST=%s\nPAIR_SCHEME=%s\nPAIR_PORT=%s\nGATEWAY_BASE=%s\nDASHBOARD_BASE=%s\nBRIDGE_BASE=%s\nNETWORK_KIND=%s\nPYTHON_BIN=%s\n' \
+  "$HOST" "$PAIR_SCHEME" "$PAIR_PORT" "$GATEWAY_BASE" "$DASHBOARD_BASE" "$BRIDGE_BASE" "$NETWORK_KIND" "$VP" > "$PAIR_ENV"
+chmod 600 "$PAIR_ENV"
 
-# Set an initial Dashboard password through the authenticated Bridge. The
-# Bridge restarts the correct platform service; we also kick it once as a
-# deterministic fallback for older Bridge versions.
-DASH=""
-if ! port_listening 9119; then
-  DASH_PASS="$("$VP" -c 'import secrets; print(secrets.token_hex(16))')"
-  curl -sS -m15 -X POST "http://127.0.0.1:9131/bridge/dashboard/credentials" \
-    -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-    -d "{\"password\":\"$DASH_PASS\"}" >/dev/null 2>&1 || true
-  start_named_service dashboard >/dev/null 2>&1 || true
-  i=0
-  while [ "$i" -lt 20 ] && ! port_listening 9119; do sleep 2; i=$((i + 1)); done
-fi
-port_listening 9119 && DASH="&dashboard=http://$HOST:9119"
+HTTPS_FLAG=""
+[ "$PAIR_SCHEME" != "https" ] || HTTPS_FLAG="1"
+LINK="$("$VP" - "$HOST" "$PAIR_PORT" "$KEY" "$HTTPS_FLAG" "$DASHBOARD_BASE" "$BRIDGE_BASE" <<'PY'
+import sys, urllib.parse
 
-LINK="hermes://pair?host=$HOST&port=8642&token=$KEY$DASH"
+host, port, token, https, dashboard, bridge = sys.argv[1:]
+query = {
+    "host": host,
+    "port": port,
+    "token": token,
+    "dashboard": dashboard,
+    "bridge": bridge,
+    "bridge_token": token,
+}
+if https:
+    query["https"] = "1"
+print("hermes://pair?" + urllib.parse.urlencode(query))
+PY
+)"
 echo ""
 echo "== SCAN THIS QR WITH HERMES CONSOLE (or copy the link) =="
 echo ""
@@ -385,22 +900,12 @@ else
   fi
 fi
 if [ -z "$QR_RENDERED" ]; then
-  echo "ERROR: the server could not prepare a QR renderer."
-  echo "Copy the pairing link below into Hermes Console instead:"
-  echo "Link: $LINK"
-  exit 1
+  echo "A QR renderer could not be prepared. Paste the verified link below into Hermes Console."
 fi
 echo ""
 echo "Link: $LINK"
 echo ""
-echo "To show this QR again later:"
+echo "All three services passed local and phone-address health/auth checks."
+echo "To verify them and show this QR again later:"
 echo "  curl -fsSL $REPO_RAW/hermes-pair.sh | sh"
-if [ -n "$PUBLIC" ]; then
-  echo ""
-  echo "CAUTION: the link uses public IP $HOST and exposes ports 8642/9119/9131."
-  echo "Use a mesh VPN/private firewall; HTTP on the public internet is unsafe."
-fi
-if [ "$HOST" = "127.0.0.1" ]; then
-  echo ""
-  echo "CAUTION: no reachable network IP was found; this link only works locally."
-fi
+echo "If chat has no model yet, open Dashboard from the app and configure your AI provider/model."

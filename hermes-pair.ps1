@@ -1,8 +1,9 @@
-# Hermes Console - native Windows pairing QR (PowerShell 5.1+).
+# Hermes Console - verify all native Windows services, then reprint pairing QR.
 param()
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $RepoRaw = if ($env:HERMES_REPO_RAW) {
     $env:HERMES_REPO_RAW.TrimEnd('/')
 } else {
@@ -14,37 +15,39 @@ $HermesHome = if ($env:HERMES_HOME) {
     Join-Path $env:LOCALAPPDATA "hermes"
 }
 $EnvFile = Join-Path $HermesHome ".env"
+$PairingFile = Join-Path $HermesHome "console-services\pairing.json"
 $Python = Join-Path $HermesHome "hermes-agent\venv\Scripts\python.exe"
-
-function Test-Port([int]$Port) {
-    $client = New-Object System.Net.Sockets.TcpClient
-    try {
-        $task = $client.ConnectAsync("127.0.0.1", $Port)
-        return $task.Wait(700) -and $client.Connected
-    } catch { return $false }
-    finally { $client.Dispose() }
-}
 
 function Get-ApiKey {
     if (-not (Test-Path -LiteralPath $EnvFile)) { return $null }
+    $values = @()
     foreach ($line in [IO.File]::ReadAllLines($EnvFile)) {
         if ($line -match '^API_SERVER_KEY=(.*)$') {
-            return $Matches[1].Trim().Trim('"').Trim("'")
+            $values += $Matches[1].Trim().Trim('"').Trim("'")
         }
     }
+    $strong = @($values | Where-Object {
+        $_.Length -ge 16 -and $_.ToLowerInvariant() -notin @(
+            "changeme", "change-me", "your-api-key", "replace-me", "secret"
+        )
+    } | Select-Object -Unique)
+    if ($strong.Count -gt 1) {
+        throw "Conflicting API_SERVER_KEY entries exist in $EnvFile. Run setup to repair them."
+    }
+    if ($strong.Count -eq 1) { return $strong[0] }
     return $null
 }
 
 function Test-Cgnat([string]$Address) {
     $parsed = $null
-    if (-not [Net.IPAddress]::TryParse($Address, [ref]$parsed)) { return $false }
+    if (-not ([Net.IPAddress]::TryParse($Address, [ref]$parsed))) { return $false }
     $bytes = $parsed.GetAddressBytes()
     return $bytes.Length -eq 4 -and $bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127
 }
 
 function Test-PrivateIpv4([string]$Address) {
     $parsed = $null
-    if (-not [Net.IPAddress]::TryParse($Address, [ref]$parsed)) { return $false }
+    if (-not ([Net.IPAddress]::TryParse($Address, [ref]$parsed))) { return $false }
     $bytes = $parsed.GetAddressBytes()
     if ($bytes.Length -ne 4) { return $false }
     return ($bytes[0] -eq 10) -or
@@ -52,38 +55,66 @@ function Test-PrivateIpv4([string]$Address) {
         ($bytes[0] -eq 192 -and $bytes[1] -eq 168)
 }
 
-function Get-ReachableHost {
-    $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
-    if ($tailscale) {
-        try {
-            $mesh = (& $tailscale.Source ip -4 2>$null | Select-Object -First 1).Trim()
-            if ($mesh) { return @{ Address = $mesh; Public = $false } }
-        } catch {}
+function Test-PrivateHost([string]$HostName) {
+    if (-not $HostName -or $HostName -eq "localhost") { return $false }
+    if ($HostName.EndsWith(".local") -or $HostName.EndsWith(".ts.net") -or $HostName -notmatch '\.') {
+        return $true
     }
-    $addresses = @()
+    if ((Test-Cgnat $HostName) -or (Test-PrivateIpv4 $HostName)) { return $true }
     try {
-        $records = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-            Where-Object {
-                $_.IPAddress -ne "127.0.0.1" -and
-                $_.IPAddress -notlike "169.254.*" -and
-                $_.AddressState -ne "Duplicate"
-            })
-        $preferred = @($records | Where-Object {
-            $_.InterfaceAlias -notmatch '(?i)(vEthernet|WSL|Default Switch|Docker|Hyper-V|VirtualBox|VMware)'
-        })
-        if ($preferred.Count -eq 0) { $preferred = $records }
-        $addresses = @($preferred | ForEach-Object { $_.IPAddress } | Select-Object -Unique)
-    } catch {
-        foreach ($line in (ipconfig.exe 2>$null)) {
-            if ($line -match 'IPv4[^:]*:\s*([0-9.]+)') { $addresses += $Matches[1] }
-        }
+        $addresses = @([Net.Dns]::GetHostAddresses($HostName))
+        return $addresses.Count -gt 0 -and @($addresses | Where-Object {
+            -not ((Test-Cgnat $_.IPAddressToString) -or (Test-PrivateIpv4 $_.IPAddressToString))
+        }).Count -eq 0
+    } catch {}
+    return $false
+}
+
+function Assert-AllowedServiceUrl([string]$Url) {
+    $uri = $null
+    if (-not ([Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) -or
+        $uri.Scheme -notin @("http", "https") -or -not $uri.Host -or
+        $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $uri.Port -lt 1) {
+        throw "Invalid phone-facing service URL: $Url"
     }
-    $meshAddress = @($addresses | Where-Object { Test-Cgnat $_ } | Select-Object -First 1)
-    if ($meshAddress.Count -gt 0) { return @{ Address = $meshAddress[0]; Public = $false } }
-    $privateAddress = @($addresses | Where-Object { Test-PrivateIpv4 $_ } | Select-Object -First 1)
-    if ($privateAddress.Count -gt 0) { return @{ Address = $privateAddress[0]; Public = $false } }
-    if ($addresses.Count -gt 0) { return @{ Address = $addresses[0]; Public = $true } }
-    return @{ Address = "127.0.0.1"; Public = $false }
+    if ($uri.IsLoopback) {
+        throw "Loopback is not reachable from the phone: $Url"
+    }
+    if ($uri.Scheme -eq "https") { return }
+    if (-not (Test-PrivateHost $uri.Host)) {
+        throw "Public HTTP is blocked. Use LAN/Tailscale or HTTPS: $Url"
+    }
+}
+
+function Test-HermesService(
+    [ValidateSet("gateway", "bridge", "dashboard")][string]$Kind,
+    [string]$BaseUrl,
+    [string]$Token
+) {
+    $base = $BaseUrl.TrimEnd('/')
+    try {
+        if ($Kind -eq "gateway") {
+            $health = Invoke-RestMethod -Method Get -Uri "$base/health" -TimeoutSec 6
+            if ($health.status -ne "ok" -or $health.platform -ne "hermes-agent") {
+                return $false
+            }
+            $sessions = Invoke-RestMethod -Method Get -Uri "$base/api/sessions" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 6
+            return $sessions.object -eq "list" -and $null -ne $sessions.data
+        }
+        if ($Kind -eq "bridge") {
+            $health = Invoke-RestMethod -Method Get -Uri "$base/bridge/health" -TimeoutSec 6
+            if ($health.status -ne "ok" -or -not $health.version) { return $false }
+            $caps = Invoke-RestMethod -Method Get -Uri "$base/bridge/capabilities" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 6
+            return ($caps.object -eq "hermes.bridge.capabilities") -and
+                ($caps.operations.self_update -eq $true) -and
+                (@($caps.scopes) -contains "read") -and
+                (@($caps.scopes) -contains "config")
+        }
+        $status = Invoke-RestMethod -Method Get -Uri "$base/api/status" -TimeoutSec 6
+        return [bool]$status.version -and $status.gateway_running -eq $true
+    } catch {
+        return $false
+    }
 }
 
 function Render-Qr([string]$Link) {
@@ -99,16 +130,76 @@ $ApiKey = Get-ApiKey
 if (-not $ApiKey) {
     throw "No API token found in $EnvFile. Run first: irm $RepoRaw/hermes-mobile-setup.ps1 | iex"
 }
-if (-not (Test-Port 8642)) { Write-Warning "Gateway 8642 is not listening; the app will not connect." }
-if (-not (Test-Port 9131)) { Write-Warning "Mobile Bridge 9131 is not listening; some features will be limited." }
-$hostInfo = Get-ReachableHost
-$dashboardPart = if (Test-Port 9119) { "&dashboard=http://$($hostInfo.Address):9119" } else { "" }
-$link = "hermes://pair?host=$($hostInfo.Address)&port=8642&token=$ApiKey$dashboardPart"
+if (-not (Test-Path -LiteralPath $PairingFile)) {
+    throw "This installation predates verified pairing. Run setup once: irm $RepoRaw/hermes-mobile-setup.ps1 | iex"
+}
+$pairing = Get-Content -LiteralPath $PairingFile -Raw | ConvertFrom-Json
+if ($pairing.schema -ne 1) {
+    throw "This pairing record is not from the verified installer. Run setup once: irm $RepoRaw/hermes-mobile-setup.ps1 | iex"
+}
+$hostName = if ($env:HERMES_PAIR_HOST) { $env:HERMES_PAIR_HOST.Trim() } else { [string]$pairing.host }
+$scheme = if ($env:HERMES_PAIR_SCHEME) { $env:HERMES_PAIR_SCHEME.Trim().ToLowerInvariant() } else { [string]$pairing.scheme }
+if ($hostName -notmatch '^[A-Za-z0-9._:-]+$') {
+    throw "The stored pairing host is invalid. Run setup again."
+}
+if ($scheme -notin @("http", "https")) {
+    throw "The stored pairing scheme is invalid. Run setup again."
+}
+$port = 0
+$rawPort = if ($env:HERMES_PAIR_PORT) { $env:HERMES_PAIR_PORT } else { [string]$pairing.port }
+if (-not ([int]::TryParse($rawPort, [ref]$port)) -or $port -lt 1 -or $port -gt 65535) {
+    throw "The stored pairing port is invalid. Run setup again."
+}
+$baseHost = if ($hostName.Contains(":")) { "[$hostName]" } else { $hostName }
+$gateway = if ($env:HERMES_PAIR_HOST -or $env:HERMES_PAIR_SCHEME -or $env:HERMES_PAIR_PORT) {
+    "$($scheme)://$($baseHost):$port"
+} else { [string]$pairing.gateway }
+$dashboard = if ($env:HERMES_DASHBOARD_URL) {
+    $env:HERMES_DASHBOARD_URL.TrimEnd('/')
+} elseif ($env:HERMES_PAIR_HOST -or $env:HERMES_PAIR_SCHEME -or $env:HERMES_PAIR_PORT) {
+    if ($scheme -eq "https") { $gateway } else { "http://$($baseHost):9119" }
+} else { [string]$pairing.dashboard }
+$bridge = if ($env:HERMES_BRIDGE_URL) {
+    $env:HERMES_BRIDGE_URL.TrimEnd('/')
+} elseif ($env:HERMES_PAIR_HOST -or $env:HERMES_PAIR_SCHEME -or $env:HERMES_PAIR_PORT) {
+    if ($scheme -eq "https") { $gateway } else { "http://$($baseHost):9131" }
+} else { [string]$pairing.bridge }
+
+$expectedGateway = "$($scheme)://$($baseHost):$port"
+if ($gateway -ne $expectedGateway) {
+    throw "The pairing record is inconsistent. Run setup again before showing credentials."
+}
+Assert-AllowedServiceUrl $gateway
+Assert-AllowedServiceUrl $dashboard
+Assert-AllowedServiceUrl $bridge
+
+foreach ($service in @(
+    @{ Kind = "gateway"; Url = $gateway },
+    @{ Kind = "bridge"; Url = $bridge },
+    @{ Kind = "dashboard"; Url = $dashboard }
+)) {
+    if (-not (Test-HermesService $service.Kind $service.Url $ApiKey)) {
+        throw "$($service.Kind) is not healthy/authenticated through $($service.Url). Run repair first: irm $RepoRaw/hermes-mobile-setup.ps1 | iex"
+    }
+}
+
+$query = @(
+    "host=$([Uri]::EscapeDataString($hostName))"
+    "port=$port"
+    "token=$([Uri]::EscapeDataString($ApiKey))"
+    "dashboard=$([Uri]::EscapeDataString($dashboard))"
+    "bridge=$([Uri]::EscapeDataString($bridge))"
+    "bridge_token=$([Uri]::EscapeDataString($ApiKey))"
+)
+if ($scheme -eq "https") { $query += "https=1" }
+$link = "hermes://pair?" + ($query -join "&")
+
 Write-Host ""
 Write-Host "== SCAN THIS QR WITH HERMES CONSOLE (or copy the link) ==" -ForegroundColor Yellow
 Write-Host ""
-if (-not (Render-Qr $link)) { Write-Warning "A QR renderer could not be prepared. Paste the link below." }
+if (-not (Render-Qr $link)) {
+    Write-Warning "A QR renderer could not be prepared. Paste the verified link below."
+}
 Write-Host ""
 Write-Host "Link: $link"
-if ($hostInfo.Public) { Write-Warning "The link uses public IP $($hostInfo.Address). Prefer a mesh VPN or private firewall." }
-if ($hostInfo.Address -eq "127.0.0.1") { Write-Warning "No reachable network address was found; this link only works on this PC." }
+Write-Host "Gateway, Dashboard and Mobile Bridge passed their functional checks."
