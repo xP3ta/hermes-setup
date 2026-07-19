@@ -33,9 +33,23 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.17.0"
-HERMES_HOME = Path(os.environ.get("BRIDGE_HERMES_HOME",
-                                  Path.home() / ".hermes")).resolve()
+VERSION = "1.18.0"
+
+
+def _default_hermes_home():
+    """Ruta usada por los instaladores oficiales en cada plataforma."""
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data) / "hermes"
+    return Path.home() / ".hermes"
+
+
+HERMES_HOME = Path(
+    os.environ.get("BRIDGE_HERMES_HOME")
+    or os.environ.get("HERMES_HOME")
+    or _default_hermes_home()
+).resolve()
 BACKUP_DIR = HERMES_HOME / "backups" / "bridge"
 AUDIT_LOG = HERMES_HOME / "logs" / "bridge_audit.log"
 TOKEN_FILE = HERMES_HOME / "bridge_token"
@@ -272,9 +286,79 @@ def _stage_self_update(body):
     return target, backup, version
 
 
+_SYSTEMD_UNITS = {
+    "bridge": "hermes-bridge",
+    "dashboard": "hermes-dashboard",
+}
+_LAUNCHD_LABELS = {
+    "bridge": "dev.xpetalab.hermes-console.bridge",
+    "dashboard": "dev.xpetalab.hermes-console.dashboard",
+}
+_WINDOWS_RESTART_TASKS = {
+    "bridge": "HermesConsole-Restart-MobileBridge",
+    "dashboard": "HermesConsole-Restart-Dashboard",
+}
+
+
+def _managed_service_restart_command(name, delay_seconds=0.0):
+    """Comando argv para reiniciar un servicio creado por nuestros setups.
+
+    Nunca acepta nombres controlados por la petición. En Unix sin systemd el
+    instalador puede proporcionar un helper confinado bajo HERMES_HOME.
+    """
+    if name not in _SYSTEMD_UNITS:
+        return None
+
+    helper = os.environ.get("BRIDGE_SERVICE_HELPER", "").strip()
+    if helper:
+        try:
+            helper_entry = Path(helper)
+            if helper_entry.is_symlink():
+                raise ValueError("service helper must not be a symlink")
+            helper_path = helper_entry.resolve()
+            helper_path.relative_to(HERMES_HOME)
+            if helper_path.is_file():
+                return [str(helper_path), "restart", name]
+        except (OSError, ValueError):
+            pass
+
+    if os.name == "nt":
+        # Un task auxiliar separado detiene y vuelve a lanzar el servicio. Si
+        # el propio task del Bridge ejecutase `/End`, Windows podría matar
+        # también al helper antes del `/Run` por pertenecer al mismo job.
+        return [
+            "schtasks.exe", "/Run", "/TN", _WINDOWS_RESTART_TASKS[name]
+        ]
+
+    if sys.platform == "darwin":
+        label = _LAUNCHD_LABELS[name]
+        return ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"]
+
+    return ["systemctl", "--user", "restart", _SYSTEMD_UNITS[name]]
+
+
+def _detached_popen(args):
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(args, **kwargs)
+
+
 _SELF_UPDATE_WATCHDOG = r'''
 import json, os, subprocess, sys, time, urllib.request
-target, backup, version, health = sys.argv[1:5]
+target, backup, version, health, restart_json = sys.argv[1:6]
+restart_command = json.loads(restart_json)
 for _ in range(10):
     time.sleep(2)
     try:
@@ -286,9 +370,17 @@ for _ in range(10):
         pass
 if os.path.isfile(backup):
     os.replace(backup, target)
-    subprocess.run(["systemctl", "--user", "restart", "hermes-bridge"],
-                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, check=False)
+    if restart_command:
+        kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL, close_fds=True)
+        if os.name == "nt":
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(restart_command, **kwargs)
 '''
 
 
@@ -303,29 +395,45 @@ def _self_update_health_url():
 
 
 def _launch_self_update_watchdog(target, backup, version):
-    subprocess.Popen(
+    restart = _managed_service_restart_command("bridge", delay_seconds=0.5)
+    _detached_popen(
         [sys.executable, "-c", _SELF_UPDATE_WATCHDOG, str(target),
-         str(backup), version, _self_update_health_url()],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=True,
+         str(backup), version, _self_update_health_url(),
+         json.dumps(restart or [])],
     )
+
+
+async def _restart_managed_service(name, delay_seconds=0.0):
+    command = _managed_service_restart_command(name, delay_seconds)
+    if not command:
+        return False
+    try:
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return await proc.wait() == 0
+    except OSError:
+        return False
 
 
 async def _restart_bridge_service():
-    await asyncio.sleep(0.5)
-    proc = await asyncio.create_subprocess_exec(
-        "systemctl", "--user", "restart", "hermes-bridge",
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await proc.wait()
+    await _restart_managed_service("bridge", delay_seconds=0.5)
 
 
 _SELF_UPDATE_RESTART_TASK = None
+
+
+def _path_is_below(path, root):
+    try:
+        path.relative_to(root)
+        return path != root
+    except (ValueError, OSError):
+        return False
 
 
 def _resolve_target(name):
@@ -337,7 +445,7 @@ def _resolve_target(name):
     rel, scope, mode = entry
     path = (HERMES_HOME / rel).resolve()
     # Confinamiento: debe quedar bajo HERMES_HOME y no ser un secreto por nombre.
-    if not str(path).startswith(str(HERMES_HOME) + os.sep):
+    if not _path_is_below(path, HERMES_HOME):
         return None, None, None, _err("path_escape",
                                       "Ruta fuera de HERMES_HOME", 400)
     if path.name in {".env", "bridge_token"} or "secret" in path.name.lower():
@@ -591,7 +699,15 @@ async def _run(args, timeout=120, stdin_text=None, env=None, max_out=8000):
 
 
 def _safe_env():
-    keep = ("PATH", "HOME", "LANG", "LC_ALL", "HERMES_HOME")
+    keep = ["PATH", "HOME", "LANG", "LC_ALL", "HERMES_HOME"]
+    if os.name == "nt":
+        # Python, PowerShell, .cmd launchers y la resolución de DLLs necesitan
+        # estas variables del entorno de Windows. No contienen credenciales.
+        keep += [
+            "Path", "PATHEXT", "SYSTEMROOT", "SystemRoot", "WINDIR",
+            "COMSPEC", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA",
+            "APPDATA", "PROGRAMDATA", "HERMES_GIT_BASH_PATH",
+        ]
     env = {k: os.environ[k] for k in keep if k in os.environ}
     # HERMES_HOME del bridge es autoritativo: el agente vive ahí y HOME es su
     # padre (layout de Hermes: HERMES_HOME = $HOME/.hermes). Lo forzamos para que
@@ -599,17 +715,31 @@ def _safe_env():
     # (si no, `hermes config set` calcula `/.hermes`, read-only, y peta con
     # Errno 30). Coincide con el HOME que fija el despliegue real → sin regresión.
     env["HERMES_HOME"] = str(HERMES_HOME)
-    env["HOME"] = str(HERMES_HOME.parent)
-    # npx necesita `node` en PATH: añade el node embebido de Hermes si existe.
-    node_bin = Path.home() / ".hermes" / "node" / "bin"
+    env["HOME"] = (
+        os.environ.get("USERPROFILE", str(Path.home()))
+        if os.name == "nt"
+        else str(HERMES_HOME.parent)
+    )
+    # npx necesita `node` en PATH: añade el Node embebido de Hermes.
+    node_bin = HERMES_HOME / "node"
+    if os.name != "nt":
+        node_bin = node_bin / "bin"
     if node_bin.is_dir():
-        env["PATH"] = f"{node_bin}:{env.get('PATH', '')}"
+        current_path = env.get("PATH") or env.get("Path", "")
+        env["PATH"] = f"{node_bin}{os.pathsep}{current_path}"
     return env
 
 
 def _npx():
-    cand = Path.home() / ".hermes" / "node" / "bin" / "npx"
-    return str(cand) if cand.exists() else "npx"
+    candidates = (
+        [HERMES_HOME / "node" / "npx.cmd", HERMES_HOME / "node" / "npx.exe"]
+        if os.name == "nt"
+        else [HERMES_HOME / "node" / "bin" / "npx"]
+    )
+    for cand in candidates:
+        if cand.exists():
+            return str(cand)
+    return "npx.cmd" if os.name == "nt" else "npx"
 
 
 def _venv_python():
@@ -621,17 +751,20 @@ def _venv_python():
     (verificado en emulador: ésta era la causa real del silencio en local).
     Resolvemos SIEMPRE el python del venv explícitamente."""
     base = os.environ.get("BRIDGE_HERMES_HOME") or str(HERMES_HOME)
-    cand = Path(base) / "hermes-agent" / "venv" / "bin" / "python3"
-    try:
-        if cand.exists():
-            return str(cand)
-    except OSError:
-        # El venv puede EXISTIR pero no ser accesible (permisos raros, symlink
-        # roto): `cand.exists()` lanza PermissionError. Como esto corre al IMPORTAR
-        # el módulo, una excepción aquí tumbaba TODO el bridge al arrancar (bridge
-        # caído → modelos/skills/info vacíos, agente "no levanta"). Nunca debe
-        # impedir que el bridge sirva; caemos al python actual.
-        pass
+    root = Path(base) / "hermes-agent" / "venv"
+    candidates = (
+        [root / "Scripts" / "python.exe", root / "Scripts" / "python3.exe"]
+        if os.name == "nt"
+        else [root / "bin" / "python3", root / "bin" / "python"]
+    )
+    for cand in candidates:
+        try:
+            if cand.exists():
+                return str(cand)
+        except OSError:
+            # El venv puede existir pero no ser accesible. Como esto corre al
+            # importar el módulo, nunca debe impedir que el Bridge sirva.
+            continue
     return sys.executable
 
 
@@ -651,9 +784,11 @@ def _ensure_ruamel():
     except ImportError:
         pass
     base = os.environ.get("BRIDGE_HERMES_HOME") or str(HERMES_HOME)
-    venv_lib = Path(base) / "hermes-agent" / "venv" / "lib"
+    venv_root = Path(base) / "hermes-agent" / "venv"
     try:
-        for sp in sorted(venv_lib.glob("python3*/site-packages")):
+        candidates = list((venv_root / "lib").glob("python3*/site-packages"))
+        candidates.append(venv_root / "Lib" / "site-packages")
+        for sp in sorted({p for p in candidates if p.is_dir()}):
             sp_str = str(sp)
             if sp_str not in sys.path:
                 sys.path.insert(0, sp_str)
@@ -676,6 +811,11 @@ def _hermes_env():
     libpython; además necesita LD_LIBRARY_PATH/TMPDIR de Termux. Sin esto el
     oneshot peta al importar y el turno termina vacío."""
     env = _safe_env()
+    is_termux = bool(os.environ.get("TERMUX_VERSION")) or "com.termux" in os.environ.get(
+        "PREFIX", ""
+    )
+    if not is_termux:
+        return env
     prefix = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
     libdir = Path(prefix) / "lib"
     env["LD_LIBRARY_PATH"] = str(libdir)
@@ -893,7 +1033,7 @@ async def attachment_upload(request):
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
     unique = f"{time.time_ns()}_{secrets.token_hex(4)}_{name}"
     target = (ATTACHMENTS_DIR / unique).resolve()
-    if not str(target).startswith(str(ATTACHMENTS_DIR) + os.sep):
+    if not _path_is_below(target, ATTACHMENTS_DIR):
         return _err("bad_attachment_name", "Nombre de adjunto no válido", 400)
     partial = target.with_name(target.name + ".part")
     total = 0
@@ -2597,7 +2737,7 @@ async def image_get(request):
         target = (IMAGES_DIR / name).resolve()
     except OSError:
         return _denied()
-    if not str(target).startswith(str(IMAGES_DIR) + os.sep):
+    if not _path_is_below(target, IMAGES_DIR):
         return _denied()
     if not target.is_file():
         return _denied()
@@ -2829,15 +2969,13 @@ async def dashboard_credentials(request):
                     500)
     final_user = raw.split("@@OK@@", 1)[1].strip()
     # Reiniciar el Dashboard para que registre el proveedor `basic` recién
-    # escrito. Necesita el entorno del systemd de usuario (XDG_RUNTIME_DIR/DBUS),
-    # que _safe_env no conserva → pasamos el entorno del propio bridge.
-    rrc, _rout = await _run(
-        ["systemctl", "--user", "restart", "hermes-dashboard"],
-        timeout=30, env=dict(os.environ))
+    # escrito. El setup elige systemd, launchd, Scheduled Tasks o su helper
+    # portable; el endpoint no presupone ya un sistema operativo concreto.
+    restarted = await _restart_managed_service("dashboard", delay_seconds=0.2)
     _audit("dashboard_set_password", {"username": final_user}, "ok",
-           {"restarted": rrc == 0})
+           {"restarted": restarted})
     return web.json_response({
-        "ok": True, "username": final_user, "restarted": rrc == 0,
+        "ok": True, "username": final_user, "restarted": restarted,
     })
 
 

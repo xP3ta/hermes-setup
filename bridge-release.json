@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "version": "1.17.0",
-  "min_app_build": 903,
-  "sha256": "2957d3263a999a366c80c0d01dd452883c53ccc54e4cdc04eed991de0ba2e433",
-  "size": 128261
+  "version": "1.18.0",
+  "min_app_build": 904,
+  "sha256": "f8243b6e651c3e3fb8ca7f19e83677f268776624041a4dedae47a03b879a7a42",
+  "size": 132711
 }
