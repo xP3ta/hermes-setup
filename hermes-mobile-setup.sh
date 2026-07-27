@@ -642,7 +642,7 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 ExecStart="$runner"
-WorkingDirectory="$HH"
+WorkingDirectory=$HH
 Restart=on-failure
 RestartSec=2
 [Install]
