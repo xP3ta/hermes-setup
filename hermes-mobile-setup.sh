@@ -38,6 +38,24 @@ PROBE="$SERVICES/hermes-service-probe.py"
 PAIR_ENV="$SERVICES/pairing.env"
 mkdir -p "$HH" "$SERVICES" "$LOGS"
 
+SETUP_STEP=0
+SETUP_TOTAL=7
+setup_step() {
+  SETUP_STEP=$((SETUP_STEP + 1))
+  case "$SETUP_STEP" in
+    1) bar="#......" ;;
+    2) bar="##....." ;;
+    3) bar="###...." ;;
+    4) bar="####..." ;;
+    5) bar="#####.." ;;
+    6) bar="######." ;;
+    *) bar="#######" ;;
+  esac
+  printf '\n[%s] %s/%s %s\n' "$bar" "$SETUP_STEP" "$SETUP_TOTAL" "$1"
+}
+
+setup_step "Inspecting platform and service manager"
+
 port_listening() {
   port="$1"
   if command -v ss >/dev/null 2>&1; then
@@ -80,7 +98,26 @@ service_failure() {
 SERVICE_MANAGER="portable"
 if [ "$PLATFORM" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
   export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-  command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "$(id -un)" 2>/dev/null || true
+  if command -v loginctl >/dev/null 2>&1; then
+    LINGER_USER="$(id -un)"
+    LINGER_STATE="$(loginctl show-user "$LINGER_USER" -p Linger --value 2>/dev/null || true)"
+    if [ "$LINGER_STATE" != "yes" ]; then
+      LINGER_ENABLED=0
+      if [ "$(id -u)" -eq 0 ]; then
+        if loginctl enable-linger "$LINGER_USER" >/dev/null 2>&1; then
+          LINGER_ENABLED=1
+        fi
+      elif command -v sudo >/dev/null 2>&1 && \
+           sudo -n loginctl enable-linger "$LINGER_USER" >/dev/null 2>&1; then
+        LINGER_ENABLED=1
+      fi
+      if [ "$LINGER_ENABLED" -ne 1 ]; then
+        echo "WARNING: user lingering is not enabled; services may stop after logout."
+        echo "Run once as an administrator, then rerun setup:"
+        echo "  sudo loginctl enable-linger $LINGER_USER"
+      fi
+    fi
+  fi
   i=0
   while [ "$i" -lt 10 ]; do
     [ -S "$XDG_RUNTIME_DIR/bus" ] && break
@@ -95,6 +132,8 @@ elif [ "$PLATFORM" = "macos" ] && command -v launchctl >/dev/null 2>&1; then
     SERVICE_MANAGER="launchd"
   fi
 fi
+
+setup_step "Checking Hermes Agent"
 
 # Hermes Agent. A launcher only counts when it responds; stale shims from a
 # half-finished uninstall must not produce three crash-looping services.
@@ -494,13 +533,28 @@ wait_probe() {
   return 1
 }
 
+setup_step "Verifying Mobile Bridge release"
+
 # Verified Bridge release: closed manifest, exact size/hash/version, compile,
 # backup and atomic swap. No bytes execute before every check passes.
 TARGET="$HH/hermes_bridge.py"
 NEW="$TARGET.new"
 BACKUP="$TARGET.rollback"
 MANIFEST="$HH/bridge-release.json.new"
-cleanup_downloads() { rm -f "$NEW" "$MANIFEST"; }
+SYSTEMD_STAGE=""
+cleanup_systemd_stage() {
+  [ -n "$SYSTEMD_STAGE" ] || return 0
+  rm -f \
+    "$SYSTEMD_STAGE/hermes-gateway.service" \
+    "$SYSTEMD_STAGE/hermes-dashboard.service" \
+    "$SYSTEMD_STAGE/hermes-bridge.service"
+  rmdir "$SYSTEMD_STAGE" 2>/dev/null || true
+  SYSTEMD_STAGE=""
+}
+cleanup_downloads() {
+  rm -f "$NEW" "$MANIFEST"
+  cleanup_systemd_stage
+}
 trap cleanup_downloads EXIT HUP INT TERM
 curl -fsSL "$REPO_RAW/bridge-release.json" -o "$MANIFEST"
 curl -fsSL "$REPO_RAW/hermes_bridge.py" -o "$NEW"
@@ -633,21 +687,53 @@ chmod 700 "$HELPER"
 install_systemd_unit() {
   name="$1"
   runner="$2"
-  unit="$HOME/.config/systemd/user/hermes-$name.service"
-  mkdir -p "$HOME/.config/systemd/user"
+  unit_dir="$3"
+  unit="$unit_dir/hermes-$name.service"
+  mkdir -p "$unit_dir"
   cat > "$unit" <<EOF
 [Unit]
 Description=Hermes Console $name
 After=network-online.target
 Wants=network-online.target
 [Service]
-ExecStart="$runner"
-WorkingDirectory="$HH"
+ExecStart=$runner
+WorkingDirectory=$HH
 Restart=on-failure
 RestartSec=2
 [Install]
 WantedBy=default.target
 EOF
+}
+
+install_verified_systemd_units() {
+  SYSTEMD_STAGE="$(mktemp -d "$SERVICES/systemd-units.XXXXXX")"
+  install_systemd_unit gateway "$GATEWAY_RUNNER" "$SYSTEMD_STAGE"
+  install_systemd_unit dashboard "$DASHBOARD_RUNNER" "$SYSTEMD_STAGE"
+  install_systemd_unit bridge "$BRIDGE_RUNNER" "$SYSTEMD_STAGE"
+
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    if ! systemd-analyze --user verify \
+      "$SYSTEMD_STAGE/hermes-gateway.service" \
+      "$SYSTEMD_STAGE/hermes-dashboard.service" \
+      "$SYSTEMD_STAGE/hermes-bridge.service"; then
+      echo "ERROR: generated systemd user units are invalid; existing units were not replaced."
+      cleanup_systemd_stage
+      exit 1
+    fi
+  else
+    echo "WARNING: systemd-analyze is unavailable; skipping the unit-file preflight."
+  fi
+
+  SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$SYSTEMD_USER_DIR"
+  for name in gateway dashboard bridge; do
+    cp "$SYSTEMD_STAGE/hermes-$name.service" \
+      "$SYSTEMD_USER_DIR/hermes-$name.service.new"
+    chmod 644 "$SYSTEMD_USER_DIR/hermes-$name.service.new"
+    mv "$SYSTEMD_USER_DIR/hermes-$name.service.new" \
+      "$SYSTEMD_USER_DIR/hermes-$name.service"
+  done
+  cleanup_systemd_stage
 }
 
 install_launchd_job() {
@@ -697,11 +783,11 @@ start_named_service() {
   esac
 }
 
+setup_step "Installing hidden persistent services"
+
 case "$SERVICE_MANAGER" in
   systemd)
-    install_systemd_unit gateway "$GATEWAY_RUNNER"
-    install_systemd_unit dashboard "$DASHBOARD_RUNNER"
-    install_systemd_unit bridge "$BRIDGE_RUNNER"
+    install_verified_systemd_units
     systemctl --user daemon-reload
     systemctl --user enable hermes-gateway hermes-dashboard hermes-bridge >/dev/null 2>&1
     systemctl --user restart hermes-gateway
@@ -735,6 +821,8 @@ if ! wait_probe bridge http://127.0.0.1:9131 40 "$BRIDGE_VERSION"; then
   service_failure Bridge 9131
 fi
 echo "Mobile Bridge $BRIDGE_VERSION auth + self-update OK ($SERVICE_MANAGER)"
+
+setup_step "Checking Dashboard and credentials"
 
 # Ensure a strong initial Dashboard password through the authenticated Bridge.
 # Existing credentials are preserved on repair/update; setup never prints them.
@@ -855,6 +943,8 @@ ensure_private_firewall() {
   fi
 }
 
+setup_step "Verifying private phone access"
+
 ensure_private_firewall
 
 # Decisive gate: use exactly the URLs encoded in the QR. A loopback-only bind,
@@ -874,6 +964,8 @@ if ! wait_probe dashboard "$DASHBOARD_BASE" 12 "" phone; then
   echo "Check routing/proxy rules for /api/status."
   exit 1
 fi
+
+setup_step "Generating pairing QR and summary"
 
 printf 'PAIRING_SCHEMA=1\nPAIR_HOST=%s\nPAIR_SCHEME=%s\nPAIR_PORT=%s\nGATEWAY_BASE=%s\nDASHBOARD_BASE=%s\nBRIDGE_BASE=%s\nNETWORK_KIND=%s\nPYTHON_BIN=%s\n' \
   "$HOST" "$PAIR_SCHEME" "$PAIR_PORT" "$GATEWAY_BASE" "$DASHBOARD_BASE" "$BRIDGE_BASE" "$NETWORK_KIND" "$VP" > "$PAIR_ENV"
@@ -922,6 +1014,13 @@ echo ""
 echo "Link: $LINK"
 echo ""
 echo "All three services passed local and phone-address health/auth checks."
+echo "Setup summary:"
+echo "  Hermes Agent: ready"
+echo "  Gateway: authenticated and reachable"
+echo "  Dashboard: ready"
+echo "  Mobile Bridge: $BRIDGE_VERSION, authenticated and reachable"
+echo "  Service manager: $SERVICE_MANAGER"
+echo "  Pairing address: $HOST ($NETWORK_KIND)"
 echo "To verify them and show this QR again later:"
 echo "  curl -fsSL $REPO_RAW/hermes-pair.sh | sh"
 echo "If chat has no model yet, open Dashboard from the app and configure your AI provider/model."
