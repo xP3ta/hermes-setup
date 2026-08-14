@@ -98,6 +98,26 @@ Bridge to replace itself atomically, and confirms the new process is healthy.
 Rerunning the full setup command remains the repair/bootstrap path for an older
 Bridge that predates self-update.
 
+## Minimal Debian and systemd troubleshooting
+
+The Unix installer supports minimal Debian hosts without PolicyKit. It first
+checks whether user lingering is already enabled and only attempts a
+non-interactive change when running as root or when passwordless `sudo` is
+already available. Otherwise it prints the single administrator command to run;
+it does not open a `pkttyagent` prompt.
+
+Before replacing any existing user service, setup renders all three units in a
+temporary directory and runs `systemd-analyze --user verify` when available.
+This prevents an invalid Gateway, Dashboard or Mobile Bridge unit from being
+loaded. If an older install reports `bad unit file setting`, rerun the current
+installer. For diagnostics, inspect the affected unit without sharing tokens or
+the pairing link:
+
+```sh
+systemctl --user status hermes-gateway.service
+journalctl --user -u hermes-gateway.service
+```
+
 ## Contents
 
 | File | What it is |
