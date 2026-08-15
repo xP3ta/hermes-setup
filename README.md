@@ -106,12 +106,16 @@ non-interactive change when running as root or when passwordless `sudo` is
 already available. Otherwise it prints the single administrator command to run;
 it does not open a `pkttyagent` prompt.
 
-Before replacing any existing user service, setup renders all three units in a
-temporary directory and runs `systemd-analyze --user verify` when available.
-This prevents an invalid Gateway, Dashboard or Mobile Bridge unit from being
-loaded. If an older install reports `bad unit file setting`, rerun the current
-installer. For diagnostics, inspect the affected unit without sharing tokens or
-the pairing link:
+Setup keeps the Gateway unit owned by Hermes itself. The phone-facing bind is
+stored in a separate `hermes-gateway.service.d` drop-in, so a Hermes update or
+in-chat restart can regenerate its canonical unit without silently reverting to
+loopback. Dashboard and Mobile Bridge units are rendered in a temporary
+directory, and all three effective units pass `systemd-analyze --user verify`
+when available before they are started. A failed preflight restores the previous
+Gateway unit and drop-in. If an older install reports `bad unit file setting` or
+the Gateway only listens on `127.0.0.1`, rerun the current installer. For
+diagnostics, inspect the affected unit without sharing tokens or the pairing
+link:
 
 ```sh
 systemctl --user status hermes-gateway.service

@@ -542,17 +542,48 @@ NEW="$TARGET.new"
 BACKUP="$TARGET.rollback"
 MANIFEST="$HH/bridge-release.json.new"
 SYSTEMD_STAGE=""
+SYSTEMD_GATEWAY_PENDING=0
+SYSTEMD_GATEWAY_HAD_UNIT=0
+SYSTEMD_GATEWAY_HAD_DROPIN=0
+SYSTEMD_USER_DIR=""
+SYSTEMD_GATEWAY_DROPIN_DIR=""
+rollback_pending_systemd_gateway() {
+  [ "$SYSTEMD_GATEWAY_PENDING" -eq 1 ] || return 0
+  rm -f \
+    "$SYSTEMD_USER_DIR/hermes-gateway.service.new" \
+    "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf.new"
+  if [ "$SYSTEMD_GATEWAY_HAD_UNIT" -eq 1 ]; then
+    cp -p "$SYSTEMD_STAGE/hermes-gateway.service.previous" \
+      "$SYSTEMD_USER_DIR/hermes-gateway.service"
+  else
+    rm -f "$SYSTEMD_USER_DIR/hermes-gateway.service"
+  fi
+  if [ "$SYSTEMD_GATEWAY_HAD_DROPIN" -eq 1 ]; then
+    cp -p "$SYSTEMD_STAGE/hermes-gateway-network.conf.previous" \
+      "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf"
+  else
+    rm -f "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf"
+    rmdir "$SYSTEMD_GATEWAY_DROPIN_DIR" 2>/dev/null || true
+  fi
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  SYSTEMD_GATEWAY_PENDING=0
+}
 cleanup_systemd_stage() {
   [ -n "$SYSTEMD_STAGE" ] || return 0
   rm -f \
+    "$SYSTEMD_STAGE/hermes-gateway.service.d/10-hermes-console-network.conf" \
     "$SYSTEMD_STAGE/hermes-gateway.service" \
     "$SYSTEMD_STAGE/hermes-dashboard.service" \
-    "$SYSTEMD_STAGE/hermes-bridge.service"
+    "$SYSTEMD_STAGE/hermes-bridge.service" \
+    "$SYSTEMD_STAGE/hermes-gateway.service.previous" \
+    "$SYSTEMD_STAGE/hermes-gateway-network.conf.previous"
+  rmdir "$SYSTEMD_STAGE/hermes-gateway.service.d" 2>/dev/null || true
   rmdir "$SYSTEMD_STAGE" 2>/dev/null || true
   SYSTEMD_STAGE=""
 }
 cleanup_downloads() {
   rm -f "$NEW" "$MANIFEST"
+  rollback_pending_systemd_gateway
   cleanup_systemd_stage
 }
 trap cleanup_downloads EXIT HUP INT TERM
@@ -705,9 +736,36 @@ WantedBy=default.target
 EOF
 }
 
+stage_gateway_systemd_unit() {
+  if ! "$VP" - "$SYSTEMD_STAGE/hermes-gateway.service" <<'PY'
+import pathlib, sys
+
+from hermes_cli.gateway import generate_systemd_unit
+
+path = pathlib.Path(sys.argv[1])
+unit = generate_systemd_unit(system=False)
+if not unit.startswith("[Unit]\n") or "hermes_cli.main" not in unit:
+    raise SystemExit("Hermes generated an invalid gateway user unit")
+path.write_text(unit, encoding="utf-8")
+PY
+  then
+    echo "ERROR: Hermes could not generate its canonical gateway user unit."
+    return 1
+  fi
+  mkdir -p "$SYSTEMD_STAGE/hermes-gateway.service.d"
+  cat > "$SYSTEMD_STAGE/hermes-gateway.service.d/10-hermes-console-network.conf" <<EOF
+[Service]
+Environment="API_SERVER_HOST=$BIND_HOST"
+Environment="API_SERVER_PORT=8642"
+EOF
+  chmod 644 \
+    "$SYSTEMD_STAGE/hermes-gateway.service" \
+    "$SYSTEMD_STAGE/hermes-gateway.service.d/10-hermes-console-network.conf"
+}
+
 install_verified_systemd_units() {
   SYSTEMD_STAGE="$(mktemp -d "$SERVICES/systemd-units.XXXXXX")"
-  install_systemd_unit gateway "$GATEWAY_RUNNER" "$SYSTEMD_STAGE"
+  stage_gateway_systemd_unit
   install_systemd_unit dashboard "$DASHBOARD_RUNNER" "$SYSTEMD_STAGE"
   install_systemd_unit bridge "$BRIDGE_RUNNER" "$SYSTEMD_STAGE"
 
@@ -717,6 +775,7 @@ install_verified_systemd_units() {
       "$SYSTEMD_STAGE/hermes-dashboard.service" \
       "$SYSTEMD_STAGE/hermes-bridge.service"; then
       echo "ERROR: generated systemd user units are invalid; existing units were not replaced."
+      rollback_pending_systemd_gateway
       cleanup_systemd_stage
       exit 1
     fi
@@ -725,14 +784,41 @@ install_verified_systemd_units() {
   fi
 
   SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
-  mkdir -p "$SYSTEMD_USER_DIR"
-  for name in gateway dashboard bridge; do
+  SYSTEMD_GATEWAY_DROPIN_DIR="$SYSTEMD_USER_DIR/hermes-gateway.service.d"
+  mkdir -p "$SYSTEMD_USER_DIR" "$SYSTEMD_GATEWAY_DROPIN_DIR"
+  SYSTEMD_GATEWAY_HAD_UNIT=0
+  if [ -f "$SYSTEMD_USER_DIR/hermes-gateway.service" ]; then
+    SYSTEMD_GATEWAY_HAD_UNIT=1
+    cp -p "$SYSTEMD_USER_DIR/hermes-gateway.service" \
+      "$SYSTEMD_STAGE/hermes-gateway.service.previous"
+  fi
+  SYSTEMD_GATEWAY_HAD_DROPIN=0
+  if [ -f "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf" ]; then
+    SYSTEMD_GATEWAY_HAD_DROPIN=1
+    cp -p "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf" \
+      "$SYSTEMD_STAGE/hermes-gateway-network.conf.previous"
+  fi
+  SYSTEMD_GATEWAY_PENDING=1
+
+  cp "$SYSTEMD_STAGE/hermes-gateway.service" \
+    "$SYSTEMD_USER_DIR/hermes-gateway.service.new"
+  chmod 644 "$SYSTEMD_USER_DIR/hermes-gateway.service.new"
+  mv "$SYSTEMD_USER_DIR/hermes-gateway.service.new" \
+    "$SYSTEMD_USER_DIR/hermes-gateway.service"
+  cp "$SYSTEMD_STAGE/hermes-gateway.service.d/10-hermes-console-network.conf" \
+    "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf.new"
+  chmod 644 "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf.new"
+  mv "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf.new" \
+    "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf"
+
+  for name in dashboard bridge; do
     cp "$SYSTEMD_STAGE/hermes-$name.service" \
       "$SYSTEMD_USER_DIR/hermes-$name.service.new"
     chmod 644 "$SYSTEMD_USER_DIR/hermes-$name.service.new"
     mv "$SYSTEMD_USER_DIR/hermes-$name.service.new" \
       "$SYSTEMD_USER_DIR/hermes-$name.service"
   done
+  SYSTEMD_GATEWAY_PENDING=0
   cleanup_systemd_stage
 }
 
