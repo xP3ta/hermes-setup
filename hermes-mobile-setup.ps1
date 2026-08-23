@@ -504,6 +504,16 @@ function Register-HermesManualTask([string]$TaskName, [string]$ScriptPath) {
     }
 }
 
+function Test-HermesTaskRunning([string]$TaskName) {
+    try {
+        Import-Module ScheduledTasks -ErrorAction Stop
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        return $null -ne $task -and $task.State.ToString() -eq "Running"
+    } catch {
+        return $false
+    }
+}
+
 function Start-HermesProcess(
     [string]$TaskName,
     [string]$ScriptPath,
@@ -1222,9 +1232,6 @@ WScript.Quit rc
         [bool]$script:TaskDefinitionsChanged["HermesConsole-Gateway"]
     $bridgeChanged = $script:BridgeChanged -or [bool]$script:RunnerChanged["hermes-bridge"] -or
         [bool]$script:TaskDefinitionsChanged["HermesConsole-MobileBridge"]
-    $dashboardChanged = [bool]$script:RunnerChanged["hermes-dashboard"] -or
-        [bool]$script:TaskDefinitionsChanged["HermesConsole-Dashboard"]
-
     $gatewayHealthy = Test-HermesService "gateway" "http://127.0.0.1:8642" $ApiKey
     if (-not $gatewayHealthy -or ($gatewayTask -and $gatewayChanged)) {
         Start-HermesProcess "HermesConsole-Gateway" $gatewayRunner $gatewayTask 8642
@@ -1260,7 +1267,6 @@ WScript.Quit rc
     if ($currentCredentials.ok -ne $true) {
         throw "Dashboard credential endpoint rejected the read."
     }
-    $dashboardCredentialsChanged = $false
     if ($currentCredentials.password_set -ne $true) {
         $passwordBytes = New-Object byte[] 24
         $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -1273,21 +1279,21 @@ WScript.Quit rc
         if ($credentials.ok -ne $true) {
             throw "Dashboard credential endpoint rejected the configuration."
         }
-        $dashboardCredentialsChanged = $true
         Write-Audit "Dashboard credentials" "OK" "Created through the authenticated Mobile Bridge"
     } else {
         Write-Audit "Dashboard credentials" "SKIP" "Existing password retained"
     }
 
     $dashboardHealthy = Test-HermesService "dashboard" "http://127.0.0.1:9119" $ApiKey
-    $dashboardMustRestart = -not $dashboardHealthy -or $dashboardCredentialsChanged -or
-        ($dashboardTask -and $dashboardChanged)
-    if ($dashboardMustRestart) {
-        if (-not $dashboardTask -and $dashboardHealthy) {
-            try { & $HermesExe dashboard --stop *> $null } catch {}
-            Wait-PortRelease 9119 5
-        }
+    $dashboardStarting = $dashboardTask -and
+        (Test-HermesTaskRunning "HermesConsole-Dashboard")
+    if (-not $dashboardHealthy -and -not $dashboardStarting) {
         Start-HermesProcess "HermesConsole-Dashboard" $dashboardRunner $dashboardTask 9119
+    } elseif ($dashboardStarting -and -not $dashboardHealthy) {
+        # A previous setup can have timed out while npm/Vite kept building in
+        # the persistent task. Restarting here creates a second build and can
+        # leave an orphan on 9119. Reuse the in-flight canonical task instead.
+        Write-Audit "Dashboard service" "INFO" "Existing Dashboard startup/build is still running; waiting"
     } else {
         Write-Audit "Dashboard service" "SKIP" "Already healthy with its existing build"
     }
