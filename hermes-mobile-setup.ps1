@@ -1,7 +1,10 @@
 # Hermes Console - native Windows setup (PowerShell 5.1+).
 # Installs/repairs Hermes, Gateway, Dashboard and Mobile Bridge for this user.
 
-param()
+param(
+    [switch]$AuditOnly,
+    [switch]$NoFirewallPrompt
+)
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -20,17 +23,59 @@ $HermesHome = if ($env:HERMES_HOME) {
 $InstallDir = Join-Path $HermesHome "hermes-agent"
 $ServicesDir = Join-Path $HermesHome "console-services"
 $LogsDir = Join-Path $HermesHome "logs"
+$AuditDir = Join-Path $HermesHome "audit"
+$AuditLog = Join-Path $AuditDir "safe-setup-audit.jsonl"
 $EnvFile = Join-Path $HermesHome ".env"
 $BridgeTarget = Join-Path $HermesHome "hermes_bridge.py"
 $BridgeNew = "$BridgeTarget.new"
 $BridgeBackup = "$BridgeTarget.rollback"
 $ManifestFile = Join-Path $HermesHome "bridge-release.json.new"
 $PairingFile = Join-Path $ServicesDir "pairing.json"
+$QrFile = Join-Path $ServicesDir "pairing-qr.png"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:TaskDefinitionsChanged = @{}
+$script:RunnerChanged = @{}
+$script:BridgeChanged = $false
 
-function Write-Info([string]$Message) { Write-Host "[Hermes Console] $Message" -ForegroundColor Cyan }
-function Write-Ok([string]$Message) { Write-Host "[OK] $Message" -ForegroundColor Green }
-function Write-Warn([string]$Message) { Write-Warning $Message }
+New-Item -ItemType Directory -Force -Path $HermesHome, $ServicesDir, $LogsDir, $AuditDir | Out-Null
+
+function Protect-AuditText([string]$Text) {
+    if (-not $Text) { return "" }
+    $safe = $Text -replace '(?i)hermes://pair\?[^\s"'']+', 'hermes://pair?[REDACTED]'
+    $safe = $safe -replace '(?i)(api[_ -]?key|token|password|credential)(\s*[:=]\s*)[^\s,;]+', '$1$2[REDACTED]'
+    return $safe
+}
+
+function Write-Audit([string]$Step, [string]$State, [string]$Detail = "") {
+    $safe = Protect-AuditText $Detail
+    $row = [ordered]@{
+        time = (Get-Date).ToString('o')
+        step = $Step
+        state = $State
+        detail = $safe
+    }
+    [IO.File]::AppendAllText(
+        $AuditLog,
+        (($row | ConvertTo-Json -Compress) + [Environment]::NewLine),
+        $Utf8NoBom
+    )
+    $color = if ($State -eq 'OK') { 'Green' } elseif ($State -in @('INFO', 'SKIP')) { 'Cyan' } else { 'Yellow' }
+    $suffix = if ($safe) { ": $safe" } else { "" }
+    Write-Host "[$State] $Step$suffix" -ForegroundColor $color
+}
+
+function Write-Info([string]$Message) { Write-Audit "Hermes Console" "INFO" $Message }
+function Write-Ok([string]$Message) { Write-Audit "Hermes Console" "OK" $Message }
+function Write-Warn([string]$Message) { Write-Audit "Hermes Console" "WARN" $Message }
+
+$script:SetupPhase = 0
+$script:SetupPhaseTotal = 7
+function Write-SetupPhase([string]$Label) {
+    $script:SetupPhase++
+    $filled = "#" * $script:SetupPhase
+    $remaining = "." * ($script:SetupPhaseTotal - $script:SetupPhase)
+    Write-Audit "Setup progress" "INFO" "[$filled$remaining] $($script:SetupPhase)/$($script:SetupPhaseTotal) $Label"
+}
 
 function Get-PowerShellExecutable {
     try {
@@ -104,11 +149,19 @@ function Wait-HermesService(
     [string]$ExpectedVersion = "",
     [switch]$PhoneFacing
 ) {
-    for ($i = 0; $i -lt $Seconds; $i++) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $lastReported = -1
+    while ($watch.Elapsed.TotalSeconds -lt $Seconds) {
         if (Test-HermesService $Kind $BaseUrl $Token $ExpectedVersion -PhoneFacing:$PhoneFacing) {
+            Write-Audit "$Kind readiness" "OK" ("Ready in {0:N1}s" -f $watch.Elapsed.TotalSeconds)
             return $true
         }
-        Start-Sleep -Seconds 1
+        $elapsed = [int]$watch.Elapsed.TotalSeconds
+        if ($elapsed -ne $lastReported -and $elapsed % 2 -eq 0) {
+            Write-Audit "$Kind readiness" "INFO" "Waiting (${elapsed}s/${Seconds}s)"
+            $lastReported = $elapsed
+        }
+        Start-Sleep -Milliseconds 500
     }
     return $false
 }
@@ -135,15 +188,23 @@ function Get-ApiKey {
 
 function Ensure-ApiKey {
     $key = Get-ApiKey
+    $lines = if (Test-Path -LiteralPath $EnvFile) {
+        @([IO.File]::ReadAllLines($EnvFile))
+    } else { @() }
+    $keyLines = @($lines | Where-Object { $_ -match '^API_SERVER_KEY=' })
+    if ($key -and $keyLines.Count -eq 1 -and $keyLines[0] -eq "API_SERVER_KEY=$key") {
+        Write-Audit "API key" "SKIP" "Existing strong key retained"
+        return $key
+    }
+    if ($AuditOnly) {
+        throw "API_SERVER_KEY is missing, weak or duplicated."
+    }
     if (-not $key) {
         $bytes = New-Object byte[] 32
         $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
         try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
         $key = ([BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
     }
-    $lines = if (Test-Path -LiteralPath $EnvFile) {
-        @([IO.File]::ReadAllLines($EnvFile))
-    } else { @() }
     $out = New-Object System.Collections.Generic.List[string]
     $inserted = $false
     foreach ($line in $lines) {
@@ -161,6 +222,7 @@ function Ensure-ApiKey {
     $newFile = "$EnvFile.new"
     [IO.File]::WriteAllText($newFile, $payload, $Utf8NoBom)
     Move-Item -LiteralPath $newFile -Destination $EnvFile -Force
+    Write-Audit "API key" "OK" "Generated or normalized in .env"
     return $key
 }
 
@@ -303,7 +365,15 @@ function Get-PairingConfiguration {
     Assert-AllowedServiceUrl $bridge
     $kind = $hostInfo.Kind
     if ($kind -eq "override") {
-        $kind = if (Test-Cgnat $hostInfo.Address) { "mesh" } else { "lan" }
+        $meshOverride = (Test-Cgnat $hostInfo.Address) -or
+            $hostInfo.Address.EndsWith(".ts.net", [StringComparison]::OrdinalIgnoreCase)
+        if (-not $meshOverride) {
+            try {
+                $meshOverride = @([Net.Dns]::GetHostAddresses($hostInfo.Address) |
+                    Where-Object { Test-Cgnat $_.IPAddressToString }).Count -gt 0
+            } catch {}
+        }
+        $kind = if ($meshOverride) { "mesh" } else { "lan" }
     }
     return @{
         Address = $hostInfo.Address
@@ -319,43 +389,82 @@ function Get-PairingConfiguration {
 }
 
 function Write-ServiceRunner([string]$Name, [string]$Content) {
-    $path = Join-Path $ServicesDir "$Name.ps1"
-    [IO.File]::WriteAllText($path, $Content, $Utf8NoBom)
+    $path = Join-Path $ServicesDir "$Name.vbs"
+    if ((Test-Path -LiteralPath $path) -and [IO.File]::ReadAllText($path) -eq $Content) {
+        $script:RunnerChanged[$Name] = $false
+        return $path
+    }
+    if ($AuditOnly) { throw "Runner $Name is missing or outdated." }
+    # Unicode es la codificación nativa y estable de Windows Script Host 5.1.
+    [IO.File]::WriteAllText($path, $Content, [Text.Encoding]::Unicode)
+    $script:RunnerChanged[$Name] = $true
     return $path
 }
 
 function Install-StartupShortcut([string]$Name, [string]$ScriptPath) {
     $startup = [Environment]::GetFolderPath("Startup")
-    if (-not $startup) { return }
+    if (-not $startup) { throw "The per-user Startup folder is unavailable." }
     $shortcutPath = Join-Path $startup "$Name.lnk"
     $shell = New-Object -ComObject WScript.Shell
+    $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
+    $arguments = "//B //NoLogo `"$ScriptPath`""
+    if (Test-Path -LiteralPath $shortcutPath) {
+        $existing = $shell.CreateShortcut($shortcutPath)
+        if ($existing.TargetPath -eq $wscript -and $existing.Arguments -eq $arguments) {
+            Write-Audit "Startup $Name" "SKIP" "Existing invisible fallback retained"
+            return $false
+        }
+    }
+    if ($AuditOnly) { throw "Startup fallback $Name is missing or outdated." }
     $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = Get-PowerShellExecutable
-    $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    $shortcut.TargetPath = $wscript
+    $shortcut.Arguments = $arguments
     $shortcut.WorkingDirectory = $HermesHome
-    $shortcut.WindowStyle = 7
+    $shortcut.WindowStyle = 7 # Minimized/no activation; wscript runner itself is windowless.
     $shortcut.Save()
+    Write-Audit "Startup $Name" "OK" "Invisible fallback installed"
+    return $true
 }
 
 function Register-HermesTask([string]$TaskName, [string]$ScriptPath) {
     try {
         Import-Module ScheduledTasks -ErrorAction Stop
         $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $action = New-ScheduledTaskAction -Execute (Get-PowerShellExecutable) `
-            -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`"" `
+        $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
+        $arguments = "//B //NoLogo `"$ScriptPath`""
+        $current = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $currentAction = if ($current) { @($current.Actions)[0] } else { $null }
+        $same = $current -and $current.Settings.Enabled -and
+            $currentAction.Execute -eq $wscript -and
+            $currentAction.Arguments -eq $arguments
+        if ($same) {
+            $script:TaskDefinitionsChanged[$TaskName] = $false
+            Write-Audit "Task $TaskName" "SKIP" "Existing invisible definition retained"
+            return $true
+        }
+        if ($AuditOnly) { throw "Scheduled Task $TaskName is missing or outdated." }
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction -Execute $wscript `
+            -Argument $arguments `
             -WorkingDirectory $HermesHome
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries -RestartCount 999 `
+            -DontStopIfGoingOnBatteries -RestartCount 3 `
             -RestartInterval (New-TimeSpan -Minutes 1) `
             -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
         $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
             -Settings $settings -Principal $principal -Force | Out-Null
+        $script:TaskDefinitionsChanged[$TaskName] = $true
+        $startupLink = Join-Path ([Environment]::GetFolderPath("Startup")) "$TaskName.lnk"
+        Remove-Item -LiteralPath $startupLink -Force -ErrorAction SilentlyContinue
+        Write-Audit "Task $TaskName" "OK" "Created with invisible wscript.exe runner"
         return $true
     } catch {
-        Write-Warn "Scheduled Task '$TaskName' could not be registered: $($_.Exception.Message)"
-        Install-StartupShortcut $TaskName $ScriptPath
+        if ($AuditOnly) { throw }
+        Write-Warn "Scheduled Task '$TaskName' is unavailable; using the per-user Startup fallback."
+        $changed = Install-StartupShortcut $TaskName $ScriptPath
+        $script:TaskDefinitionsChanged[$TaskName] = $changed
         return $false
     }
 }
@@ -364,8 +473,21 @@ function Register-HermesManualTask([string]$TaskName, [string]$ScriptPath) {
     try {
         Import-Module ScheduledTasks -ErrorAction Stop
         $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $action = New-ScheduledTaskAction -Execute (Get-PowerShellExecutable) `
-            -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`"" `
+        $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
+        $arguments = "//B //NoLogo `"$ScriptPath`""
+        $current = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $currentAction = if ($current) { @($current.Actions)[0] } else { $null }
+        $same = $current -and $current.Settings.Enabled -and
+            $currentAction.Execute -eq $wscript -and
+            $currentAction.Arguments -eq $arguments
+        if ($same) {
+            Write-Audit "Task $TaskName" "SKIP" "Manual restart definition retained"
+            return $true
+        }
+        if ($AuditOnly) { throw "Manual task $TaskName is missing or outdated." }
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction -Execute $wscript `
+            -Argument $arguments `
             -WorkingDirectory $HermesHome
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
@@ -373,21 +495,117 @@ function Register-HermesManualTask([string]$TaskName, [string]$ScriptPath) {
         $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
         Register-ScheduledTask -TaskName $TaskName -Action $action -Settings $settings `
             -Principal $principal -Force | Out-Null
+        Write-Audit "Task $TaskName" "OK" "Manual restart task created windowless"
         return $true
     } catch {
-        Write-Warn "Restart task '$TaskName' could not be registered: $($_.Exception.Message)"
+        if ($AuditOnly) { throw }
+        Write-Warn "Restart task '$TaskName' could not be registered; remote restart will be unavailable."
         return $false
     }
 }
 
-function Start-HermesProcess([string]$TaskName, [string]$ScriptPath, [bool]$Registered) {
+function Start-HermesProcess(
+    [string]$TaskName,
+    [string]$ScriptPath,
+    [bool]$Registered,
+    [int]$Port = 0
+) {
     if ($Registered) {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($Port -gt 0) {
+            Wait-PortRelease $Port 5
+            Assert-PortAvailable $Port $TaskName
+        }
         Start-ScheduledTask -TaskName $TaskName
     } else {
-        Start-Process -FilePath (Get-PowerShellExecutable) `
-            -ArgumentList @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $ScriptPath) `
+        if ($Port -gt 0) { Assert-PortAvailable $Port $TaskName }
+        $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
+        $arguments = "//B //NoLogo `"$ScriptPath`""
+        Start-Process -FilePath $wscript `
+            -ArgumentList $arguments `
             -WorkingDirectory $HermesHome -WindowStyle Hidden | Out-Null
+    }
+}
+
+function Remove-LegacyTasks {
+    foreach ($name in @("Hermes Gateway", "Hermes Dashboard", "Hermes Mobile Bridge")) {
+        try {
+            Import-Module ScheduledTasks -ErrorAction Stop
+            if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+                if ($AuditOnly) { throw "Legacy task '$name' is still installed." }
+                Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName $name -Confirm:$false
+                Write-Audit "Legacy task $name" "OK" "Removed to prevent duplicate services"
+            }
+        } catch {
+            if ($AuditOnly -and $_.Exception.Message -like "Legacy task*") { throw }
+        }
+        $startup = [Environment]::GetFolderPath("Startup")
+        if ($startup) {
+            $legacyLink = Join-Path $startup "$name.lnk"
+            if (Test-Path -LiteralPath $legacyLink) {
+                if ($AuditOnly) { throw "Legacy Startup shortcut '$name' is still installed." }
+                Remove-Item -LiteralPath $legacyLink -Force
+            }
+        }
+    }
+}
+
+function Get-PortOwner([int]$Port) {
+    try {
+        $connection = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
+            Select-Object -First 1
+        if (-not $connection) { return $null }
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($connection.OwningProcess)" `
+            -ErrorAction SilentlyContinue
+        return [PSCustomObject]@{
+            Pid = $connection.OwningProcess
+            Name = $process.Name
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Assert-PortAvailable([int]$Port, [string]$Service) {
+    $owner = Get-PortOwner $Port
+    if ($owner) {
+        # La línea de comandos puede contener tokens o credenciales. PID y
+        # nombre identifican al propietario sin copiar secretos al registro.
+        throw "$Service port $Port is occupied by PID $($owner.Pid) $($owner.Name)."
+    }
+}
+
+function Wait-PortRelease([int]$Port, [int]$Seconds = 5) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ((Get-PortOwner $Port) -and $watch.Elapsed.TotalSeconds -lt $Seconds) {
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+function Invoke-HiddenProcess(
+    [string]$File,
+    [string]$Arguments,
+    [int]$TimeoutSeconds,
+    [string]$StdoutPath,
+    [string]$StderrPath
+) {
+    $process = Start-Process -FilePath $File -ArgumentList $Arguments `
+        -WorkingDirectory $HermesHome -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $process.Kill() } catch {}
+        throw "Hidden process timed out after ${TimeoutSeconds}s: $File"
+    }
+    $process.WaitForExit()
+    $process.Refresh()
+    if ($process.ExitCode -ne 0) {
+        $tail = ""
+        if (Test-Path -LiteralPath $StderrPath) {
+            $tail = ([IO.File]::ReadAllText($StderrPath) -replace '[\r\n]+', ' ').Trim()
+            if ($tail.Length -gt 500) { $tail = $tail.Substring($tail.Length - 500) }
+        }
+        throw "Hidden process exited with $($process.ExitCode): $tail"
     }
 }
 
@@ -395,7 +613,9 @@ function Test-RestrictedFirewallRule([string]$DisplayName, [string]$Kind) {
     try {
         Import-Module NetSecurity -ErrorAction Stop
         $expectedProfile = if ($Kind -eq "mesh") { "Any" } else { "Private" }
-        $expectedRemote = if ($Kind -eq "mesh") { "100.64.0.0/10" } else { "LocalSubnet" }
+        $expectedRemote = if ($Kind -eq "mesh") {
+            @("100.64.0.0/10", "100.64.0.0/255.192.0.0")
+        } else { @("LocalSubnet") }
         $requiredPorts = @("8642", "9119", "9131")
         foreach ($rule in @(Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue)) {
             if ($rule.Enabled.ToString() -ne "True" -or
@@ -414,7 +634,7 @@ function Test-RestrictedFirewallRule([string]$DisplayName, [string]$Kind) {
                 $_.ToString().Split(',') | ForEach-Object { $_.Trim() }
             })
             if (@($requiredPorts | Where-Object { $_ -notin $ports }).Count -eq 0 -and
-                $expectedRemote -in $addresses) {
+                @($addresses | Where-Object { $_ -in $expectedRemote }).Count -gt 0) {
                 return $true
             }
         }
@@ -452,10 +672,13 @@ if ($Kind -eq "mesh") {
 '@
     [IO.File]::WriteAllText($helper, $content, $Utf8NoBom)
     try {
+        if ($NoFirewallPrompt) {
+            throw "Firewall repair needs elevation and -NoFirewallPrompt was selected."
+        }
         Write-Info "Windows will request administrator approval for the restricted firewall rule."
         $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$helper`" -Kind $Kind"
         $process = Start-Process -FilePath (Get-PowerShellExecutable) -Verb RunAs `
-            -ArgumentList $arguments -Wait -PassThru
+            -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
         if ($process.ExitCode -ne 0) {
             throw "The elevated firewall helper exited with code $($process.ExitCode)."
         }
@@ -479,6 +702,13 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
         if ($profile -and $profile.NetworkCategory -ne "Private") {
             throw "The selected LAN is '$($profile.NetworkCategory)'. Mark it Private or use Tailscale before exposing Hermes."
         }
+    }
+    if ($AuditOnly) {
+        if (-not (Test-RestrictedFirewallRule $display $Pairing.Kind)) {
+            throw "Restricted Windows Firewall rule is missing or invalid."
+        }
+        Write-Audit "Firewall" "SKIP" "Existing restricted rule verified"
+        return
     }
     if (-not $admin) {
         if (Test-RestrictedFirewallRule $display $Pairing.Kind) {
@@ -518,27 +748,36 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
 function Install-HermesIfNeeded {
     $hermes = Get-HermesExecutable
     if ($hermes) {
-        try { & $hermes --version *> $null; if ($LASTEXITCODE -eq 0) { return $hermes } } catch {}
+        try {
+            $version = (& $hermes --version 2>$null | Select-Object -First 1)
+            if ($LASTEXITCODE -eq 0) {
+                Write-Audit "Hermes Agent" "SKIP" "Installed: $version"
+                return $hermes
+            }
+        } catch {}
     }
+    if ($AuditOnly) { throw "Hermes Agent is not installed or is broken." }
     Write-Info "Installing Hermes Agent for native Windows..."
     $installer = Join-Path ([IO.Path]::GetTempPath()) "hermes-agent-install.ps1"
     Invoke-WebRequest -Uri "https://hermes-agent.nousresearch.com/install.ps1" `
         -OutFile $installer -UseBasicParsing
     try {
-        & (Get-PowerShellExecutable) -NoProfile -ExecutionPolicy Bypass -File $installer `
-            -SkipSetup -NonInteractive -HermesHome $HermesHome -InstallDir $InstallDir
-        if ($LASTEXITCODE -ne 0) { throw "Hermes installer exited with $LASTEXITCODE" }
+        $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installer`" " +
+            "-SkipSetup -NonInteractive -HermesHome `"$HermesHome`" -InstallDir `"$InstallDir`""
+        Invoke-HiddenProcess (Get-PowerShellExecutable) $arguments 180 `
+            (Join-Path $AuditDir "hermes-install.out.log") `
+            (Join-Path $AuditDir "hermes-install.err.log")
     } finally {
         Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
     }
     $hermes = Get-HermesExecutable
     if (-not $hermes) { throw "Hermes Agent executable was not found after installation." }
+    Write-Audit "Hermes Agent" "OK" "Installed with the official installer"
     return $hermes
 }
 
 function Install-VerifiedBridge([string]$Python) {
     Invoke-WebRequest -Uri "$RepoRaw/bridge-release.json" -OutFile $ManifestFile -UseBasicParsing
-    Invoke-WebRequest -Uri "$RepoRaw/hermes_bridge.py" -OutFile $BridgeNew -UseBasicParsing
     $manifest = Get-Content -LiteralPath $ManifestFile -Raw | ConvertFrom-Json
     $expectedFields = @("schema", "version", "min_app_build", "sha256", "size")
     $actualFields = @($manifest.PSObject.Properties.Name)
@@ -550,110 +789,424 @@ function Install-VerifiedBridge([string]$Python) {
         [int64]$manifest.size -le 0 -or [int64]$manifest.size -gt 524288) {
         throw "Invalid Bridge release manifest"
     }
-    $item = Get-Item -LiteralPath $BridgeNew
-    $digest = (Get-FileHash -LiteralPath $BridgeNew -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($item.Length -ne [int64]$manifest.size -or $digest -ne $manifest.sha256) {
-        throw "Bridge release integrity check failed"
+
+    function Test-BridgeArtifact([string]$Path) {
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        $item = Get-Item -LiteralPath $Path
+        $digest = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($item.Length -ne [int64]$manifest.size -or $digest -ne $manifest.sha256) {
+            return $false
+        }
+        try {
+            $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+            $source = [IO.File]::ReadAllText($Path, $strictUtf8)
+        } catch {
+            return $false
+        }
+        $versions = [regex]::Matches($source, '(?m)^VERSION\s*=\s*["''](\d+\.\d+\.\d+)["'']\s*(?:#.*)?$')
+        if ($versions.Count -ne 1 -or $versions[0].Groups[1].Value -ne $manifest.version) {
+            return $false
+        }
+        $compileLog = Join-Path $AuditDir "bridge-compile.log"
+        # Compila en memoria: misma validación sintáctica que `-m py_compile`
+        # sin crear __pycache__ durante una auditoría de solo lectura.
+        & $Python -c 'import pathlib,sys;compile(pathlib.Path(sys.argv[1]).read_bytes(),sys.argv[1],"exec")' $Path *> $compileLog
+        return $LASTEXITCODE -eq 0
     }
-    $source = [IO.File]::ReadAllText($BridgeNew, [Text.Encoding]::UTF8)
-    $versions = [regex]::Matches($source, '(?m)^VERSION\s*=\s*["''](\d+\.\d+\.\d+)["'']\s*(?:#.*)?$')
-    if ($versions.Count -ne 1 -or $versions[0].Groups[1].Value -ne $manifest.version) {
-        throw "Bridge source VERSION mismatch"
+
+    if (Test-BridgeArtifact $BridgeTarget) {
+        $script:BridgeChanged = $false
+        Write-Audit "Mobile Bridge file" "SKIP" "Version $($manifest.version), size, SHA-256 and syntax verified"
+        return [string]$manifest.version
     }
-    & $Python -m py_compile $BridgeNew
-    if ($LASTEXITCODE -ne 0) { throw "Bridge Python compilation failed" }
+    if ($AuditOnly) {
+        throw "Mobile Bridge is missing, outdated or failed integrity/syntax validation; expected $($manifest.version)."
+    }
+
+    Invoke-WebRequest -Uri "$RepoRaw/hermes_bridge.py" -OutFile $BridgeNew -UseBasicParsing
+    if (-not (Test-BridgeArtifact $BridgeNew)) {
+        throw "Bridge release integrity check failed (size, SHA-256, VERSION, UTF-8 or compilation)."
+    }
     if (Test-Path -LiteralPath $BridgeTarget) {
         [IO.File]::Replace($BridgeNew, $BridgeTarget, $BridgeBackup, $true)
     } else {
         Move-Item -LiteralPath $BridgeNew -Destination $BridgeTarget
     }
-    return $manifest.version
+    $script:BridgeChanged = $true
+    Write-Audit "Mobile Bridge file" "OK" "Installed verified version $($manifest.version)"
+    return [string]$manifest.version
 }
 
-function Render-Qr([string]$Python, [string]$Link) {
-    $code = "import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)"
+function Write-PairingQr([string]$Python, [string]$Link) {
     & $Python -c "import qrcode" 2>$null
     if ($LASTEXITCODE -ne 0) {
-        & $Python -m pip install -q qrcode *> $null
+        Invoke-HiddenProcess $Python '-m pip install -q "qrcode[pil]"' 90 `
+            (Join-Path $AuditDir "qrcode-install.out.log") `
+            (Join-Path $AuditDir "qrcode-install.err.log")
     }
-    & $Python -c $code $Link
-    return $LASTEXITCODE -eq 0
+    $qrScript = Join-Path $AuditDir "make-pairing-qr.py"
+    $qrSource = @'
+import qrcode
+import sys
+
+link = sys.stdin.read()
+if not link:
+    raise SystemExit("empty pairing payload")
+qrcode.make(link).save(sys.argv[1])
+'@
+    [IO.File]::WriteAllText($qrScript, $qrSource, $Utf8NoBom)
+    try {
+        $start = New-Object Diagnostics.ProcessStartInfo
+        $start.FileName = $Python
+        $start.Arguments = "`"$qrScript`" `"$QrFile`""
+        $start.WorkingDirectory = $HermesHome
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardInput = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $process = New-Object Diagnostics.Process
+        $process.StartInfo = $start
+        if (-not $process.Start()) { throw "Python QR process did not start." }
+        $process.StandardInput.Write($Link)
+        $process.StandardInput.Close()
+        if (-not $process.WaitForExit(30000)) {
+            try { $process.Kill() } catch {}
+            throw "Pairing QR generation timed out."
+        }
+        $stderr = $process.StandardError.ReadToEnd()
+        if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $QrFile)) {
+            throw "Pairing QR generation failed: $stderr"
+        }
+    } finally {
+        Remove-Item -LiteralPath $qrScript -Force -ErrorAction SilentlyContinue
+    }
+    Write-Audit "Pairing QR" "OK" $QrFile
+    return $QrFile
+}
+
+function Test-RunnerContract([string]$Path, [string[]]$RequiredFragments) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $content = [IO.File]::ReadAllText($Path)
+    } catch {
+        return $false
+    }
+    foreach ($fragment in $RequiredFragments) {
+        if ($content.IndexOf($fragment, [StringComparison]::Ordinal) -lt 0) {
+            return $false
+        }
+    }
+    return $content -notmatch '(?i)powershell(?:\.exe)?\s+-.*-file'
+}
+
+function Invoke-SetupInventory {
+    $missing = New-Object System.Collections.Generic.List[string]
+    $hermes = Get-HermesExecutable
+    if (-not $hermes) {
+        [void]$missing.Add("Hermes Agent executable")
+    } else {
+        try {
+            & $hermes --version *> $null
+            if ($LASTEXITCODE -ne 0) { [void]$missing.Add("Healthy Hermes Agent executable") }
+        } catch { [void]$missing.Add("Healthy Hermes Agent executable") }
+    }
+
+    $python = Get-HermesPython
+    if (-not $python) {
+        [void]$missing.Add("Hermes virtual-environment Python")
+    } else {
+        & $python -c "import aiohttp" *> $null
+        if ($LASTEXITCODE -ne 0) { [void]$missing.Add("Python package aiohttp") }
+        try {
+            [void](Install-VerifiedBridge $python)
+        } catch {
+            [void]$missing.Add("Verified current Mobile Bridge file")
+        } finally {
+            Remove-Item -LiteralPath $BridgeNew, $ManifestFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $key = $null
+    try { $key = Get-ApiKey } catch {}
+    if (-not $key) { [void]$missing.Add("One strong API_SERVER_KEY entry") }
+
+    $pairing = $null
+    try { $pairing = Get-PairingConfiguration } catch {
+        [void]$missing.Add("Tailscale/private-LAN address or configured HTTPS endpoint")
+    }
+
+    $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
+    $runnerContracts = @(
+        @{
+            Task = "HermesConsole-Gateway"
+            File = "hermes-gateway.vbs"
+            Fragments = @("gateway run --replace", "API_SERVER_HOST", "sh.Run(command, 0, True)")
+        },
+        @{
+            Task = "HermesConsole-Dashboard"
+            File = "hermes-dashboard.vbs"
+            Fragments = @("dashboard --host", "--no-open", "%ProgramFiles%\nodejs", "--skip-build", "sh.Run(command, 0, True)")
+        },
+        @{
+            Task = "HermesConsole-MobileBridge"
+            File = "hermes-bridge.vbs"
+            Fragments = @("BRIDGE_TOKEN", "hermes_bridge.py", "--i-know-what-im-doing", "sh.Run(command, 0, True)")
+        }
+    )
+    foreach ($contract in $runnerContracts) {
+        $name = $contract.Task
+        $runnerPath = Join-Path $ServicesDir $contract.File
+        if (-not (Test-RunnerContract $runnerPath $contract.Fragments)) {
+            [void]$missing.Add("Current windowless runner for $name")
+        }
+        $expectedArguments = "//B //NoLogo `"$runnerPath`""
+        $persistent = $false
+        try {
+            Import-Module ScheduledTasks -ErrorAction Stop
+            $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+            $action = if ($task) { @($task.Actions)[0] } else { $null }
+            $persistent = $task -and $task.Settings.Enabled -and
+                $action.Execute -eq $wscript -and $action.Arguments -eq $expectedArguments
+        } catch {}
+        if (-not $persistent) {
+            $startup = [Environment]::GetFolderPath("Startup")
+            $shortcutPath = if ($startup) { Join-Path $startup "$name.lnk" } else { $null }
+            if ($shortcutPath -and (Test-Path -LiteralPath $shortcutPath)) {
+                try {
+                    $shell = New-Object -ComObject WScript.Shell
+                    $shortcut = $shell.CreateShortcut($shortcutPath)
+                    $persistent = $shortcut.TargetPath -eq $wscript -and
+                        $shortcut.Arguments -eq $expectedArguments
+                } catch {}
+            }
+        }
+        if (-not $persistent) { [void]$missing.Add("Exact per-user autostart for $name") }
+    }
+
+    foreach ($legacyName in @("Hermes Gateway", "Hermes Dashboard", "Hermes Mobile Bridge")) {
+        $legacyFound = $false
+        try {
+            Import-Module ScheduledTasks -ErrorAction Stop
+            $legacyFound = $null -ne (Get-ScheduledTask -TaskName $legacyName -ErrorAction SilentlyContinue)
+        } catch {}
+        $startup = [Environment]::GetFolderPath("Startup")
+        if ($startup -and (Test-Path -LiteralPath (Join-Path $startup "$legacyName.lnk"))) {
+            $legacyFound = $true
+        }
+        if ($legacyFound) { [void]$missing.Add("Remove legacy duplicate $legacyName") }
+    }
+
+    try {
+        Import-Module ScheduledTasks -ErrorAction Stop
+        $restartContracts = @(
+            @{ Task = "HermesConsole-Restart-Dashboard"; File = "restart-hermes-dashboard.vbs" },
+            @{ Task = "HermesConsole-Restart-MobileBridge"; File = "restart-hermes-bridge.vbs" }
+        )
+        foreach ($contract in $restartContracts) {
+            $task = Get-ScheduledTask -TaskName $contract.Task -ErrorAction SilentlyContinue
+            $action = if ($task) { @($task.Actions)[0] } else { $null }
+            $runnerPath = Join-Path $ServicesDir $contract.File
+            $expectedArguments = "//B //NoLogo `"$runnerPath`""
+            if (-not $task -or -not $task.Settings.Enabled -or
+                $action.Execute -ne $wscript -or $action.Arguments -ne $expectedArguments) {
+                [void]$missing.Add("Exact allowlisted remote restart task $($contract.Task)")
+            }
+        }
+    } catch {
+        [void]$missing.Add("ScheduledTasks support for allowlisted remote restarts")
+    }
+
+    if ($key) {
+        foreach ($service in @(
+            @{ Kind = "gateway"; Url = "http://127.0.0.1:8642"; Port = 8642 },
+            @{ Kind = "bridge"; Url = "http://127.0.0.1:9131"; Port = 9131 },
+            @{ Kind = "dashboard"; Url = "http://127.0.0.1:9119"; Port = 9119 }
+        )) {
+            if (-not (Test-HermesService $service.Kind $service.Url $key)) {
+                $owner = Get-PortOwner $service.Port
+                $suffix = if ($owner) { " (port owned by PID $($owner.Pid) $($owner.Name))" } else { "" }
+                [void]$missing.Add("Healthy/authenticated $($service.Kind) service$suffix")
+            }
+        }
+        try {
+            $credentials = Invoke-RestMethod -Method Get `
+                -Uri "http://127.0.0.1:9131/bridge/dashboard/credentials" `
+                -Headers @{ Authorization = "Bearer $key" } -TimeoutSec 4
+            if ($credentials.password_set -ne $true) {
+                [void]$missing.Add("Dashboard password")
+            }
+        } catch { [void]$missing.Add("Readable Dashboard credential state through Mobile Bridge") }
+    }
+
+    if ($pairing) {
+        if ($pairing.Scheme -eq "http") {
+            $display = if ($pairing.Kind -eq "mesh") { "Hermes Console Tailscale" } else { "Hermes Console private network" }
+            if (-not (Test-RestrictedFirewallRule $display $pairing.Kind)) {
+                [void]$missing.Add("Restricted Windows Firewall rule")
+            }
+        }
+        if ($key) {
+            foreach ($service in @(
+                @{ Kind = "gateway"; Url = $pairing.GatewayBase },
+                @{ Kind = "bridge"; Url = $pairing.BridgeBase },
+                @{ Kind = "dashboard"; Url = $pairing.DashboardBase }
+            )) {
+                if (-not (Test-HermesService $service.Kind $service.Url $key "" -PhoneFacing)) {
+                    [void]$missing.Add("Phone-facing $($service.Kind) reachability")
+                }
+            }
+        }
+    }
+
+    $dist = Join-Path $InstallDir "web\dist\index.html"
+    $node = Get-Command node.exe -ErrorAction SilentlyContinue
+    if (-not $node -and -not (Test-Path -LiteralPath "C:\Program Files\nodejs\node.exe") -and
+        -not (Test-Path -LiteralPath $dist)) {
+        [void]$missing.Add("Node.js in PATH or an already-built Dashboard")
+    }
+    $pairingRecordValid = $false
+    if ($pairing -and (Test-Path -LiteralPath $PairingFile)) {
+        try {
+            $record = Get-Content -LiteralPath $PairingFile -Raw | ConvertFrom-Json
+            $pairingRecordValid = $record.schema -eq 1 -and
+                $record.host -eq $pairing.Address -and
+                $record.gateway -eq $pairing.GatewayBase -and
+                $record.dashboard -eq $pairing.DashboardBase -and
+                $record.bridge -eq $pairing.BridgeBase -and
+                $record.kind -eq $pairing.Kind
+        } catch {}
+    }
+    if (-not $pairingRecordValid) { [void]$missing.Add("Verified current pairing record") }
+    if (-not (Test-Path -LiteralPath $QrFile) -or (Get-Item -LiteralPath $QrFile).Length -le 0) {
+        [void]$missing.Add("Non-empty pairing QR PNG")
+    }
+
+    foreach ($item in $missing) { Write-Audit "Inventory" "WARN" $item }
+    if ($missing.Count -eq 0) { Write-Audit "Inventory" "OK" "Installation is ready for Hermes Console" }
+    return [PSCustomObject]@{
+        ready = $missing.Count -eq 0
+        missing = @($missing)
+        audit = $AuditLog
+        qr = if (Test-Path -LiteralPath $QrFile) { $QrFile } else { $null }
+    }
+}
+
+if ($AuditOnly) {
+    Write-Audit "Setup" "INFO" "Audit-only mode; service files and tasks will not be modified"
+    $inventory = Invoke-SetupInventory
+    $inventory | ConvertTo-Json -Compress
+    if (-not $inventory.ready) {
+        throw "Audit found $($inventory.missing.Count) item(s) to repair. See $AuditLog."
+    }
+    return
 }
 
 try {
-    New-Item -ItemType Directory -Force -Path $HermesHome, $ServicesDir, $LogsDir | Out-Null
+    Write-Audit "Setup" "INFO" "Repair/install mode"
+    Write-SetupPhase "Inspecting the existing installation"
+    Remove-LegacyTasks
+    Write-SetupPhase "Checking Hermes Agent and Python"
     $HermesExe = Install-HermesIfNeeded
     $PythonExe = Get-HermesPython
     if (-not $PythonExe) { throw "Hermes virtual-environment Python was not found." }
     & $PythonExe -c "import aiohttp" *> $null
     if ($LASTEXITCODE -ne 0) { throw "Hermes Python does not provide aiohttp." }
+    Write-Audit "Hermes Python" "OK" "Python and aiohttp are available"
     $ApiKey = Ensure-ApiKey
     $Pairing = Get-PairingConfiguration
     $HadBridgeTarget = Test-Path -LiteralPath $BridgeTarget
+    Write-SetupPhase "Verifying the Mobile Bridge release"
     $BridgeVersion = Install-VerifiedBridge $PythonExe
 
     $gatewayRunnerContent = @'
-$ErrorActionPreference = "Stop"
-$HermesHome = Split-Path $PSScriptRoot -Parent
-$env:HERMES_HOME = $HermesHome
-$env:API_SERVER_HOST = "__BIND_HOST__"
-$env:API_SERVER_PORT = "8642"
-$exe = Join-Path $HermesHome "hermes-agent\venv\Scripts\hermes.exe"
-$log = Join-Path $HermesHome "logs\gateway.log"
-Set-Location $HermesHome
-& $exe gateway run --replace >> $log 2>&1
-exit $LASTEXITCODE
+Option Explicit
+Dim sh, fso, home, exe, command, rc
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+home = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
+sh.CurrentDirectory = home
+sh.Environment("Process")("HERMES_HOME") = home
+sh.Environment("Process")("API_SERVER_HOST") = "__BIND_HOST__"
+sh.Environment("Process")("API_SERVER_PORT") = "8642"
+exe = fso.BuildPath(home, "hermes-agent\venv\Scripts\hermes.exe")
+command = Chr(34) & exe & Chr(34) & " gateway run --replace"
+rc = sh.Run(command, 0, True)
+WScript.Quit rc
 '@
     $gatewayRunner = Write-ServiceRunner "hermes-gateway" ($gatewayRunnerContent.Replace("__BIND_HOST__", $Pairing.BindHost))
     $dashboardRunnerContent = @'
-$ErrorActionPreference = "Stop"
-$HermesHome = Split-Path $PSScriptRoot -Parent
-$env:HERMES_HOME = $HermesHome
-$exe = Join-Path $HermesHome "hermes-agent\venv\Scripts\hermes.exe"
-$log = Join-Path $HermesHome "logs\dashboard.log"
-Set-Location $HermesHome
-& $exe dashboard --host __BIND_HOST__ --port 9119 --no-open >> $log 2>&1
-exit $LASTEXITCODE
+Option Explicit
+Dim sh, fso, home, exe, dist, nodePath, command, rc
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+home = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
+sh.CurrentDirectory = home
+sh.Environment("Process")("HERMES_HOME") = home
+nodePath = sh.ExpandEnvironmentStrings("%ProgramFiles%\nodejs")
+If fso.FolderExists(nodePath) Then
+  sh.Environment("Process")("PATH") = nodePath & ";" & sh.Environment("Process")("PATH")
+End If
+exe = fso.BuildPath(home, "hermes-agent\venv\Scripts\hermes.exe")
+dist = fso.BuildPath(home, "hermes-agent\web\dist\index.html")
+command = Chr(34) & exe & Chr(34) & " dashboard --host __BIND_HOST__ --port 9119 --no-open"
+If fso.FileExists(dist) Then command = command & " --skip-build"
+rc = sh.Run(command, 0, True)
+WScript.Quit rc
 '@
     $dashboardRunner = Write-ServiceRunner "hermes-dashboard" ($dashboardRunnerContent.Replace("__BIND_HOST__", $Pairing.BindHost))
     $bridgeRunnerContent = @'
-$ErrorActionPreference = "Stop"
-$HermesHome = Split-Path $PSScriptRoot -Parent
-$env:HERMES_HOME = $HermesHome
-$env:BRIDGE_HERMES_HOME = $HermesHome
-$env:BRIDGE_HOST = "__BIND_HOST__"
-$env:BRIDGE_PORT = "9131"
-$env:BRIDGE_SCOPES = "read,memory,soul,skills,cron,config,command"
-$env:BRIDGE_READ_ONLY = "false"
-foreach ($line in [IO.File]::ReadAllLines((Join-Path $HermesHome ".env"))) {
-    if ($line -match '^API_SERVER_KEY=(.*)$') { $env:BRIDGE_TOKEN = $Matches[1].Trim().Trim('"').Trim("'"); break }
-}
-if (-not $env:BRIDGE_TOKEN) { throw "API_SERVER_KEY is missing" }
-$python = Join-Path $HermesHome "hermes-agent\venv\Scripts\python.exe"
-$bridge = Join-Path $HermesHome "hermes_bridge.py"
-$log = Join-Path $HermesHome "logs\bridge.log"
-Set-Location $HermesHome
-& $python $bridge --i-know-what-im-doing >> $log 2>&1
-exit $LASTEXITCODE
+Option Explicit
+Dim sh, fso, home, python, bridge, envFile, stream, line, token, command, rc
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+home = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
+sh.CurrentDirectory = home
+sh.Environment("Process")("HERMES_HOME") = home
+sh.Environment("Process")("BRIDGE_HERMES_HOME") = home
+sh.Environment("Process")("BRIDGE_HOST") = "__BIND_HOST__"
+sh.Environment("Process")("BRIDGE_PORT") = "9131"
+sh.Environment("Process")("BRIDGE_SCOPES") = "read,memory,soul,skills,cron,config,command"
+sh.Environment("Process")("BRIDGE_READ_ONLY") = "false"
+envFile = fso.BuildPath(home, ".env")
+token = ""
+Set stream = fso.OpenTextFile(envFile, 1, False)
+Do Until stream.AtEndOfStream
+  line = Trim(stream.ReadLine)
+  If Left(line, 15) = "API_SERVER_KEY=" Then token = Mid(line, 16)
+Loop
+stream.Close
+If Len(token) = 0 Then WScript.Quit 2
+sh.Environment("Process")("BRIDGE_TOKEN") = Replace(token, Chr(34), "")
+python = fso.BuildPath(home, "hermes-agent\venv\Scripts\python.exe")
+bridge = fso.BuildPath(home, "hermes_bridge.py")
+command = Chr(34) & python & Chr(34) & " " & Chr(34) & bridge & Chr(34) & " --i-know-what-im-doing"
+rc = sh.Run(command, 0, True)
+WScript.Quit rc
 '@
     $bridgeRunner = Write-ServiceRunner "hermes-bridge" ($bridgeRunnerContent.Replace("__BIND_HOST__", $Pairing.BindHost))
     $dashboardRestartRunner = Write-ServiceRunner "restart-hermes-dashboard" @'
-$ErrorActionPreference = "Stop"
-Start-Sleep -Milliseconds 300
-& schtasks.exe /End /TN "HermesConsole-Dashboard" 2>$null | Out-Null
-Start-Sleep -Milliseconds 500
-& schtasks.exe /Run /TN "HermesConsole-Dashboard" | Out-Null
-exit $LASTEXITCODE
+Option Explicit
+Dim sh, rc
+Set sh = CreateObject("WScript.Shell")
+WScript.Sleep 300
+Call sh.Run("schtasks.exe /End /TN ""HermesConsole-Dashboard""", 0, True)
+WScript.Sleep 500
+rc = sh.Run("schtasks.exe /Run /TN ""HermesConsole-Dashboard""", 0, True)
+WScript.Quit rc
 '@
     $bridgeRestartRunner = Write-ServiceRunner "restart-hermes-bridge" @'
-$ErrorActionPreference = "Stop"
-Start-Sleep -Milliseconds 500
-& schtasks.exe /End /TN "HermesConsole-MobileBridge" 2>$null | Out-Null
-Start-Sleep -Milliseconds 500
-& schtasks.exe /Run /TN "HermesConsole-MobileBridge" | Out-Null
-exit $LASTEXITCODE
+Option Explicit
+Dim sh, rc
+Set sh = CreateObject("WScript.Shell")
+WScript.Sleep 500
+Call sh.Run("schtasks.exe /End /TN ""HermesConsole-MobileBridge""", 0, True)
+WScript.Sleep 500
+rc = sh.Run("schtasks.exe /Run /TN ""HermesConsole-MobileBridge""", 0, True)
+WScript.Quit rc
 '@
 
+    Write-SetupPhase "Installing hidden persistent services"
     $gatewayTask = Register-HermesTask "HermesConsole-Gateway" $gatewayRunner
     $dashboardTask = Register-HermesTask "HermesConsole-Dashboard" $dashboardRunner
     $bridgeTask = Register-HermesTask "HermesConsole-MobileBridge" $bridgeRunner
@@ -664,48 +1217,86 @@ exit $LASTEXITCODE
         [void](Register-HermesManualTask "HermesConsole-Restart-MobileBridge" $bridgeRestartRunner)
     }
 
-    Start-HermesProcess "HermesConsole-Gateway" $gatewayRunner $gatewayTask
-    Start-HermesProcess "HermesConsole-MobileBridge" $bridgeRunner $bridgeTask
-    if (-not (Wait-HermesService "gateway" "http://127.0.0.1:8642" $ApiKey 40)) {
-        throw "Gateway did not pass /health plus authenticated /api/sessions. TCP 8642 may be occupied by another process; inspect $LogsDir and Task Scheduler."
+    Write-SetupPhase "Checking Gateway, Dashboard and credentials"
+    $gatewayChanged = [bool]$script:RunnerChanged["hermes-gateway"] -or
+        [bool]$script:TaskDefinitionsChanged["HermesConsole-Gateway"]
+    $bridgeChanged = $script:BridgeChanged -or [bool]$script:RunnerChanged["hermes-bridge"] -or
+        [bool]$script:TaskDefinitionsChanged["HermesConsole-MobileBridge"]
+    $dashboardChanged = [bool]$script:RunnerChanged["hermes-dashboard"] -or
+        [bool]$script:TaskDefinitionsChanged["HermesConsole-Dashboard"]
+
+    $gatewayHealthy = Test-HermesService "gateway" "http://127.0.0.1:8642" $ApiKey
+    if (-not $gatewayHealthy -or ($gatewayTask -and $gatewayChanged)) {
+        Start-HermesProcess "HermesConsole-Gateway" $gatewayRunner $gatewayTask 8642
+    } else {
+        Write-Audit "Gateway service" "SKIP" "Already healthy and authenticated"
+    }
+    if (-not (Wait-HermesService "gateway" "http://127.0.0.1:8642" $ApiKey 15)) {
+        throw "Gateway readiness failed. Inspect its Scheduled Task and the owner of TCP 8642."
     }
     Write-Ok "Gateway identity and authentication passed on 8642"
-    if (-not (Wait-HermesService "bridge" "http://127.0.0.1:9131" $ApiKey 40 $BridgeVersion)) {
-        if (Test-Path -LiteralPath $BridgeBackup) {
+
+    $bridgeHealthy = Test-HermesService "bridge" "http://127.0.0.1:9131" $ApiKey $BridgeVersion
+    if (-not $bridgeHealthy -or ($bridgeTask -and $bridgeChanged)) {
+        Start-HermesProcess "HermesConsole-MobileBridge" $bridgeRunner $bridgeTask 9131
+    } else {
+        Write-Audit "Mobile Bridge service" "SKIP" "Already healthy, authenticated and current"
+    }
+    if (-not (Wait-HermesService "bridge" "http://127.0.0.1:9131" $ApiKey 15 $BridgeVersion)) {
+        if ($script:BridgeChanged -and (Test-Path -LiteralPath $BridgeBackup)) {
             Copy-Item -LiteralPath $BridgeBackup -Destination $BridgeTarget -Force
-            Start-HermesProcess "HermesConsole-MobileBridge" $bridgeRunner $bridgeTask
+            Start-HermesProcess "HermesConsole-MobileBridge" $bridgeRunner $bridgeTask 9131
+            [void](Wait-HermesService "bridge" "http://127.0.0.1:9131" $ApiKey 15)
+            Write-Audit "Mobile Bridge rollback" "WARN" "Restored the previous verified file after readiness failed"
         } elseif (-not $HadBridgeTarget) {
             Remove-Item -LiteralPath $BridgeTarget -Force -ErrorAction SilentlyContinue
         }
-        throw "Mobile Bridge did not pass health, auth and self-update capability checks. TCP 9131 may be occupied; inspect $LogsDir and Task Scheduler."
+        throw "Mobile Bridge did not pass health, auth and self-update checks. Inspect its Scheduled Task and TCP 9131."
     }
     Write-Ok "Mobile Bridge $BridgeVersion health, auth and self-update passed"
 
-    try { & $HermesExe dashboard --stop *> $null } catch {}
-    $passwordBytes = New-Object byte[] 24
-    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($passwordBytes) } finally { $rng.Dispose() }
-    $password = [Convert]::ToBase64String($passwordBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
     $bridgeHeaders = @{ Authorization = "Bearer $ApiKey" }
-    $currentCredentials = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:9131/bridge/dashboard/credentials" -Headers $bridgeHeaders -TimeoutSec 65
+    $currentCredentials = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:9131/bridge/dashboard/credentials" -Headers $bridgeHeaders -TimeoutSec 4
     if ($currentCredentials.ok -ne $true) {
         throw "Dashboard credential endpoint rejected the read."
     }
+    $dashboardCredentialsChanged = $false
     if ($currentCredentials.password_set -ne $true) {
+        $passwordBytes = New-Object byte[] 24
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($passwordBytes) } finally { $rng.Dispose() }
+        $password = [Convert]::ToBase64String($passwordBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
         $username = if ($currentCredentials.username) { $currentCredentials.username } else { "admin" }
         $body = @{ username = $username; password = $password } | ConvertTo-Json -Compress
         $credentials = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:9131/bridge/dashboard/credentials" `
-            -Headers $bridgeHeaders -ContentType "application/json" -Body $body -TimeoutSec 65
+            -Headers $bridgeHeaders -ContentType "application/json" -Body $body -TimeoutSec 6
         if ($credentials.ok -ne $true) {
             throw "Dashboard credential endpoint rejected the configuration."
         }
+        $dashboardCredentialsChanged = $true
+        Write-Audit "Dashboard credentials" "OK" "Created through the authenticated Mobile Bridge"
+    } else {
+        Write-Audit "Dashboard credentials" "SKIP" "Existing password retained"
     }
-    Start-HermesProcess "HermesConsole-Dashboard" $dashboardRunner $dashboardTask
-    if (-not (Wait-HermesService "dashboard" "http://127.0.0.1:9119" $ApiKey 60)) {
-        throw "Dashboard did not pass /api/status or reports Gateway stopped. TCP 9119 may be occupied; inspect $LogsDir and Task Scheduler."
+
+    $dashboardHealthy = Test-HermesService "dashboard" "http://127.0.0.1:9119" $ApiKey
+    $dashboardMustRestart = -not $dashboardHealthy -or $dashboardCredentialsChanged -or
+        ($dashboardTask -and $dashboardChanged)
+    if ($dashboardMustRestart) {
+        if (-not $dashboardTask -and $dashboardHealthy) {
+            try { & $HermesExe dashboard --stop *> $null } catch {}
+            Wait-PortRelease 9119 5
+        }
+        Start-HermesProcess "HermesConsole-Dashboard" $dashboardRunner $dashboardTask 9119
+    } else {
+        Write-Audit "Dashboard service" "SKIP" "Already healthy with its existing build"
+    }
+    if (-not (Wait-HermesService "dashboard" "http://127.0.0.1:9119" $ApiKey 25)) {
+        throw "Dashboard readiness failed. Check Node.js/PATH, its Scheduled Task and TCP 9119."
     }
     Write-Ok "Dashboard identity and Gateway state passed on 9119"
 
+    Write-SetupPhase "Verifying private phone access"
     Ensure-PrivateFirewallRules $Pairing
 
     if (-not (Wait-HermesService "gateway" $Pairing.GatewayBase $ApiKey 12 "" -PhoneFacing)) {
@@ -718,6 +1309,7 @@ exit $LASTEXITCODE
         throw "Dashboard works locally but not through $($Pairing.DashboardBase). Check routing/proxy rules for /api/status. No QR was generated."
     }
 
+    Write-SetupPhase "Generating pairing QR and summary"
     $pairingRecord = [ordered]@{
         schema = 1
         host = $Pairing.Address
@@ -728,7 +1320,16 @@ exit $LASTEXITCODE
         bridge = $Pairing.BridgeBase
         kind = $Pairing.Kind
     }
-    [IO.File]::WriteAllText($PairingFile, ($pairingRecord | ConvertTo-Json -Compress), $Utf8NoBom)
+    $pairingJson = $pairingRecord | ConvertTo-Json -Compress
+    if ((Test-Path -LiteralPath $PairingFile) -and
+        [IO.File]::ReadAllText($PairingFile).Trim() -eq $pairingJson) {
+        Write-Audit "Pairing record" "SKIP" "Existing verified endpoints retained"
+    } else {
+        $pairingNew = "$PairingFile.new"
+        [IO.File]::WriteAllText($pairingNew, $pairingJson, $Utf8NoBom)
+        Move-Item -LiteralPath $pairingNew -Destination $PairingFile -Force
+        Write-Audit "Pairing record" "OK" "Verified endpoint metadata updated"
+    }
 
     $query = @(
         "host=$([Uri]::EscapeDataString($Pairing.Address))"
@@ -740,19 +1341,31 @@ exit $LASTEXITCODE
     )
     if ($Pairing.Scheme -eq "https") { $query += "https=1" }
     $link = "hermes://pair?" + ($query -join "&")
-    Write-Host ""
-    Write-Host "== SCAN THIS QR WITH HERMES CONSOLE (or copy the link) ==" -ForegroundColor Yellow
-    Write-Host ""
-    if (-not (Render-Qr $PythonExe $link)) {
-        Write-Warn "A QR renderer could not be prepared. Paste the link shown below."
-    }
-    Write-Host ""
-    Write-Host "Link: $link"
-    Write-Host ""
-    Write-Host "All three services passed local and phone-address health/auth checks."
-    Write-Host "To verify them and show this QR again later in PowerShell:"
-    Write-Host "  irm $RepoRaw/hermes-pair.ps1 | iex"
-    Write-Host "If chat has no model yet, open Dashboard from the app and configure your AI provider/model."
+    [void](Write-PairingQr $PythonExe $link)
+    Write-Audit "Setup" "OK" "All local and phone-facing checks passed; pairing QR is ready"
+    Write-Audit "Setup summary" "OK" "Hermes Agent, Gateway, Dashboard and Mobile Bridge are ready; private phone access passed"
+    [PSCustomObject]@{
+        ok = $true
+        qr = $QrFile
+        audit = $AuditLog
+        pairing = $PairingFile
+        summary = @(
+            "Hermes Agent ready"
+            "Gateway authenticated and reachable"
+            "Dashboard ready"
+            "Mobile Bridge $BridgeVersion authenticated and reachable"
+            "Private phone access verified"
+        )
+    } | ConvertTo-Json -Compress
+} catch {
+    $safeError = Protect-AuditText $_.Exception.Message
+    Write-Audit "Setup" "ERROR" $safeError
+    [PSCustomObject]@{
+        ok = $false
+        error = $safeError
+        audit = $AuditLog
+    } | ConvertTo-Json -Compress
+    throw $safeError
 } finally {
-    Remove-Item -LiteralPath $BridgeNew, $ManifestFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $BridgeNew, $ManifestFile, "$PairingFile.new" -Force -ErrorAction SilentlyContinue
 }
