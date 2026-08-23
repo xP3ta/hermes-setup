@@ -1148,7 +1148,7 @@ If fso.FolderExists(nodePath) Then
   sh.Environment("Process")("PATH") = nodePath & ";" & sh.Environment("Process")("PATH")
 End If
 exe = fso.BuildPath(home, "hermes-agent\venv\Scripts\hermes.exe")
-dist = fso.BuildPath(home, "hermes-agent\web\dist\index.html")
+dist = fso.BuildPath(home, "hermes-agent\hermes_cli\web_dist\index.html")
 command = Chr(34) & exe & Chr(34) & " dashboard --host __BIND_HOST__ --port 9119 --no-open"
 If fso.FileExists(dist) Then command = command & " --skip-build"
 rc = sh.Run(command, 0, True)
@@ -1291,7 +1291,10 @@ WScript.Quit rc
     } else {
         Write-Audit "Dashboard service" "SKIP" "Already healthy with its existing build"
     }
-    if (-not (Wait-HermesService "dashboard" "http://127.0.0.1:9119" $ApiKey 25)) {
+    # A first native-Windows launch may need npm install + the Vite build.
+    # Hermes itself allows a long idle window for that work; do not fail the
+    # setup after 25 seconds while the Scheduled Task is still building.
+    if (-not (Wait-HermesService "dashboard" "http://127.0.0.1:9119" $ApiKey 240)) {
         throw "Dashboard readiness failed. Check Node.js/PATH, its Scheduled Task and TCP 9119."
     }
     Write-Ok "Dashboard identity and Gateway state passed on 9119"
