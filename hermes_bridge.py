@@ -28,6 +28,9 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1520,11 +1523,70 @@ def _config_model():
     return out
 
 
+def _validated_http_url(value, *, loopback_only=False, allow_query=True):
+    """Acepta únicamente destinos HTTP(S) explícitos y bien formados.
+
+    `base_url` es configurable por el operador y debe poder apuntar a su modelo
+    LAN/Tailscale, por eso HTTP sigue permitido. La allowlist de esquema evita
+    que urllib interprete `file:`, `ftp:` u otros handlers locales.
+    """
+    raw = str(value or "").strip()
+    if not raw or any(ord(char) < 0x20 for char in raw):
+        raise ValueError("URL vacía o con caracteres de control")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError as ex:
+        raise ValueError("URL o puerto no válidos") from ex
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("el esquema debe ser http o https")
+    if not parsed.hostname:
+        raise ValueError("falta el host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("no se permiten credenciales dentro de la URL")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("puerto fuera de rango")
+    if parsed.fragment:
+        raise ValueError("no se permiten fragmentos en la URL")
+    if parsed.query and not allow_query:
+        raise ValueError("base_url no admite parámetros de consulta")
+    hostname = parsed.hostname.lower().rstrip(".")
+    if loopback_only and hostname not in {"127.0.0.1", "::1", "localhost"}:
+        raise ValueError("el destino debe ser loopback")
+    return urllib.parse.urlunsplit(
+        (scheme, parsed.netloc, parsed.path, parsed.query, "")
+    )
+
+
+class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Aplica la misma política de URL a cada salto HTTP."""
+
+    def __init__(self, *, loopback_only=False):
+        super().__init__()
+        self._loopback_only = loopback_only
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validated_http_url(newurl, loopback_only=self._loopback_only)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _urlopen_http(target, *, timeout, loopback_only=False):
+    """Abre solo HTTP(S); punto único auditado para las sondas del Bridge."""
+    raw = target.full_url if isinstance(target, urllib.request.Request) else target
+    _validated_http_url(raw, loopback_only=loopback_only)
+    opener = urllib.request.build_opener(
+        _ValidatedRedirectHandler(loopback_only=loopback_only)
+    )
+    return opener.open(target, timeout=timeout)
+
+
 def _normalize_base_url(base_url):
     """Garantiza exactamente un sufijo /v1 (evita base_url duplicada /v1/v1)."""
     u = (base_url or "").strip().rstrip("/")
     if not u:
         u = "http://127.0.0.1:8000/v1"  # fallback local OlliteRT
+    u = _validated_http_url(u, allow_query=False)
     if not u.endswith("/v1"):
         u = u + "/v1"
     return u  # luego + "/chat/completions"
@@ -1532,12 +1594,11 @@ def _normalize_base_url(base_url):
 
 async def _ollama_tags():
     """Modelos descargados en ollama (:11434), o None si no responde."""
-    import urllib.request
-
     def _get():
         try:
-            with urllib.request.urlopen(
-                    "http://127.0.0.1:11434/api/tags", timeout=3) as r:
+            with _urlopen_http(
+                    "http://127.0.0.1:11434/api/tags", timeout=3,
+                    loopback_only=True) as r:
                 data = json.loads(r.read().decode())
                 return [m.get("name", "") for m in data.get("models", [])]
         except Exception:
@@ -1548,12 +1609,11 @@ async def _ollama_tags():
 async def _ollitert_models():
     """IDs de modelos que OlliteRT sirve en :8000 (/v1/models), o None si el
     servidor no responde (app cerrada o «Start Server» sin pulsar)."""
-    import urllib.request
-
     def _go():
         try:
-            with urllib.request.urlopen(
-                    "http://127.0.0.1:8000/v1/models", timeout=3) as r:
+            with _urlopen_http(
+                    "http://127.0.0.1:8000/v1/models", timeout=3,
+                    loopback_only=True) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
             return [str(m.get("id") or "") for m in (data.get("data") or [])
                     if isinstance(m, dict) and m.get("id")]
@@ -1573,9 +1633,6 @@ async def _ollitert_chat_probe(model, timeout=30):
           plantilla en OlliteRT).
       {"ok": False, "error": "<motivo>"}  si el endpoint falló (HTTP/red).
     """
-    import urllib.request
-    import urllib.error
-
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": "Responde solo: hola"}],
@@ -1585,14 +1642,18 @@ async def _ollitert_chat_probe(model, timeout=30):
     }).encode("utf-8")
 
     def _go():
-        req = urllib.request.Request(
+        endpoint = _validated_http_url(
             "http://127.0.0.1:8000/v1/chat/completions",
+            loopback_only=True,
+        )
+        req = urllib.request.Request(
+            endpoint,
             data=payload,
             headers={"Content-Type": "application/json",
                      "Authorization": "Bearer local"},
             method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _urlopen_http(req, timeout=timeout, loopback_only=True) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as e:
             body = ""
@@ -1627,9 +1688,6 @@ async def _chat_local_simple(prompt, history, *, max_tokens=1024, timeout=120):
     """Chat OpenAI DIRECTO contra el modelo local (OlliteRT/Ollama), SIN tools,
     SIN plantilla de agente. Evita el bucle de tool-calling que deja vacío a los
     modelos pequeños. NO usa `hermes -z`. Solo instancias locales (mode=simple)."""
-    import urllib.request
-    import urllib.error
-
     cfg = _config_model()
     model = cfg.get("default") or ""
     url = _normalize_base_url(cfg.get("base_url")) + "/chat/completions"
@@ -1661,7 +1719,7 @@ async def _chat_local_simple(prompt, history, *, max_tokens=1024, timeout=120):
                      "Authorization": "Bearer local"},
             method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _urlopen_http(req, timeout=timeout) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as e:
             body = ""
@@ -1831,20 +1889,21 @@ async def _ollama_probe(model, num_ctx, timeout=45):
     ollama caído) de un problema de RENDIMIENTO: la primera carga de un modelo
     con contexto 64K en un móvil modesto reserva un KV-cache enorme y puede
     tardar minutos o colgarse. Devuelve {ok, ms, error?}."""
-    import urllib.request
-    import time
-
     def _go():
         body = json.dumps({
             "model": model, "prompt": "hi", "stream": False,
             "options": {"num_predict": 1, "num_ctx": int(num_ctx)},
         }).encode()
+        endpoint = _validated_http_url(
+            "http://127.0.0.1:11434/api/generate",
+            loopback_only=True,
+        )
         req = urllib.request.Request(
-            "http://127.0.0.1:11434/api/generate", data=body,
+            endpoint, data=body,
             headers={"Content-Type": "application/json"})
         t0 = time.monotonic()
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _urlopen_http(req, timeout=timeout, loopback_only=True) as r:
                 r.read()
             return {"ok": True, "ms": int((time.monotonic() - t0) * 1000)}
         except Exception as ex:
@@ -2626,6 +2685,11 @@ async def model_set(request):
         ctx = 0
     if not provider or not model:
         return _err("bad_args", "provider y model son obligatorios")
+    if base_url:
+        try:
+            base_url = _validated_http_url(base_url, allow_query=False)
+        except ValueError as ex:
+            return _err("bad_args", f"base_url no válida: {ex}")
     is_ollama = provider in ("custom", "ollama")
     # OlliteRT (motor GPU, :8000) no es Ollama real pero Hermes lee ollama_num_ctx
     # como "contexto de runtime" y bloquea tool-use si < 64K.
