@@ -36,6 +36,7 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:TaskDefinitionsChanged = @{}
 $script:RunnerChanged = @{}
 $script:BridgeChanged = $false
+$script:HermesInstallTimeoutSeconds = 900
 
 New-Item -ItemType Directory -Force -Path $HermesHome, $ServicesDir, $LogsDir, $AuditDir | Out-Null
 
@@ -768,13 +769,15 @@ function Install-HermesIfNeeded {
     }
     if ($AuditOnly) { throw "Hermes Agent is not installed or is broken." }
     Write-Info "Installing Hermes Agent for native Windows..."
+    Write-Info "The official installer can take several minutes on a clean Windows host; setup will wait safely."
     $installer = Join-Path ([IO.Path]::GetTempPath()) "hermes-agent-install.ps1"
     Invoke-WebRequest -Uri "https://hermes-agent.nousresearch.com/install.ps1" `
         -OutFile $installer -UseBasicParsing
     try {
         $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installer`" " +
             "-SkipSetup -NonInteractive -HermesHome `"$HermesHome`" -InstallDir `"$InstallDir`""
-        Invoke-HiddenProcess (Get-PowerShellExecutable) $arguments 180 `
+        Invoke-HiddenProcess (Get-PowerShellExecutable) $arguments `
+            $script:HermesInstallTimeoutSeconds `
             (Join-Path $AuditDir "hermes-install.out.log") `
             (Join-Path $AuditDir "hermes-install.err.log")
     } finally {
