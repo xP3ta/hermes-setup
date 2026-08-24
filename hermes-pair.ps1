@@ -126,16 +126,53 @@ function Render-Qr([string]$Link) {
     return $LASTEXITCODE -eq 0
 }
 
+function Invoke-VerifiedSetupRepair([string]$Reason) {
+    $setupUrl = "$RepoRaw/hermes-mobile-setup.ps1"
+    Write-Host ""
+    Write-Host "Hermes Console needs to upgrade or repair this installation before pairing." -ForegroundColor Yellow
+    Write-Host "Reason: $Reason"
+    Write-Host "Running the verified Hermes Console setup now..." -ForegroundColor Cyan
+
+    try {
+        $setupSource = [string](Invoke-RestMethod -Method Get -Uri $setupUrl -TimeoutSec 30)
+    } catch {
+        throw "Automatic setup/repair could not be downloaded. Run this command and retry: irm $setupUrl | iex"
+    }
+    if (-not $setupSource.StartsWith("# Hermes Console - native Windows setup") -or
+        $setupSource -notmatch '(?m)^function Get-PairingConfiguration' -or
+        $setupSource -notmatch '(?m)^\$PairingFile = Join-Path \$ServicesDir "pairing\.json"') {
+        throw "The downloaded setup file did not match the expected Hermes Console installer. Nothing was executed."
+    }
+
+    try {
+        & ([ScriptBlock]::Create($setupSource))
+    } catch {
+        throw "Automatic setup/repair failed: $($_.Exception.Message)"
+    }
+    if (-not (Test-Path -LiteralPath $PairingFile)) {
+        throw "Setup finished without a verified pairing record. Review the setup error above before retrying."
+    }
+    Write-Host "Setup/repair completed. Use the QR printed above to connect Hermes Console." -ForegroundColor Green
+}
+
 $ApiKey = Get-ApiKey
 if (-not $ApiKey) {
-    throw "No API token found in $EnvFile. Run first: irm $RepoRaw/hermes-mobile-setup.ps1 | iex"
+    Invoke-VerifiedSetupRepair "No valid API token was found."
+    return
 }
 if (-not (Test-Path -LiteralPath $PairingFile)) {
-    throw "This installation predates verified pairing. Run setup once: irm $RepoRaw/hermes-mobile-setup.ps1 | iex"
+    Invoke-VerifiedSetupRepair "This installation predates verified pairing."
+    return
 }
-$pairing = Get-Content -LiteralPath $PairingFile -Raw | ConvertFrom-Json
+try {
+    $pairing = Get-Content -LiteralPath $PairingFile -Raw | ConvertFrom-Json
+} catch {
+    Invoke-VerifiedSetupRepair "The saved pairing record is unreadable."
+    return
+}
 if ($pairing.schema -ne 1) {
-    throw "This pairing record is not from the verified installer. Run setup once: irm $RepoRaw/hermes-mobile-setup.ps1 | iex"
+    Invoke-VerifiedSetupRepair "The saved pairing record is outdated."
+    return
 }
 $hostName = if ($env:HERMES_PAIR_HOST) { $env:HERMES_PAIR_HOST.Trim() } else { [string]$pairing.host }
 $scheme = if ($env:HERMES_PAIR_SCHEME) { $env:HERMES_PAIR_SCHEME.Trim().ToLowerInvariant() } else { [string]$pairing.scheme }
