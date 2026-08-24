@@ -58,10 +58,17 @@ New-Item -ItemType Directory -Force -Path $HermesHome, $ServicesDir, $LogsDir, $
 # sees a half-built venv, misclassifies a healthy install as broken, and
 # triggers a destructive reinstall. The lock makes re-runs wait instead.
 $script:SetupLock = Join-Path $HermesHome ".setup-lock"
+# Review fix (xPeta): the exclusive handle must stay OPEN for the whole setup
+# run - closing it right after Open only proved exclusivity for an instant.
+# The FileStream is kept in $script: scope and disposed by Exit-SetupLock.
+# Note: a crash leaves the FILE behind but releases the OS handle, so the next
+# run's Open succeeds; file presence alone is never treated as "locked".
+$script:SetupLockStream = $null
 function Enter-SetupLock {
     for ($i = 0; $i -lt 60; $i++) {
         try {
-            [IO.File]::Open($script:SetupLock, 'OpenOrCreate', 'ReadWrite', 'None').Close()
+            $script:SetupLockStream = [IO.File]::Open(
+                $script:SetupLock, 'OpenOrCreate', 'ReadWrite', 'None')
             return
         } catch {
             if ($i -eq 0) {
@@ -73,6 +80,10 @@ function Enter-SetupLock {
     throw "Another Hermes Console setup is still running (lock held): $script:SetupLock"
 }
 function Exit-SetupLock {
+    if ($script:SetupLockStream) {
+        try { $script:SetupLockStream.Dispose() } catch {}
+        $script:SetupLockStream = $null
+    }
     Remove-Item -LiteralPath $script:SetupLock -Force -ErrorAction SilentlyContinue
 }
 
