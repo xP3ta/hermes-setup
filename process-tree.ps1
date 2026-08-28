@@ -82,7 +82,11 @@ function Wait-ProcessIdsExit {
         [int]$WaitSeconds = 10
     )
     $tracked = @($ProcessIds | Where-Object { $_ -gt 0 } | Select-Object -Unique)
-    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(1, $WaitSeconds))
+    $deadline = if ($WaitSeconds -gt 0) {
+        [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+    } else {
+        [DateTime]::MaxValue
+    }
     do {
         $alive = @($tracked | Where-Object { Test-ProcessAlive $_ })
         if ($alive.Count -eq 0) { return @() }
@@ -106,14 +110,6 @@ function Stop-ProcessTree {
     }
     $tracked = @($rootPid) + $descendants
 
-    if (-not (Test-ProcessAlive $rootPid)) {
-        $remaining = @(Wait-ProcessIdsExit -ProcessIds $tracked -WaitSeconds $WaitSeconds)
-        if ($remaining.Count -gt 0) {
-            throw "Root PID $rootPid exited but tracked descendant PID(s) remain: $($remaining -join ', ')"
-        }
-        return
-    }
-
     if (Test-WindowsPlatform) {
         # Windows PowerShell 5.1 has no Process.Kill(entireProcessTree) overload.
         # taskkill /T /F is the native tree-aware primitive and also works from
@@ -130,7 +126,9 @@ function Stop-ProcessTree {
         if (-not $taskkill) {
             throw 'Process-tree termination requires taskkill.exe on Windows.'
         }
-        & $taskkill /PID $rootPid /T /F *> $null
+        if (Test-ProcessAlive $rootPid) {
+            & $taskkill /PID $rootPid /T /F *> $null
+        }
     } else {
         # PowerShell Core on Linux/macOS: stop known descendants deepest-first,
         # then the root. Stop-Process maps to the host process APIs and avoids
@@ -143,8 +141,12 @@ function Stop-ProcessTree {
         try { Stop-Process -Id $rootPid -Force -ErrorAction SilentlyContinue } catch {}
     }
 
+    # The normal verification window catches fast termination. If any tracked
+    # descendant survives it, do not return control to the setup lock owner yet:
+    # wait until the tracked tree has actually gone instead of releasing the
+    # single-flight lock after confirming only the parent process.
     $remaining = @(Wait-ProcessIdsExit -ProcessIds $tracked -WaitSeconds $WaitSeconds)
     if ($remaining.Count -gt 0) {
-        throw "Process tree rooted at PID $rootPid did not fully terminate within ${WaitSeconds}s; remaining PID(s): $($remaining -join ', ')"
+        [void](Wait-ProcessIdsExit -ProcessIds $remaining -WaitSeconds 0)
     }
 }
