@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$SetupScript = (Join-Path $PSScriptRoot "hermes-mobile-setup.ps1")
+    [string]$SetupScript = (Join-Path $PSScriptRoot "hermes-mobile-setup.ps1"),
+    [string]$ProcessTreeHelper = (Join-Path $PSScriptRoot "process-tree.ps1")
 )
 
 Set-StrictMode -Version Latest
@@ -32,6 +33,9 @@ function Test-PidAlive([int]$ProcessId) {
 if (-not (Test-Path -LiteralPath $SetupScript)) {
     throw "Setup script not found: $SetupScript"
 }
+if (-not (Test-Path -LiteralPath $ProcessTreeHelper)) {
+    throw "Process-tree helper not found: $ProcessTreeHelper"
+}
 
 $source = Get-Content -LiteralPath $SetupScript -Raw
 $tokens = $null
@@ -41,21 +45,29 @@ $ast = [Management.Automation.Language.Parser]::ParseInput(
 )
 Assert-True ($parseErrors.Count -eq 0) "hermes-mobile-setup.ps1 parses cleanly"
 
-function Find-SetupFunction([string]$Name) {
-    return $ast.Find({
+$helperSource = Get-Content -LiteralPath $ProcessTreeHelper -Raw
+$helperTokens = $null
+$helperParseErrors = $null
+$helperAst = [Management.Automation.Language.Parser]::ParseInput(
+    $helperSource, [ref]$helperTokens, [ref]$helperParseErrors
+)
+Assert-True ($helperParseErrors.Count -eq 0) "process-tree.ps1 parses cleanly"
+
+function Find-Function([Management.Automation.Language.Ast]$Root, [string]$Name) {
+    return $Root.Find({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
             $node.Name -eq $Name
     }, $true)
 }
 
-$enterFn = Find-SetupFunction "Enter-SetupLock"
-$exitFn = Find-SetupFunction "Exit-SetupLock"
-$installFn = Find-SetupFunction "Install-HermesIfNeeded"
-$platformFn = Find-SetupFunction "Test-WindowsPlatform"
-$aliveFn = Find-SetupFunction "Test-ProcessAlive"
-$unixDescendantsFn = Find-SetupFunction "Get-UnixDescendantProcessIds"
-$stopTreeFn = Find-SetupFunction "Stop-ProcessTree"
+$enterFn = Find-Function $ast "Enter-SetupLock"
+$exitFn = Find-Function $ast "Exit-SetupLock"
+$installFn = Find-Function $ast "Install-HermesIfNeeded"
+$platformFn = Find-Function $helperAst "Test-WindowsPlatform"
+$aliveFn = Find-Function $helperAst "Test-ProcessAlive"
+$unixDescendantsFn = Find-Function $helperAst "Get-UnixDescendantProcessIds"
+$stopTreeFn = Find-Function $helperAst "Stop-ProcessTree"
 
 Assert-True ($null -ne $enterFn) "Enter-SetupLock exists"
 Assert-True ($null -ne $exitFn) "Exit-SetupLock exists"
@@ -67,6 +79,9 @@ Assert-True ($null -ne $stopTreeFn) "Stop-ProcessTree exists"
 
 $installText = $installFn.Extent.Text
 $stopTreeText = $stopTreeFn.Extent.Text
+Assert-True (
+    $source -match '(?m)^\.\s+\$ProcessTreeHelper\s*$'
+) "setup imports the portable process-tree helper"
 Assert-True (
     $installText -match "continuing to wait while the setup lock remains held"
 ) "default timeout path explicitly preserves lock ownership while waiting"
@@ -100,10 +115,7 @@ try {
     function Write-Audit([string]$Step, [string]$State, [string]$Detail = "") {}
     Invoke-Expression $enterFn.Extent.Text
     Invoke-Expression $exitFn.Extent.Text
-    Invoke-Expression $platformFn.Extent.Text
-    Invoke-Expression $aliveFn.Extent.Text
-    Invoke-Expression $unixDescendantsFn.Extent.Text
-    Invoke-Expression $stopTreeFn.Extent.Text
+    . $ProcessTreeHelper
     $script:SetupLock = $lockPath
     $script:SetupLockStream = $null
 
