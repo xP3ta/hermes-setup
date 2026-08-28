@@ -1,42 +1,20 @@
 # Patch: safe-setup-idempotency
 
-## Problem (observed in production, 2026-08-23)
-`hermes-mobile-setup.ps1` repair mode failed twice consecutively:
+## Problem
+Repair mode could misclassify a transient health-probe failure as a broken install, then a slow hidden reinstall could collide with a second setup run. The first lock repair held an exclusive FileStream for setup, but the timeout path still threw while deliberately leaving the installer alive; the outer finally then released the lock before venv mutation ended.
 
-1. `Get-HermesExecutable` found `venv\Scripts\hermes.exe`, but a single
-   transient `--version` probe failure reclassified the healthy install as
-   broken and triggered a full reinstall.
-2. The reinstall ran hidden with a hard **180s timeout**, but the official
-   installer routinely needs 5-10 minutes on Windows (PortableGit download,
-   venv recreate, full dependency install). It was killed mid-run during the
-   `uv.lock` dependency tier — twice — leaving a half-built venv and all
-   three console services (gateway :8642, dashboard :9119, bridge :9131) down.
+## Corrected behavior
+1. **Idempotent health guard** — three retries plus `hermes_cli` import fallback before destructive reinstall.
+2. **Soft installer timeout** — `-InstallerTimeoutSec` defaults to 900s. Without `-ForceClose`, crossing the threshold only emits a warning; setup remains alive and continues waiting for the installer, so `.setup-lock` stays held until the process exits.
+3. **Explicit force-close** — `-ForceClose` kills the timed-out installer and confirms process exit before setup can unwind and release the lock.
+4. **Single-flight lock** — the exclusive `.setup-lock` FileStream remains open for the complete setup lifetime.
+5. **Regression test** — `test-lock.ps1` parses the setup source, proves the exclusive handle lifecycle, verifies stale-file recovery, and exercises timeout followed immediately by a second acquisition attempt; the second run must remain blocked until the simulated installer exits. The child signals only after its exclusive handle is open, so the proof has no startup timing race.
 
-Audit log evidence (`safe-setup-audit.jsonl`):
+## Evidence discipline
+The previous revision overstated its evidence by referring to `test-lock.ps1` when that file was not present and by treating a lock-handle test as proof of the installer-timeout lifecycle. This revision corrects both errors. The stale generated `.diff` has been removed rather than retained as conflicting evidence.
+
+## Run the regression
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-lock.ps1
+pwsh -NoProfile -File .\test-lock.ps1
 ```
-{"step":"Hermes Console","state":"INFO","detail":"Installing Hermes Agent for native Windows..."}
-{"step":"Setup","state":"ERROR","detail":"Hidden process timed out after 180s: ...pwsh.exe"}
-```
-(repeated on two consecutive runs, ~3 minutes apart)
-
-## Fix
-1. **Idempotent health guard** — `Test-HermesHealthy`: 3 retries with backoff
-   plus a `hermes_cli` venv-import fallback before declaring an install broken.
-2. **Safe installer timeout** — default 900s via `-InstallerTimeoutSec`. On
-   timeout the installer keeps running detached so it can finish rebuilding
-   the venv; `-ForceClose` restores the old kill behavior explicitly;
-   `-Interactive` runs the installer attached with live output.
-3. **Single-flight lock** — `.setup-lock` exclusive-open makes overlapping
-   setup runs wait instead of corrupting each other's venv rebuild.
-
-## Validation (live Windows 11 host, RTX laptop, PowerShell 7.6.5)
-- Parser check: clean.
-- `-AuditOnly` on the broken system correctly listed only genuinely-down
-  items; "Healthy Hermes Agent executable" no longer falsely flagged.
-- Full repair run with patched script: gateway ready 9.7s + auth passed,
-  bridge 1.18.0 health/auth/self-update passed, dashboard ready 2.4s,
-  all scheduled tasks registered, firewall rule installed+verified.
-- Phone-facing check fail-closed correctly when Tailscale runs under a
-  different local account (environment issue, not script).
-
-Full unified diff: `docs-safe-setup-idempotency.diff` (118+/17-).

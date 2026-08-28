@@ -11,8 +11,9 @@ param(
     # mid-install kill on every slow run.
     [int]$InstallerTimeoutSec = 900,
     # Opt-in ONLY. When set, a timed-out installer is killed immediately (old
-    # behavior). Without it, the installer keeps running to completion in the
-    # background so a partially built venv is never left behind.
+    # behavior). Without it, the timeout is a soft warning threshold: setup
+    # keeps waiting while holding the single-flight lock until the installer
+    # actually exits, so a second setup cannot overlap the same venv mutation.
     [switch]$ForceClose,
     # Run the Hermes Agent installer attached to this console with live output
     # instead of hidden. Recommended on first install and major updates.
@@ -858,9 +859,10 @@ function Install-HermesIfNeeded {
         # PortableGit, recreates the venv and installs every dependency; 180s
         # was not enough and hard-killing it mid-run left a broken venv behind
         # (the exact failure this repair mode exists to fix). Default timeout
-        # is now 900s (-InstallerTimeoutSec). On timeout WITHOUT -ForceClose
-        # the installer keeps running detached so it can finish rebuilding the
-        # venv; setup exits with guidance instead of corrupting the install.
+        # is now 900s (-InstallerTimeoutSec). On timeout WITHOUT -ForceClose,
+        # the threshold is informational: setup keeps waiting for the same
+        # installer while retaining .setup-lock. The lock is therefore never
+        # released while that installer can still be mutating the venv.
         if ($Interactive) {
             Write-Info "Running Hermes installer attached to this console (live output)..."
             & (Get-PowerShellExecutable) -NoProfile -ExecutionPolicy Bypass -File $installer `
@@ -876,11 +878,16 @@ function Install-HermesIfNeeded {
                 -RedirectStandardOutput $outLog -RedirectStandardError $errLog
             if (-not $process.WaitForExit($InstallerTimeoutSec * 1000)) {
                 if ($ForceClose) {
-                    try { $process.Kill() } catch {}
+                    try {
+                        $process.Kill()
+                        $process.WaitForExit()
+                    } catch {
+                        Write-Warn "Force-close did not confirm installer exit; continuing to wait while the setup lock remains held."
+                        $process.WaitForExit()
+                    }
                     throw "Hidden installer timed out after ${InstallerTimeoutSec}s and was force-closed (-ForceClose): $(Get-PowerShellExecutable)"
                 }
-                Write-Warn "Hermes installer exceeded ${InstallerTimeoutSec}s; leaving it running detached to finish safely. Re-run this setup in a few minutes (it is idempotent). Logs: $outLog"
-                throw "Hermes installer still running after ${InstallerTimeoutSec}s. It was NOT killed; wait for completion and re-run setup."
+                Write-Warn "Hermes installer exceeded ${InstallerTimeoutSec}s; continuing to wait while the setup lock remains held. Logs: $outLog"
             }
             $process.WaitForExit()
             $process.Refresh()
