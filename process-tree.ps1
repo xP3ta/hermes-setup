@@ -1,6 +1,6 @@
 # Provider-neutral process-tree termination primitive for PowerShell 5.1+ and PowerShell Core.
-# This file intentionally contains no Hermes/Creation policy. It only implements one contract:
-# terminate a process and all descendants, then prove that the root process is gone.
+# This file intentionally contains no Hermes/Creation policy. It implements one contract:
+# discover descendants, terminate the tree through the host adapter, and verify the tracked set.
 
 Set-StrictMode -Version Latest
 
@@ -21,21 +21,45 @@ function Test-ProcessAlive([int]$ProcessId) {
     }
 }
 
-function Get-UnixDescendantProcessIds([int]$RootProcessId) {
+function Get-WindowsProcessPairs {
+    try {
+        return @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop |
+            ForEach-Object {
+                [PSCustomObject]@{ Pid = [int]$_.ProcessId; ParentPid = [int]$_.ParentProcessId }
+            })
+    } catch {
+        $wmi = Get-Command Get-WmiObject -ErrorAction SilentlyContinue
+        if (-not $wmi) {
+            throw 'Process-tree discovery requires Get-CimInstance or Get-WmiObject on Windows.'
+        }
+        return @(Get-WmiObject Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop |
+            ForEach-Object {
+                [PSCustomObject]@{ Pid = [int]$_.ProcessId; ParentPid = [int]$_.ParentProcessId }
+            })
+    }
+}
+
+function Get-UnixProcessPairs {
     $psCommand = Get-Command ps -ErrorAction SilentlyContinue
     if (-not $psCommand) {
-        throw 'Process-tree termination requires ps on non-Windows hosts.'
+        throw 'Process-tree discovery requires ps on non-Windows hosts.'
     }
-
-    $childrenByParent = @{}
+    $pairs = New-Object System.Collections.Generic.List[object]
     foreach ($line in @(& $psCommand.Source -axo 'pid=,ppid=' 2>$null)) {
         if ($line -notmatch '^\s*(\d+)\s+(\d+)\s*$') { continue }
-        $pidValue = [int]$Matches[1]
-        $ppidValue = [int]$Matches[2]
-        if (-not $childrenByParent.ContainsKey($ppidValue)) {
-            $childrenByParent[$ppidValue] = New-Object System.Collections.Generic.List[int]
+        $pairs.Add([PSCustomObject]@{ Pid = [int]$Matches[1]; ParentPid = [int]$Matches[2] })
+    }
+    return @($pairs)
+}
+
+function Get-ProcessDescendantIds([int]$RootProcessId) {
+    $pairs = if (Test-WindowsPlatform) { @(Get-WindowsProcessPairs) } else { @(Get-UnixProcessPairs) }
+    $childrenByParent = @{}
+    foreach ($pair in $pairs) {
+        if (-not $childrenByParent.ContainsKey($pair.ParentPid)) {
+            $childrenByParent[$pair.ParentPid] = New-Object System.Collections.Generic.List[int]
         }
-        $childrenByParent[$ppidValue].Add($pidValue)
+        $childrenByParent[$pair.ParentPid].Add([int]$pair.Pid)
     }
 
     $result = New-Object System.Collections.Generic.List[int]
@@ -52,6 +76,23 @@ function Get-UnixDescendantProcessIds([int]$RootProcessId) {
     return @($result)
 }
 
+function Wait-ProcessIdsExit {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int[]]$ProcessIds,
+        [int]$WaitSeconds = 10
+    )
+    $tracked = @($ProcessIds | Where-Object { $_ -gt 0 } | Select-Object -Unique)
+    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(1, $WaitSeconds))
+    do {
+        $alive = @($tracked | Where-Object { Test-ProcessAlive $_ })
+        if ($alive.Count -eq 0) { return @() }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return @($tracked | Where-Object { Test-ProcessAlive $_ })
+}
+
 function Stop-ProcessTree {
     [CmdletBinding()]
     param(
@@ -61,17 +102,24 @@ function Stop-ProcessTree {
     )
 
     $rootPid = [int]$Process.Id
-    try {
-        $Process.Refresh()
-        if ($Process.HasExited) { return }
-    } catch {
-        if (-not (Test-ProcessAlive $rootPid)) { return }
+    $descendants = @()
+    try { $descendants = @(Get-ProcessDescendantIds $rootPid) } catch {
+        throw "Could not discover process tree rooted at PID $rootPid: $($_.Exception.Message)"
+    }
+    $tracked = @($rootPid) + $descendants
+
+    if (-not (Test-ProcessAlive $rootPid)) {
+        $remaining = @(Wait-ProcessIdsExit -ProcessIds $tracked -WaitSeconds $WaitSeconds)
+        if ($remaining.Count -gt 0) {
+            throw "Root PID $rootPid exited but tracked descendant PID(s) remain: $($remaining -join ', ')"
+        }
+        return
     }
 
     if (Test-WindowsPlatform) {
         # Windows PowerShell 5.1 has no Process.Kill(entireProcessTree) overload.
-        # taskkill /T /F is the native tree-aware primitive and works from both
-        # Windows PowerShell 5.1 and modern PowerShell on Windows.
+        # taskkill /T /F is the native tree-aware primitive and also works from
+        # modern PowerShell on Windows.
         $taskkill = $null
         if ($env:SystemRoot) {
             $candidate = Join-Path $env:SystemRoot 'System32\taskkill.exe'
@@ -86,22 +134,19 @@ function Stop-ProcessTree {
         }
         & $taskkill /PID $rootPid /T /F *> $null
     } else {
-        # PowerShell Core on Linux/macOS: derive the descendant graph from ps,
-        # stop descendants deepest-first, then stop the root. Stop-Process maps
-        # to the host process APIs and avoids shell-specific kill syntax.
-        $descendants = @(Get-UnixDescendantProcessIds $rootPid)
-        [array]::Reverse($descendants)
-        foreach ($childPid in $descendants) {
+        # PowerShell Core on Linux/macOS: stop known descendants deepest-first,
+        # then the root. Stop-Process maps to the host process APIs and avoids
+        # shell-specific kill syntax.
+        $killOrder = @($descendants)
+        [array]::Reverse($killOrder)
+        foreach ($childPid in $killOrder) {
             try { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue } catch {}
         }
         try { Stop-Process -Id $rootPid -Force -ErrorAction SilentlyContinue } catch {}
     }
 
-    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(1, $WaitSeconds))
-    while ((Test-ProcessAlive $rootPid) -and [DateTime]::UtcNow -lt $deadline) {
-        Start-Sleep -Milliseconds 100
-    }
-    if (Test-ProcessAlive $rootPid) {
-        throw "Process tree rooted at PID $rootPid did not terminate within ${WaitSeconds}s."
+    $remaining = @(Wait-ProcessIdsExit -ProcessIds $tracked -WaitSeconds $WaitSeconds)
+    if ($remaining.Count -gt 0) {
+        throw "Process tree rooted at PID $rootPid did not fully terminate within ${WaitSeconds}s; remaining PID(s): $($remaining -join ', ')"
     }
 }
