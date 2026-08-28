@@ -66,7 +66,10 @@ $exitFn = Find-Function $ast "Exit-SetupLock"
 $installFn = Find-Function $ast "Install-HermesIfNeeded"
 $platformFn = Find-Function $helperAst "Test-WindowsPlatform"
 $aliveFn = Find-Function $helperAst "Test-ProcessAlive"
-$unixDescendantsFn = Find-Function $helperAst "Get-UnixDescendantProcessIds"
+$windowsPairsFn = Find-Function $helperAst "Get-WindowsProcessPairs"
+$unixPairsFn = Find-Function $helperAst "Get-UnixProcessPairs"
+$descendantsFn = Find-Function $helperAst "Get-ProcessDescendantIds"
+$waitIdsFn = Find-Function $helperAst "Wait-ProcessIdsExit"
 $stopTreeFn = Find-Function $helperAst "Stop-ProcessTree"
 
 Assert-True ($null -ne $enterFn) "Enter-SetupLock exists"
@@ -74,7 +77,10 @@ Assert-True ($null -ne $exitFn) "Exit-SetupLock exists"
 Assert-True ($null -ne $installFn) "Install-HermesIfNeeded exists"
 Assert-True ($null -ne $platformFn) "Test-WindowsPlatform exists"
 Assert-True ($null -ne $aliveFn) "Test-ProcessAlive exists"
-Assert-True ($null -ne $unixDescendantsFn) "Get-UnixDescendantProcessIds exists"
+Assert-True ($null -ne $windowsPairsFn) "Windows process discovery adapter exists"
+Assert-True ($null -ne $unixPairsFn) "Unix process discovery adapter exists"
+Assert-True ($null -ne $descendantsFn) "provider-neutral descendant resolver exists"
+Assert-True ($null -ne $waitIdsFn) "tracked-PID exit verifier exists"
 Assert-True ($null -ne $stopTreeFn) "Stop-ProcessTree exists"
 
 $installText = $installFn.Extent.Text
@@ -103,9 +109,12 @@ Assert-True (
     $stopTreeText -match '/F'
 ) "Windows adapter uses taskkill /T /F for PowerShell 5.1-compatible tree termination"
 Assert-True (
-    $stopTreeText -match 'Get-UnixDescendantProcessIds' -and
+    $stopTreeText -match 'Get-ProcessDescendantIds' -and
     $stopTreeText -match 'Stop-Process'
 ) "PowerShell Core Unix adapter terminates discovered descendants before the root"
+Assert-True (
+    $stopTreeText -match 'Wait-ProcessIdsExit'
+) "tree termination verifies the captured process set before returning"
 
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-lock-review-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $temp -Force | Out-Null
