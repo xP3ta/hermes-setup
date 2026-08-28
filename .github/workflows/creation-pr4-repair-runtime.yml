@@ -23,6 +23,7 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
+          import textwrap
 
           setup = Path("hermes-mobile-setup.ps1")
           source = setup.read_text(encoding="utf-8")
@@ -137,11 +138,13 @@ jobs:
               Assert-True (Test-ExclusiveAcquire $lockPath) "stale lock file does not deadlock the next run"
 
               $holderScript = Join-Path $temp "holder.ps1"
+              $readyPath = Join-Path $temp "holder.ready"
               @'
-          param([string]$LockPath)
+          param([string]$LockPath, [string]$ReadyPath)
           $ErrorActionPreference = "Stop"
           $stream = [IO.File]::Open($LockPath, 'OpenOrCreate', 'ReadWrite', 'None')
           try {
+              Set-Content -LiteralPath $ReadyPath -Value "ready" -Encoding ASCII
               Start-Sleep -Milliseconds 2600
           } finally {
               $stream.Dispose()
@@ -152,10 +155,18 @@ jobs:
               $holder = Start-Process -FilePath $hostExe -ArgumentList @(
                   "-NoProfile",
                   "-File", $holderScript,
-                  "-LockPath", $lockPath
+                  "-LockPath", $lockPath,
+                  "-ReadyPath", $readyPath
               ) -PassThru
 
-              Start-Sleep -Milliseconds 350
+              $readyWatch = [Diagnostics.Stopwatch]::StartNew()
+              while (-not (Test-Path -LiteralPath $readyPath) -and $readyWatch.Elapsed.TotalSeconds -lt 10) {
+                  if ($holder.HasExited) {
+                      throw "holder exited before acquiring the lock (exit $($holder.ExitCode))"
+                  }
+                  Start-Sleep -Milliseconds 50
+              }
+              Assert-True (Test-Path -LiteralPath $readyPath) "simulated first run signaled lock ownership"
               Assert-True (-not (Test-ExclusiveAcquire $lockPath)) "first run owns lock before timeout"
 
               Start-Sleep -Milliseconds 1100
@@ -173,9 +184,6 @@ jobs:
               Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
           }
           '''
-          # The Python heredoc is indented by the workflow block; normalize the
-          # intentionally indented PowerShell fixture back to column zero.
-          import textwrap
           Path("test-lock.ps1").write_text(textwrap.dedent(test), encoding="utf-8", newline="\n")
 
           notes = '''# Patch: safe-setup-idempotency
@@ -188,7 +196,7 @@ jobs:
           2. **Soft installer timeout** — `-InstallerTimeoutSec` defaults to 900s. Without `-ForceClose`, crossing the threshold only emits a warning; setup remains alive and continues waiting for the installer, so `.setup-lock` stays held until the process exits.
           3. **Explicit force-close** — `-ForceClose` kills the timed-out installer and confirms process exit before setup can unwind and release the lock.
           4. **Single-flight lock** — the exclusive `.setup-lock` FileStream remains open for the complete setup lifetime.
-          5. **Regression test** — `test-lock.ps1` parses the setup source, proves the exclusive handle lifecycle, verifies stale-file recovery, and exercises timeout followed immediately by a second acquisition attempt; the second run must remain blocked until the simulated installer exits.
+          5. **Regression test** — `test-lock.ps1` parses the setup source, proves the exclusive handle lifecycle, verifies stale-file recovery, and exercises timeout followed immediately by a second acquisition attempt; the second run must remain blocked until the simulated installer exits. The child signals only after its exclusive handle is open, so the proof has no startup timing race.
 
           ## Evidence discipline
           The previous revision overstated its evidence by referring to `test-lock.ps1` when that file was not present and by treating a lock-handle test as proof of the installer-timeout lifecycle. This revision corrects both errors. The stale generated `.diff` has been removed rather than retained as conflicting evidence.
