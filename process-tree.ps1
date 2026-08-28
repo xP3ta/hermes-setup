@@ -2,8 +2,6 @@
 # This file intentionally contains no Hermes/Creation policy. It implements one contract:
 # discover descendants, terminate the tree through the host adapter, and verify the tracked set.
 
-Set-StrictMode -Version Latest
-
 function Test-WindowsPlatform {
     $isWindowsVariable = Get-Variable -Name IsWindows -ErrorAction SilentlyContinue
     if ($null -ne $isWindowsVariable) {
