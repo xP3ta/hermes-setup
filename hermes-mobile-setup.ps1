@@ -3,12 +3,32 @@
 
 param(
     [switch]$AuditOnly,
-    [switch]$NoFirewallPrompt
+    [switch]$NoFirewallPrompt,
+    # --- Idempotent-update options (patch: safe-setup-idempotency) ---
+    # Timeout for the hidden Hermes Agent installer. The official installer
+    # downloads PortableGit, recreates the venv and installs all dependencies;
+    # on cold machines this routinely takes 5-10 minutes. 180s guaranteed a
+    # mid-install kill on every slow run.
+    [int]$InstallerTimeoutSec = 900,
+    # Opt-in ONLY. When set, a timed-out installer is killed immediately (old
+    # behavior). Without it, the timeout is a soft warning threshold: setup
+    # keeps waiting while holding the single-flight lock until the installer
+    # actually exits, so a second setup cannot overlap the same venv mutation.
+    [switch]$ForceClose,
+    # Run the Hermes Agent installer attached to this console with live output
+    # instead of hidden. Recommended on first install and major updates.
+    [switch]$Interactive
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$ProcessTreeHelper = Join-Path $PSScriptRoot "process-tree.ps1"
+if (-not (Test-Path -LiteralPath $ProcessTreeHelper)) {
+    throw "Required process-tree helper is missing: $ProcessTreeHelper"
+}
+. $ProcessTreeHelper
 
 $RepoRaw = if ($env:HERMES_REPO_RAW) {
     $env:HERMES_REPO_RAW.TrimEnd('/')
@@ -36,9 +56,71 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:TaskDefinitionsChanged = @{}
 $script:RunnerChanged = @{}
 $script:BridgeChanged = $false
-$script:HermesInstallTimeoutSeconds = 900
 
 New-Item -ItemType Directory -Force -Path $HermesHome, $ServicesDir, $LogsDir, $AuditDir | Out-Null
+
+# --- Patch: safe-setup-idempotency -------------------------------------------
+# Single-flight lock. Two overlapping setup runs (e.g. a retry while the first
+# run's installer is still rebuilding the venv) corrupt each other: one run
+# sees a half-built venv, misclassifies a healthy install as broken, and
+# triggers a destructive reinstall. The lock makes re-runs wait instead.
+$script:SetupLock = Join-Path $HermesHome ".setup-lock"
+# Review fix (xPeta): the exclusive handle must stay OPEN for the whole setup
+# run - closing it right after Open only proved exclusivity for an instant.
+# The FileStream is kept in $script: scope and disposed by Exit-SetupLock.
+# Note: a crash leaves the FILE behind but releases the OS handle, so the next
+# run's Open succeeds; file presence alone is never treated as "locked".
+$script:SetupLockStream = $null
+function Enter-SetupLock {
+    for ($i = 0; $i -lt 60; $i++) {
+        try {
+            $script:SetupLockStream = [IO.File]::Open(
+                $script:SetupLock, 'OpenOrCreate', 'ReadWrite', 'None')
+            return
+        } catch {
+            if ($i -eq 0) {
+                Write-Audit "Setup lock" "INFO" "Another Hermes Console setup appears to be running; waiting up to 5 minutes..."
+            }
+            Start-Sleep -Seconds 5
+        }
+    }
+    throw "Another Hermes Console setup is still running (lock held): $script:SetupLock"
+}
+function Exit-SetupLock {
+    if ($script:SetupLockStream) {
+        try { $script:SetupLockStream.Dispose() } catch {}
+        $script:SetupLockStream = $null
+    }
+    Remove-Item -LiteralPath $script:SetupLock -Force -ErrorAction SilentlyContinue
+}
+
+# Idempotency guard for the Hermes Agent health probe. A single transient
+# failure of `hermes --version` (venv being rebuilt by another process,
+# antivirus scan, first-run JIT) must NOT downgrade a healthy install into
+# "broken" and trigger a full reinstall. Retry, then fall back to checking
+# that python.exe in the venv can import hermes_cli.
+function Test-HermesHealthy([string]$HermesExe) {
+    if (-not $HermesExe -or -not (Test-Path -LiteralPath $HermesExe)) { return $false }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            & $HermesExe --version *> $null
+            if ($LASTEXITCODE -eq 0) { return $true }
+        } catch {}
+        Start-Sleep -Seconds (2 * $attempt)
+    }
+    # Fallback: the CLI entry point may be slow/flaky while the venv is warm;
+    # if its Python interpreter exists and imports cleanly, treat as healthy.
+    $python = Get-HermesPython
+    if ($python) {
+        & $python -c "import hermes_cli" *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Warn "Hermes Agent '--version' probe failed but the venv imports hermes_cli; treating installation as healthy (idempotent guard)."
+            return $true
+        }
+    }
+    return $false
+}
+# ------------------------------------------------------------------------------
 
 function Protect-AuditText([string]$Text) {
     if (-not $Text) { return "" }
@@ -159,7 +241,7 @@ function Wait-HermesService(
         }
         $elapsed = [int]$watch.Elapsed.TotalSeconds
         if ($elapsed -ne $lastReported -and $elapsed % 2 -eq 0) {
-            Write-Audit "$Kind readiness" "INFO" "Waiting (${elapsed}s/${Seconds}s)"
+            Write-Audit "$kind readiness" "INFO" "Waiting (${elapsed}s/${Seconds}s)"
             $lastReported = $elapsed
         }
         Start-Sleep -Milliseconds 500
@@ -605,7 +687,11 @@ function Invoke-HiddenProcess(
         -WorkingDirectory $HermesHome -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        try { $process.Kill() } catch {}
+        try {
+            Stop-ProcessTree -Process $process -WaitSeconds 10
+        } catch {
+            throw "Hidden process timed out after ${TimeoutSeconds}s and process-tree termination failed: $($_.Exception.Message)"
+        }
         throw "Hidden process timed out after ${TimeoutSeconds}s: $File"
     }
     $process.WaitForExit()
@@ -759,27 +845,71 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
 function Install-HermesIfNeeded {
     $hermes = Get-HermesExecutable
     if ($hermes) {
-        try {
-            $version = (& $hermes --version 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0) {
+        # Patch: safe-setup-idempotency — retry + fallback instead of a single
+        # flaky probe deciding to reinstall a healthy installation.
+        if (Test-HermesHealthy $hermes) {
+            try {
+                $version = (& $hermes --version 2>$null | Select-Object -First 1)
                 Write-Audit "Hermes Agent" "SKIP" "Installed: $version"
-                return $hermes
+            } catch {
+                Write-Audit "Hermes Agent" "SKIP" "Installed (probe degraded, venv verified healthy)"
             }
-        } catch {}
+            return $hermes
+        }
     }
     if ($AuditOnly) { throw "Hermes Agent is not installed or is broken." }
     Write-Info "Installing Hermes Agent for native Windows..."
-    Write-Info "The official installer can take several minutes on a clean Windows host; setup will wait safely."
     $installer = Join-Path ([IO.Path]::GetTempPath()) "hermes-agent-install.ps1"
     Invoke-WebRequest -Uri "https://hermes-agent.nousresearch.com/install.ps1" `
         -OutFile $installer -UseBasicParsing
     try {
         $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installer`" " +
             "-SkipSetup -NonInteractive -HermesHome `"$HermesHome`" -InstallDir `"$InstallDir`""
-        Invoke-HiddenProcess (Get-PowerShellExecutable) $arguments `
-            $script:HermesInstallTimeoutSeconds `
-            (Join-Path $AuditDir "hermes-install.out.log") `
-            (Join-Path $AuditDir "hermes-install.err.log")
+        # Patch: safe-setup-idempotency. The official installer downloads
+        # PortableGit, recreates the venv and installs every dependency; 180s
+        # was not enough and hard-killing it mid-run left a broken venv behind
+        # (the exact failure this repair mode exists to fix). Default timeout
+        # is now 900s (-InstallerTimeoutSec). On timeout WITHOUT -ForceClose,
+        # the threshold is informational: setup keeps waiting for the same
+        # installer while retaining .setup-lock. The lock is therefore never
+        # released while that installer can still be mutating the venv.
+        if ($Interactive) {
+            Write-Info "Running Hermes installer attached to this console (live output)..."
+            & (Get-PowerShellExecutable) -NoProfile -ExecutionPolicy Bypass -File $installer `
+                -SkipSetup -NonInteractive -HermesHome $HermesHome -InstallDir $InstallDir
+            if ($LASTEXITCODE -ne 0) {
+                throw "Hermes installer exited with $LASTEXITCODE."
+            }
+        } else {
+            $outLog = Join-Path $AuditDir "hermes-install.out.log"
+            $errLog = Join-Path $AuditDir "hermes-install.err.log"
+            $process = Start-Process -FilePath (Get-PowerShellExecutable) -ArgumentList $arguments `
+                -WorkingDirectory $HermesHome -WindowStyle Hidden -PassThru `
+                -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+            if (-not $process.WaitForExit($InstallerTimeoutSec * 1000)) {
+                if ($ForceClose) {
+                    try {
+                        Stop-ProcessTree -Process $process -WaitSeconds 10
+                        $process.WaitForExit()
+                    } catch {
+                        Write-Warn "Force-close did not confirm full installer-tree exit; continuing to wait while the setup lock remains held."
+                        $process.WaitForExit()
+                    }
+                    throw "Hidden installer timed out after ${InstallerTimeoutSec}s and its process tree was force-closed (-ForceClose): $(Get-PowerShellExecutable)"
+                }
+                Write-Warn "Hermes installer exceeded ${InstallerTimeoutSec}s; continuing to wait while the setup lock remains held. Logs: $outLog"
+            }
+            $process.WaitForExit()
+            $process.Refresh()
+            if ($process.ExitCode -ne 0) {
+                $tail = ""
+                if (Test-Path -LiteralPath $errLog) {
+                    $tail = ([IO.File]::ReadAllText($errLog) -replace '[\r\n]+', ' ').Trim()
+                    if ($tail.Length -gt 500) { $tail = $tail.Substring($tail.Length - 500) }
+                }
+                throw "Hidden installer exited with $($process.ExitCode): $tail"
+            }
+        }
     } finally {
         Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
     }
@@ -884,7 +1014,11 @@ qrcode.make(link).save(sys.argv[1])
         $process.StandardInput.Write($Link)
         $process.StandardInput.Close()
         if (-not $process.WaitForExit(30000)) {
-            try { $process.Kill() } catch {}
+            try {
+                Stop-ProcessTree -Process $process -WaitSeconds 10
+            } catch {
+                throw "Pairing QR generation timed out and process-tree termination failed: $($_.Exception.Message)"
+            }
             throw "Pairing QR generation timed out."
         }
         $stderr = $process.StandardError.ReadToEnd()
@@ -918,11 +1052,8 @@ function Invoke-SetupInventory {
     $hermes = Get-HermesExecutable
     if (-not $hermes) {
         [void]$missing.Add("Hermes Agent executable")
-    } else {
-        try {
-            & $hermes --version *> $null
-            if ($LASTEXITCODE -ne 0) { [void]$missing.Add("Healthy Hermes Agent executable") }
-        } catch { [void]$missing.Add("Healthy Hermes Agent executable") }
+    } elseif (-not (Test-HermesHealthy $hermes)) {
+        [void]$missing.Add("Healthy Hermes Agent executable")
     }
 
     $python = Get-HermesPython
@@ -1116,6 +1247,7 @@ if ($AuditOnly) {
 }
 
 try {
+    Enter-SetupLock
     Write-Audit "Setup" "INFO" "Repair/install mode"
     Write-SetupPhase "Inspecting the existing installation"
     Remove-LegacyTasks
@@ -1380,4 +1512,5 @@ WScript.Quit rc
     throw $safeError
 } finally {
     Remove-Item -LiteralPath $BridgeNew, $ManifestFile, "$PairingFile.new" -Force -ErrorAction SilentlyContinue
+    Exit-SetupLock
 }
