@@ -24,6 +24,12 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+$ProcessTreeHelper = Join-Path $PSScriptRoot "process-tree.ps1"
+if (-not (Test-Path -LiteralPath $ProcessTreeHelper)) {
+    throw "Required process-tree helper is missing: $ProcessTreeHelper"
+}
+. $ProcessTreeHelper
+
 $RepoRaw = if ($env:HERMES_REPO_RAW) {
     $env:HERMES_REPO_RAW.TrimEnd('/')
 } else {
@@ -235,7 +241,7 @@ function Wait-HermesService(
         }
         $elapsed = [int]$watch.Elapsed.TotalSeconds
         if ($elapsed -ne $lastReported -and $elapsed % 2 -eq 0) {
-            Write-Audit "$Kind readiness" "INFO" "Waiting (${elapsed}s/${Seconds}s)"
+            Write-Audit "$kind readiness" "INFO" "Waiting (${elapsed}s/${Seconds}s)"
             $lastReported = $elapsed
         }
         Start-Sleep -Milliseconds 500
@@ -681,7 +687,11 @@ function Invoke-HiddenProcess(
         -WorkingDirectory $HermesHome -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        try { $process.Kill() } catch {}
+        try {
+            Stop-ProcessTree -Process $process -WaitSeconds 10
+        } catch {
+            throw "Hidden process timed out after ${TimeoutSeconds}s and process-tree termination failed: $($_.Exception.Message)"
+        }
         throw "Hidden process timed out after ${TimeoutSeconds}s: $File"
     }
     $process.WaitForExit()
@@ -879,13 +889,13 @@ function Install-HermesIfNeeded {
             if (-not $process.WaitForExit($InstallerTimeoutSec * 1000)) {
                 if ($ForceClose) {
                     try {
-                        $process.Kill()
+                        Stop-ProcessTree -Process $process -WaitSeconds 10
                         $process.WaitForExit()
                     } catch {
-                        Write-Warn "Force-close did not confirm installer exit; continuing to wait while the setup lock remains held."
+                        Write-Warn "Force-close did not confirm full installer-tree exit; continuing to wait while the setup lock remains held."
                         $process.WaitForExit()
                     }
-                    throw "Hidden installer timed out after ${InstallerTimeoutSec}s and was force-closed (-ForceClose): $(Get-PowerShellExecutable)"
+                    throw "Hidden installer timed out after ${InstallerTimeoutSec}s and its process tree was force-closed (-ForceClose): $(Get-PowerShellExecutable)"
                 }
                 Write-Warn "Hermes installer exceeded ${InstallerTimeoutSec}s; continuing to wait while the setup lock remains held. Logs: $outLog"
             }
@@ -1004,7 +1014,11 @@ qrcode.make(link).save(sys.argv[1])
         $process.StandardInput.Write($Link)
         $process.StandardInput.Close()
         if (-not $process.WaitForExit(30000)) {
-            try { $process.Kill() } catch {}
+            try {
+                Stop-ProcessTree -Process $process -WaitSeconds 10
+            } catch {
+                throw "Pairing QR generation timed out and process-tree termination failed: $($_.Exception.Message)"
+            }
             throw "Pairing QR generation timed out."
         }
         $stderr = $process.StandardError.ReadToEnd()
