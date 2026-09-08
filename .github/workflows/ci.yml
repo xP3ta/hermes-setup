@@ -47,6 +47,7 @@ jobs:
           python3 tests/ci_workflow_test.py
           python3 tests/ci-parse-closure_test.py
           python3 tests/bootstrap-isolation_test.py
+          python3 tests/checkout-integrity_test.py
           python3 tests/sync-work-preservation_test.py
           python3 tests/bridge-release_test.py
 
