@@ -1,0 +1,2 @@
+# The manifest digest covers these exact bytes, including line endings.
+hermes_bridge.py text eol=lf
