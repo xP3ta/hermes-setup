@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    name: Unix syntax, lint, release and bootstrap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate POSIX and Bash syntax
+        shell: bash
+        run: |
+          for script in hermes-mobile-setup.sh hermes-pair.sh tests/hermes-mobile-setup_test.sh; do
+            sh -n "$script"
+          done
+          for script in sync-from-app.sh tests/sync-from-app_test.sh tests/bootstrap-unix_test.sh; do
+            bash -n "$script"
+          done
+
+      - name: Run ShellCheck
+        shell: bash
+        run: |
+          # These exclusions cover pre-existing parser false positives/intentional
+          # portability idioms in app-synchronized runtime artifacts.
+          shellcheck --severity=warning \
+            --exclude=SC1007,SC1087,SC2015,SC2221,SC2222 \
+            hermes-mobile-setup.sh hermes-pair.sh sync-from-app.sh
+          # The POSIX harness sources functions generated at runtime.
+          shellcheck --severity=warning --exclude=SC1007,SC2034 \
+            tests/hermes-mobile-setup_test.sh tests/sync-from-app_test.sh tests/bootstrap-unix_test.sh
+
+      - name: Verify CI contract and Bridge release
+        shell: bash
+        run: |
+          python3 tests/ci_workflow_test.py
+          python3 tests/ci-parse-closure_test.py
+          python3 tests/bootstrap-isolation_test.py
+          python3 tests/sync-work-preservation_test.py
+          python3 tests/bridge-release_test.py
+
+      - name: Run Unix tests
+        shell: bash
+        run: |
+          sh tests/hermes-mobile-setup_test.sh
+          bash tests/sync-from-app_test.sh
+          bash tests/bootstrap-unix_test.sh
+
+  windows:
+    name: Windows PowerShell 5.1 and 7
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Parse and test with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/powershell_test.ps1
+
+      - name: Parse and test with PowerShell 7
+        shell: pwsh
+        run: ./tests/powershell_test.ps1

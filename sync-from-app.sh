@@ -117,6 +117,32 @@ if $DRY_RUN; then
   exit 0
 fi
 
+# Canonical files are generated, but local work still belongs to the caller.
+# Check both index and worktree (including an untracked manifest) before copying
+# any destination. Dry-run above remains available for inspecting a dirty tree.
+LOCAL_CHANGES="$(git -C "$REPO_DIR" status --porcelain=v1 --untracked-files=all -- "${CANONICAL_FILES[@]}")"
+if [[ -n "$LOCAL_CHANGES" ]]; then
+  echo "ERROR: hay cambios locales en archivos canónicos; guarda o confirma ese trabajo antes de sincronizar." >&2
+  exit 1
+fi
+# Status hides ignored files and assume-unchanged/skip-worktree edits. Compare
+# each physical destination to HEAD too; hash-object applies Git's checkout
+# filters so a normal CRLF checkout is not mistaken for an edit.
+for dest in "${CANONICAL_FILES[@]}"; do
+  head_object="$(git -C "$REPO_DIR" rev-parse --verify "HEAD:$dest" 2>/dev/null || true)"
+  destination="$REPO_DIR/$dest"
+  if [[ -n "$head_object" ]]; then
+    if [[ ! -f "$destination" || -L "$destination" ]] || \
+       [[ "$(git -C "$REPO_DIR" hash-object --path="$dest" -- "$destination")" != "$head_object" ]]; then
+      echo "ERROR: contenido local canónico distinto de HEAD: $dest; guarda ese trabajo antes de sincronizar." >&2
+      exit 1
+    fi
+  elif [[ -e "$destination" || -L "$destination" ]]; then
+    echo "ERROR: archivo local canónico no versionado: $dest; guarda ese trabajo antes de sincronizar." >&2
+    exit 1
+  fi
+done
+
 for dest in "${SOURCE_FILES[@]}"; do
   src="$(source_path "$dest")"
   if ! cmp -s -- "$src" "$REPO_DIR/$dest"; then

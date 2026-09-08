@@ -19,6 +19,28 @@ assert_eq() {
     fail "$label (expected '$expected', got '$actual')"
 }
 
+assert_exact_path_set() {
+  local actual="$1"
+  local label="$2"
+  shift 2
+  local path
+  declare -A expected=()
+  declare -A seen=()
+
+  for path in "$@"; do
+    expected["$path"]=1
+  done
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    [[ -n "${expected[$path]:-}" ]] || fail "$label (unexpected path '$path')"
+    [[ -z "${seen[$path]:-}" ]] || fail "$label (duplicate path '$path')"
+    seen["$path"]=1
+  done <<< "$actual"
+  for path in "$@"; do
+    [[ -n "${seen[$path]:-}" ]] || fail "$label (missing path '$path')"
+  done
+}
+
 make_app() {
   local app="$1"
   local version="$2"
@@ -106,9 +128,14 @@ test_local_commit_and_explicit_publish() {
   assert_eq "$remote_before" "$(git --git-dir="$remote" rev-parse main)" \
     'default mode pushed unexpectedly'
 
-  commit_files="$(git -C "$repo" show --pretty=format: --name-only HEAD | sed '/^$/d' | sort)"
-  assert_eq $'bridge-release.json\nhermes-mobile-setup.ps1\nhermes-mobile-setup.sh\nhermes-pair.ps1\nhermes-pair.sh\nhermes_bridge.py' \
-    "$commit_files" 'canonical commit paths'
+  commit_files="$(git -C "$repo" show --pretty=format: --name-only HEAD | sed '/^$/d')"
+  assert_exact_path_set "$commit_files" 'canonical commit paths' \
+    bridge-release.json \
+    hermes-mobile-setup.ps1 \
+    hermes-mobile-setup.sh \
+    hermes-pair.ps1 \
+    hermes-pair.sh \
+    hermes_bridge.py
   staged_files="$(git -C "$repo" diff --cached --name-only)"
   assert_eq 'notes.txt' "$staged_files" 'unrelated staged change preservation'
   [[ -e "$repo/scratch.txt" ]] || fail 'untracked file was removed'
