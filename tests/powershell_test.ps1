@@ -49,13 +49,11 @@ function Invoke-SafeBootstrapSmoke([ValidateSet("file", "memory")][string]$Mode)
     $fixtureHome = Join-Path $tempHome "home"
     $env:HERMES_HOME = $fixtureHome
     if (-not $env:SystemRoot) { $env:SystemRoot = $tempHome }
-    # GitHub-hosted Windows runners are Windows Server, which the product
-    # deliberately rejects ("supports only Windows 10 and Windows 11"). Both
-    # the platform refusal and the clean-host audit guard are valid
-    # non-destructive outcomes here; anything else must fail, and no run may
-    # create the target home.
+    # Both the platform refusal (legacy/32-bit/unknown hosts) and the clean-host
+    # audit guard are valid non-destructive outcomes here; anything else must
+    # fail, and no run may create the target home.
     $boundedOutcomes = 'Audit found [0-9]+ item\(s\) to repair|' +
-        'supports only Windows 10 and Windows 11|' +
+        'supports Windows 10, Windows 11 and Windows Server|' +
         'could not verify the Windows version|' +
         'does not belong to the selected Hermes home|' +
         'owned by another identity'

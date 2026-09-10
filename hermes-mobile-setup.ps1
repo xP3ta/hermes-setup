@@ -93,7 +93,7 @@ function Test-WindowsPlatform {
 }
 
 function Assert-SupportedWindows {
-    $support = "Hermes Console Setup supports only Windows 10 and Windows 11 (x64 or ARM64)."
+    $support = "Hermes Console Setup supports Windows 10, Windows 11 and Windows Server (x64 or ARM64)."
     if (-not (Test-WindowsPlatform)) {
         throw "$support Detected: non-Windows operating system. This system is not supported. No changes were made."
     }
@@ -109,7 +109,7 @@ function Assert-SupportedWindows {
         $build = [string]$os.BuildNumber
         if ([string]::IsNullOrWhiteSpace($build)) { throw "Operating system build was empty." }
     } catch {
-        throw "Hermes Console Setup could not verify the Windows version. It supports only Windows 10 and Windows 11 (x64 or ARM64). No changes were made."
+        throw "Hermes Console Setup could not verify the Windows version. It supports Windows 10, Windows 11 and Windows Server (x64 or ARM64). No changes were made."
     }
 
     $nativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) {
@@ -128,7 +128,11 @@ function Assert-SupportedWindows {
     if ($caption.Length -gt 120) { $caption = $caption.Substring(0, 120) }
     $detected = "$caption, version $version, build $build, $architecture"
 
-    $supportedEdition = $productType -eq 1
+    # Windows Server (productType 2 = domain controller, 3 = server) is a
+    # supported target: the per-user Scheduled Tasks, restricted firewall rules
+    # and CIM preflight behave the same as on client Windows. Release evidence
+    # is still recorded separately per edition.
+    $supportedEdition = $productType -in @(1, 2, 3)
     $supportedVersion = $version.Major -eq 10
     $supportedArchitecture = $architecture -in @("x64", "ARM64")
     if (-not ($supportedEdition -and $supportedVersion -and $supportedArchitecture)) {
