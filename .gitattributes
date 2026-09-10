@@ -1,2 +1,5 @@
 # The manifest digest covers these exact bytes, including line endings.
 hermes_bridge.py text eol=lf
+# PowerShell artifacts ship LF so the published bytes are deterministic and
+# every published hash matches a validated revision.
+*.ps1 text eol=lf
