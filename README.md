@@ -44,9 +44,58 @@ versions, Scheduled Task/listener/firewall state, log tails and the audit
 trail — no tokens, API keys or pairing credentials. Share that file when asking
 for help: it is the difference between guessing and fixing.
 
+**Removing everything setup created.** If you end up stuck, or you simply want a
+clean slate, the installer can reverse itself. It stops and deletes only its own
+Scheduled Tasks, its own firewall rules and the pairing artifacts (`-Purge`
+additionally removes the Hermes home, and refuses to do so for a path that is
+not a Hermes Console home):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\hermes-setup.ps1" -Uninstall
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\hermes-setup.ps1" -Uninstall -Purge
+```
+
+On Unix: `sh hermes-mobile-setup.sh --uninstall` is not a thing yet; services and
+firewall rules are removed with `systemctl --user disable --now hermes-gateway
+hermes-dashboard hermes-bridge` plus your firewall tool of choice.
+
+### Ports already in use
+
+Setup refuses to touch a host whose ports belong to another process: 8642
+(Gateway), 9119 (Dashboard) and 9131 (Mobile Bridge) are fixed defaults, but you
+can move them. The override is honoured by the service runners, the firewall
+rule, the readiness probes and the pairing link, so nothing keeps pointing at the
+old port. They must be three different valid ports; anything else fails before
+changing the machine.
+
+```powershell
+$env:HERMES_GATEWAY_PORT = "18642"
+$env:HERMES_DASHBOARD_PORT = "19119"
+$env:HERMES_BRIDGE_PORT = "19131"
+```
+
+```sh
+HERMES_GATEWAY_PORT=18642 HERMES_DASHBOARD_PORT=19119 HERMES_BRIDGE_PORT=19131 sh hermes-mobile-setup.sh
+```
+
+### First start on a slow machine
+
+The Dashboard is built on first start. On slow disks, with antivirus scanning
+`node_modules`, or a two-core laptop, that can outlive a fixed timeout: setup now
+extends the wait while the Dashboard task is still running (up to 30 minutes) and
+writes the extension to the audit log, instead of reporting a false failure. The
+build is only trusted once the service answers on its own port.
+
+### More than one network address
+
+A machine with a VPN, Hyper-V/WSL adapters or a second NIC has several candidate
+addresses. If the first one cannot be reached from the phone side, setup now
+probes the other candidates (at most three) and adopts the first that really
+answers, instead of failing with an address your phone cannot reach.
+
 For a reproducible install that cannot change under you, use the newest tag
 instead of `main` (e.g.
-`https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.0.0/hermes-mobile-setup.ps1`).
+`https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.3.0/hermes-mobile-setup.ps1`).
 
 WSL deliberately uses the Windows path so setup can configure networking,
 Windows Firewall and persistent startup correctly. The Unix installer uses

@@ -863,6 +863,26 @@ if [ -z "$HOST" ]; then
   fi
 fi
 
+# Puertos de servicio: defaults historicos, con overrides para un host que ya
+# tiene 8642/9119/9131 ocupados. Todo consumidor (unidades, runners, firewall,
+# probes, enlace de pairing) sale de aqui.
+GATEWAY_PORT="${HERMES_GATEWAY_PORT:-8642}"
+DASHBOARD_PORT="${HERMES_DASHBOARD_PORT:-9119}"
+BRIDGE_PORT="${HERMES_BRIDGE_PORT:-9131}"
+for _hermes_port in "$GATEWAY_PORT" "$DASHBOARD_PORT" "$BRIDGE_PORT"; do
+  case "$_hermes_port" in
+    *[!0-9]*|'') echo "ERROR: HERMES_GATEWAY_PORT, HERMES_DASHBOARD_PORT and HERMES_BRIDGE_PORT must be TCP ports. No changes were made."; exit 1 ;;
+  esac
+  if [ "$_hermes_port" -lt 1 ] || [ "$_hermes_port" -gt 65535 ]; then
+    echo "ERROR: a Hermes service port is out of range. No changes were made."
+    exit 1
+  fi
+done
+if [ "$GATEWAY_PORT" = "$DASHBOARD_PORT" ] || [ "$GATEWAY_PORT" = "$BRIDGE_PORT" ] || [ "$DASHBOARD_PORT" = "$BRIDGE_PORT" ]; then
+  echo "ERROR: HERMES_GATEWAY_PORT, HERMES_DASHBOARD_PORT and HERMES_BRIDGE_PORT must be three different ports. No changes were made."
+  exit 1
+fi
+
 PAIR_SCHEME="${HERMES_PAIR_SCHEME:-http}"
 case "$PAIR_SCHEME" in
   http|https) ;;
@@ -870,7 +890,7 @@ case "$PAIR_SCHEME" in
 esac
 PAIR_PORT="${HERMES_PAIR_PORT:-}"
 if [ -z "$PAIR_PORT" ]; then
-  if [ "$PAIR_SCHEME" = "https" ]; then PAIR_PORT=443; else PAIR_PORT=8642; fi
+  if [ "$PAIR_SCHEME" = "https" ]; then PAIR_PORT=443; else PAIR_PORT="$GATEWAY_PORT"; fi
 fi
 case "$PAIR_PORT" in
   *[!0-9]*|'') echo "ERROR: HERMES_PAIR_PORT must be a TCP port."; exit 1 ;;
@@ -953,8 +973,8 @@ BASE_HOST="$HOST"
 case "$BASE_HOST" in *:*) BASE_HOST="[$BASE_HOST]" ;; esac
 GATEWAY_BASE="$PAIR_SCHEME://$BASE_HOST:$PAIR_PORT"
 if [ "$PAIR_SCHEME" = "http" ]; then
-  DASHBOARD_BASE="${HERMES_DASHBOARD_URL:-http://$BASE_HOST:9119}"
-  BRIDGE_BASE="${HERMES_BRIDGE_URL:-http://$BASE_HOST:9131}"
+  DASHBOARD_BASE="${HERMES_DASHBOARD_URL:-http://$BASE_HOST:$DASHBOARD_PORT}"
+  BRIDGE_BASE="${HERMES_BRIDGE_URL:-http://$BASE_HOST:$BRIDGE_PORT}"
   BIND_HOST="${HERMES_SERVICE_BIND_HOST:-0.0.0.0}"
 else
   DASHBOARD_BASE="${HERMES_DASHBOARD_URL:-$GATEWAY_BASE}"
@@ -1269,14 +1289,14 @@ else
 fi
 mv "$NEW" "$TARGET"
 
-printf 'BRIDGE_HOST=%s\nBRIDGE_PORT=9131\nBRIDGE_SCOPES=read,memory,soul,skills,cron,config,command\nBRIDGE_READ_ONLY=false\nBRIDGE_TOKEN=%s\n' "$BIND_HOST" "$KEY" > "$ENV_FILE"
+printf 'BRIDGE_HOST=%s\nBRIDGE_PORT=%s\nBRIDGE_SCOPES=read,memory,soul,skills,cron,config,command\nBRIDGE_READ_ONLY=false\nBRIDGE_TOKEN=%s\n' "$BIND_HOST" "$BRIDGE_PORT" "$KEY" > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 cat > "$GATEWAY_RUNNER" <<EOF
 #!/bin/sh
 export HERMES_HOME="$HH"
 export API_SERVER_HOST="$BIND_HOST"
-export API_SERVER_PORT=8642
+export API_SERVER_PORT="$GATEWAY_PORT"
 cd "$HH"
 exec "$HB" gateway run --replace
 EOF
@@ -1284,7 +1304,7 @@ cat > "$DASHBOARD_RUNNER" <<EOF
 #!/bin/sh
 export HERMES_HOME="$HH"
 cd "$HH"
-exec "$HB" dashboard --host "$BIND_HOST" --port 9119 --no-open
+exec "$HB" dashboard --host "$BIND_HOST" --port "$DASHBOARD_PORT" --no-open
 EOF
 HELPER_EXPORT=""
 [ "$SERVICE_MANAGER" = "portable" ] && HELPER_EXPORT="export BRIDGE_SERVICE_HELPER=\"$HELPER\""
@@ -1511,7 +1531,7 @@ PY
   cat > "$SYSTEMD_STAGE/hermes-gateway.service.d/10-hermes-console-network.conf" <<EOF
 [Service]
 Environment="API_SERVER_HOST=$BIND_HOST"
-Environment="API_SERVER_PORT=8642"
+Environment="API_SERVER_PORT=$GATEWAY_PORT"
 EOF
   chmod 644 \
     "$SYSTEMD_STAGE/hermes-gateway.service" \
@@ -1691,13 +1711,13 @@ case "$SERVICE_MANAGER" in
     ;;
 esac
 
-if ! wait_probe gateway http://127.0.0.1:8642 40; then
-  service_failure Gateway 8642
+if ! wait_probe gateway "http://127.0.0.1:$GATEWAY_PORT" 40; then
+  service_failure Gateway "$GATEWAY_PORT"
 fi
 echo "Gateway identity + valid-token + auth-rejection checks OK ($SERVICE_MANAGER)"
 
-if ! wait_probe bridge http://127.0.0.1:9131 40 "$BRIDGE_VERSION"; then
-  service_failure Bridge 9131
+if ! wait_probe bridge "http://127.0.0.1:$BRIDGE_PORT" 40 "$BRIDGE_VERSION"; then
+  service_failure Bridge "$BRIDGE_PORT"
 fi
 echo "Mobile Bridge $BRIDGE_VERSION valid-token + auth-rejection + capability checks OK ($SERVICE_MANAGER)"
 
@@ -1711,7 +1731,7 @@ if ! stop_named_service dashboard >/dev/null 2>&1; then
 fi
 DASH_PASS="$("$VP" -c 'import secrets; print(secrets.token_urlsafe(24))')"
 DASHBOARD_CREDENTIAL_RESULT=""
-if ! DASHBOARD_CREDENTIAL_RESULT="$("$VP" - "http://127.0.0.1:9131" "$KEY" "$DASH_PASS" <<'PY'
+if ! DASHBOARD_CREDENTIAL_RESULT="$("$VP" - "http://127.0.0.1:$BRIDGE_PORT" "$KEY" "$DASH_PASS" <<'PY'
 import json, sys, urllib.request
 
 base, token, password = sys.argv[1:]
@@ -1773,10 +1793,10 @@ if ! start_named_service dashboard >/dev/null 2>&1; then
   echo "ERROR: Dashboard ownership could not be proven before starting it."
   exit 1
 fi
-if ! wait_probe dashboard http://127.0.0.1:9119 60; then
-  service_failure Dashboard 9119
+if ! wait_probe dashboard "http://127.0.0.1:$DASHBOARD_PORT" 60; then
+  service_failure Dashboard "$DASHBOARD_PORT"
 fi
-if ! "$VP" - "http://127.0.0.1:9119" "$DASHBOARD_LOGIN_CREATED" "$DASHBOARD_LOGIN_USER" "$DASH_PASS" <<'PY_DASH_AUTH'
+if ! "$VP" - "http://127.0.0.1:$DASHBOARD_PORT" "$DASHBOARD_LOGIN_CREATED" "$DASHBOARD_LOGIN_USER" "$DASH_PASS" <<'PY_DASH_AUTH'
 import json, sys, urllib.error, urllib.request
 
 base, created, username, password = sys.argv[1:]
@@ -1893,7 +1913,7 @@ ensure_private_firewall() {
     fi
     if [ -n "$UFW_ACTIVE" ]; then
       UFW_STATUS="$(run_privileged ufw status 2>/dev/null || true)"
-      for port in 8642 9119 9131; do
+      for port in "$GATEWAY_PORT" "$DASHBOARD_PORT" "$BRIDGE_PORT"; do
         if printf '%s\n' "$UFW_STATUS" | grep -E "^${port}/tcp[[:space:]]" | \
             grep -F "$FIREWALL_SOURCE" >/dev/null 2>&1; then
           continue
@@ -1901,9 +1921,9 @@ ensure_private_firewall() {
         if ! run_privileged ufw allow from "$FIREWALL_SOURCE" to any port "$port" proto tcp comment 'Hermes Console' >/dev/null; then
           echo "ERROR: UFW is active and a private rule could not be installed."
           echo "Run these commands, then rerun setup:"
-          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port 8642 proto tcp"
-          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port 9119 proto tcp"
-          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port 9131 proto tcp"
+          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port $GATEWAY_PORT proto tcp"
+          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port $DASHBOARD_PORT proto tcp"
+          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port $BRIDGE_PORT proto tcp"
           return 1
         fi
         printf '%s\n' "$port" >> "$TRANSACTION_DIR/ufw.added"
@@ -1912,14 +1932,14 @@ ensure_private_firewall() {
     fi
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    for port in 8642 9119 9131; do
+    for port in "$GATEWAY_PORT" "$DASHBOARD_PORT" "$BRIDGE_PORT"; do
       rule="rule family=ipv4 source address=$FIREWALL_SOURCE port port=$port protocol=tcp accept"
       if run_privileged firewall-cmd --permanent --query-rich-rule="$rule" >/dev/null 2>&1; then
         continue
       fi
       if ! run_privileged firewall-cmd --permanent --add-rich-rule="$rule" >/dev/null; then
         echo "ERROR: firewalld is active and a private rule could not be installed."
-        echo "Add private TCP rules for 8642, 9119 and 9131 from $FIREWALL_SOURCE, then rerun setup."
+        echo "Add private TCP rules for $GATEWAY_PORT, $DASHBOARD_PORT and $BRIDGE_PORT from $FIREWALL_SOURCE, then rerun setup."
         return 1
       fi
       printf '%s\n' "$rule" >> "$TRANSACTION_DIR/firewalld.added"
