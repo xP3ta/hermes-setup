@@ -6,6 +6,8 @@ param(
     [switch]$Preflight,
     [switch]$Diagnose,
     [switch]$NoFirewallPrompt,
+    [switch]$Uninstall,
+    [switch]$Purge,
     [string]$InstallerTimeoutSec = "900",
     [string]$TerminationTimeoutSec = "15",
     [string]$LockTimeoutSec = "30"
@@ -23,6 +25,17 @@ function Get-BoundedIntegerParameter([string]$Name, [string]$Value, [int]$Minimu
 $InstallerTimeoutSec = Get-BoundedIntegerParameter "InstallerTimeoutSec" $InstallerTimeoutSec 1 86400
 $TerminationTimeoutSec = Get-BoundedIntegerParameter "TerminationTimeoutSec" $TerminationTimeoutSec 1 300
 $LockTimeoutSec = Get-BoundedIntegerParameter "LockTimeoutSec" $LockTimeoutSec 0 600
+
+# Service ports. The defaults keep the historical well-known trio; the env
+# overrides let a host whose 8642/9119/9131 is already taken install without
+# killing the process that owns it. Everything that touches a port (runners,
+# firewall rule, probes, pairing record and inventory) resolves it from here.
+$GatewayPort = Get-BoundedIntegerParameter "HERMES_GATEWAY_PORT" $(if ($env:HERMES_GATEWAY_PORT) { $env:HERMES_GATEWAY_PORT } else { "8642" }) 1 65535
+$DashboardPort = Get-BoundedIntegerParameter "HERMES_DASHBOARD_PORT" $(if ($env:HERMES_DASHBOARD_PORT) { $env:HERMES_DASHBOARD_PORT } else { "9119" }) 1 65535
+$BridgePort = Get-BoundedIntegerParameter "HERMES_BRIDGE_PORT" $(if ($env:HERMES_BRIDGE_PORT) { $env:HERMES_BRIDGE_PORT } else { "9131" }) 1 65535
+if (($GatewayPort -eq $DashboardPort) -or ($GatewayPort -eq $BridgePort) -or ($DashboardPort -eq $BridgePort)) {
+    throw "HERMES_GATEWAY_PORT, HERMES_DASHBOARD_PORT and HERMES_BRIDGE_PORT must be three different ports. No changes were made."
+}
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $RepoRaw = if ($env:HERMES_REPO_RAW) {
@@ -589,9 +602,9 @@ function Stop-TransactionTasksAndVerify {
     } while ($watch.Elapsed.TotalSeconds -lt 10)
     foreach ($name in $running) { [void]$failures.Add("task-running.$name") }
     foreach ($service in @(
-        @{ Port = 8642; Name = "HermesConsole-Gateway" },
-        @{ Port = 9119; Name = "HermesConsole-Dashboard" },
-        @{ Port = 9131; Name = "HermesConsole-MobileBridge" }
+        @{ Port = $GatewayPort; Name = "HermesConsole-Gateway" },
+        @{ Port = $DashboardPort; Name = "HermesConsole-Dashboard" },
+        @{ Port = $BridgePort; Name = "HermesConsole-MobileBridge" }
     )) {
         try {
             $records = @(Get-ExistingHermesPortRecords | Where-Object { $_.Port -eq $service.Port })
@@ -921,7 +934,7 @@ function Get-ExistingHermesPortRecords {
     }
     $records = New-Object System.Collections.Generic.List[object]
     foreach ($connection in @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
-        Where-Object { $_.LocalPort -in @(8642, 9119, 9131) })) {
+        Where-Object { $_.LocalPort -in @($GatewayPort, $DashboardPort, $BridgePort) })) {
         $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($connection.OwningProcess)" -ErrorAction Stop
         if (-not $process) { throw "TCP listener ownership could not be resolved for PID $($connection.OwningProcess)." }
         $records.Add([PSCustomObject]@{
@@ -1063,29 +1076,57 @@ function Test-HermesService(
     }
 }
 
+function Test-ProgressHolder([string]$TaskName) {
+    # True while the owning Scheduled Task still runs: a cold Dashboard build or a
+    # first-run initialisation is real progress, so the readiness budget must
+    # extend instead of failing on a fixed stopwatch.
+    if (-not $TaskName) { return $false }
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -Path "\" -ErrorAction SilentlyContinue
+        return ($null -ne $task -and $task.State.ToString() -eq "Running")
+    } catch {
+        return $false
+    }
+}
+
 function Wait-HermesService(
     [ValidateSet("gateway", "bridge", "dashboard")][string]$Kind,
     [string]$BaseUrl,
     [string]$Token,
     [int]$Seconds,
     [string]$ExpectedVersion = "",
-    [switch]$PhoneFacing
+    [switch]$PhoneFacing,
+    [string]$ExtendWhileTaskRunning = "",
+    [int]$MaxSeconds = 0
 ) {
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $lastReported = -1
-    while ($watch.Elapsed.TotalSeconds -lt $Seconds) {
+    $lastExtension = 0
+    while ($true) {
         if (Test-HermesService $Kind $BaseUrl $Token $ExpectedVersion -PhoneFacing:$PhoneFacing) {
             Write-Audit "$Kind readiness" "OK" ("Ready in {0:N1}s" -f $watch.Elapsed.TotalSeconds)
             return $true
         }
         $elapsed = [int]$watch.Elapsed.TotalSeconds
-        if ($elapsed -ne $lastReported -and $elapsed % 2 -eq 0) {
-            Write-Audit "$Kind readiness" "INFO" "Waiting (${elapsed}s/${Seconds}s)"
-            $lastReported = $elapsed
+        if ($elapsed -lt $Seconds) {
+            if ($elapsed -ne $lastReported -and $elapsed % 2 -eq 0) {
+                Write-Audit "$Kind readiness" "INFO" "Waiting (${elapsed}s/${Seconds}s)"
+                $lastReported = $elapsed
+            }
+        } elseif ($ExtendWhileTaskRunning -and $MaxSeconds -gt $Seconds -and
+                  $elapsed -lt $MaxSeconds -and (Test-ProgressHolder $ExtendWhileTaskRunning)) {
+            # The task is still working (cold build, first initialisation): keep
+            # waiting with an explicit trail instead of reporting a false failure.
+            if ($elapsed - $lastExtension -ge 15) {
+                $lastExtension = $elapsed
+                Write-Audit "$Kind readiness" "INFO" `
+                    "Still starting (${elapsed}s, budget ${Seconds}s extended to ${MaxSeconds}s); the service task is still running"
+            }
+        } else {
+            return $false
         }
         Start-Sleep -Milliseconds 500
     }
-    return $false
 }
 
 function Get-ApiKey {
@@ -1178,15 +1219,20 @@ function Test-AllowedIpAddress([string]$Address) {
         $parsed.IsIPv6LinkLocal -or (($bytes[0] -band 0xFE) -eq 0xFC)
 }
 
-function Get-ReachableHost {
+function Get-ReachableHostCandidates {
+    # Ordered candidate list for the address the phone will use. The first entry
+    # keeps the historical choice; the rest exist so that a multi-NIC host (VPN,
+    # Hyper-V/WSL virtual adapters, a second physical NIC) can self-correct when
+    # the phone-facing probe fails on the first address.
     if ($env:HERMES_PAIR_HOST) {
-        return @{ Address = $env:HERMES_PAIR_HOST.Trim(); Kind = "override"; InterfaceIndex = $null }
+        return @(@{ Address = $env:HERMES_PAIR_HOST.Trim(); Kind = "override"; InterfaceIndex = $null })
     }
+    $candidates = New-Object System.Collections.Generic.List[object]
     $tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
     if ($tailscale) {
         try {
             $mesh = (& $tailscale.Source ip -4 2>$null | Select-Object -First 1).Trim()
-            if ($mesh) { return @{ Address = $mesh; Kind = "mesh"; InterfaceIndex = $null } }
+            if ($mesh) { $candidates.Add(@{ Address = $mesh; Kind = "mesh"; InterfaceIndex = $null }) }
         } catch {}
     }
 
@@ -1213,15 +1259,29 @@ function Get-ReachableHost {
             [PSCustomObject]@{ IPAddress = $_; InterfaceIndex = $null }
         })
     }
-    $meshRecord = @($records | Where-Object { Test-Cgnat $_.IPAddress } | Select-Object -First 1)
-    if ($meshRecord.Count -gt 0) {
-        return @{ Address = $meshRecord[0].IPAddress; Kind = "mesh"; InterfaceIndex = $meshRecord[0].InterfaceIndex }
+
+    foreach ($record in @($records | Where-Object { Test-Cgnat $_.IPAddress })) {
+        $candidates.Add(@{ Address = $record.IPAddress; Kind = "mesh"; InterfaceIndex = $record.InterfaceIndex })
     }
-    $privateRecord = @($records | Where-Object { Test-PrivateIpv4 $_.IPAddress } | Select-Object -First 1)
-    if ($privateRecord.Count -gt 0) {
-        return @{ Address = $privateRecord[0].IPAddress; Kind = "lan"; InterfaceIndex = $privateRecord[0].InterfaceIndex }
+    foreach ($record in @($records | Where-Object { Test-PrivateIpv4 $_.IPAddress })) {
+        $candidates.Add(@{ Address = $record.IPAddress; Kind = "lan"; InterfaceIndex = $record.InterfaceIndex })
     }
-    return @{ Address = ""; Kind = "none"; InterfaceIndex = $null }
+    # Last resort: any other non-loopback address (e.g. a routed public NIC or a
+    # mesh range outside 100.64/10) so HTTPS deployments can still pair.
+    foreach ($record in @($records | Where-Object { -not (Test-PrivateIpv4 $_.IPAddress) -and -not (Test-Cgnat $_.IPAddress) })) {
+        $candidates.Add(@{ Address = $record.IPAddress; Kind = "other"; InterfaceIndex = $record.InterfaceIndex })
+    }
+    # Nunca @($lista): envolver una List[object] con @() lanza ArgumentException
+    # en Windows PowerShell 5.1 (los llamadores ya normalizan con @()).
+    return $candidates.ToArray()
+}
+
+function Get-ReachableHost {
+    $candidates = @(Get-ReachableHostCandidates)
+    if ($candidates.Count -eq 0) {
+        return @{ Address = ""; Kind = "none"; InterfaceIndex = $null }
+    }
+    return $candidates[0]
 }
 
 function Test-PrivateHost([string]$HostName) {
@@ -1311,7 +1371,13 @@ function Invoke-HermesJsonRequest {
 }
 
 function Get-PairingConfiguration {
-    $hostInfo = Get-ReachableHost
+    param([string]$HostOverride = "")
+    $hostInfo = if ($HostOverride) {
+        $kind = if (Test-Cgnat $HostOverride) { "mesh" } elseif (Test-PrivateIpv4 $HostOverride) { "lan" } else { "other" }
+        @{ Address = $HostOverride; Kind = $kind; InterfaceIndex = $null }
+    } else {
+        Get-ReachableHost
+    }
     if (-not $hostInfo.Address) {
         throw "No private LAN/Tailscale address was found. Connect Tailscale or configure HTTPS with HERMES_PAIR_HOST and HERMES_PAIR_SCHEME=https."
     }
@@ -1327,7 +1393,7 @@ function Get-PairingConfiguration {
     if ($scheme -eq "http" -and -not (Test-PrivateHost $hostInfo.Address)) {
         throw "Public HTTP/loopback is blocked. Use LAN/Tailscale or HERMES_PAIR_SCHEME=https."
     }
-    $defaultPort = if ($scheme -eq "https") { 443 } else { 8642 }
+    $defaultPort = if ($scheme -eq "https") { 443 } else { $GatewayPort }
     $port = $defaultPort
     if ($env:HERMES_PAIR_PORT) {
         if (-not ([int]::TryParse($env:HERMES_PAIR_PORT, [ref]$port)) -or $port -lt 1 -or $port -gt 65535) {
@@ -1337,8 +1403,8 @@ function Get-PairingConfiguration {
     $baseHost = if ($hostInfo.Address.Contains(":")) { "[$($hostInfo.Address)]" } else { $hostInfo.Address }
     $gateway = "$($scheme)://$($baseHost):$port"
     if ($scheme -eq "http") {
-        $dashboard = if ($env:HERMES_DASHBOARD_URL) { $env:HERMES_DASHBOARD_URL.TrimEnd('/') } else { "http://$($baseHost):9119" }
-        $bridge = if ($env:HERMES_BRIDGE_URL) { $env:HERMES_BRIDGE_URL.TrimEnd('/') } else { "http://$($baseHost):9131" }
+        $dashboard = if ($env:HERMES_DASHBOARD_URL) { $env:HERMES_DASHBOARD_URL.TrimEnd('/') } else { "http://$($baseHost):$DashboardPort" }
+        $bridge = if ($env:HERMES_BRIDGE_URL) { $env:HERMES_BRIDGE_URL.TrimEnd('/') } else { "http://$($baseHost):$BridgePort" }
         $bind = if ($env:HERMES_SERVICE_BIND_HOST) { $env:HERMES_SERVICE_BIND_HOST } else { "0.0.0.0" }
     } else {
         $dashboard = if ($env:HERMES_DASHBOARD_URL) { $env:HERMES_DASHBOARD_URL.TrimEnd('/') } else { $gateway }
@@ -1938,7 +2004,7 @@ function Get-RestrictedFirewallRuleState([string]$DisplayName, [string]$Kind) {
         $ports = @($portFilter.LocalPort | ForEach-Object {
             $_.ToString().Split(',') | ForEach-Object { $_.Trim() }
         } | Sort-Object -Unique)
-        $requiredPorts = @("8642", "9119", "9131")
+        $requiredPorts = @("$GatewayPort", "$DashboardPort", "$BridgePort")
         if (@(Compare-Object $requiredPorts $ports).Count -ne 0) { return "Conflict" }
         $addresses = @($addressFilter.RemoteAddress | ForEach-Object {
             $_.ToString().Split(',') | ForEach-Object { $_.Trim() }
@@ -2019,11 +2085,11 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
         Import-Module NetSecurity -ErrorAction Stop
         if ($Pairing.Kind -eq "mesh") {
             New-NetFirewallRule -Name $ruleName -DisplayName $display -Direction Inbound -Action Allow `
-                -Protocol TCP -LocalPort 8642, 9119, 9131 -Profile Any `
+                -Protocol TCP -LocalPort @($GatewayPort, $DashboardPort, $BridgePort) -Profile Any `
                 -RemoteAddress "100.64.0.0/10" -ErrorAction Stop | Out-Null
         } else {
             New-NetFirewallRule -Name $ruleName -DisplayName $display -Direction Inbound -Action Allow `
-                -Protocol TCP -LocalPort 8642, 9119, 9131 -Profile Private `
+                -Protocol TCP -LocalPort @($GatewayPort, $DashboardPort, $BridgePort) -Profile Private `
                 -RemoteAddress LocalSubnet -ErrorAction Stop | Out-Null
         }
         $script:SetupTransaction.FirewallRuleName = $ruleName
@@ -2472,9 +2538,9 @@ function Invoke-SetupInventory {
 
     if ($key) {
         foreach ($service in @(
-            @{ Kind = "gateway"; Url = "http://127.0.0.1:8642"; Port = 8642 },
-            @{ Kind = "bridge"; Url = "http://127.0.0.1:9131"; Port = 9131 },
-            @{ Kind = "dashboard"; Url = "http://127.0.0.1:9119"; Port = 9119 }
+            @{ Kind = "gateway"; Url = "http://127.0.0.1:$GatewayPort"; Port = $GatewayPort },
+            @{ Kind = "bridge"; Url = "http://127.0.0.1:$BridgePort"; Port = $BridgePort },
+            @{ Kind = "dashboard"; Url = "http://127.0.0.1:$DashboardPort"; Port = $DashboardPort }
         )) {
             if (-not (Test-HermesService $service.Kind $service.Url $key)) {
                 $owner = Get-PortOwner $service.Port
@@ -2484,7 +2550,7 @@ function Invoke-SetupInventory {
         }
         try {
             $credentials = Invoke-HermesJsonRequest -Method Get `
-                -Url "http://127.0.0.1:9131/bridge/dashboard/credentials" `
+                -Url "http://127.0.0.1:$BridgePort/bridge/dashboard/credentials" `
                 -Token $key -TimeoutSeconds 4
             if ($credentials.password_set -ne $true) {
                 [void]$missing.Add("Dashboard password")
@@ -2670,9 +2736,9 @@ function Invoke-SetupPreflight {
     }
 
     foreach ($service in @(
-        @{ Port = 8642; Name = "Gateway" },
-        @{ Port = 9119; Name = "Dashboard" },
-        @{ Port = 9131; Name = "Mobile Bridge" }
+        @{ Port = $GatewayPort; Name = "Gateway" },
+        @{ Port = $DashboardPort; Name = "Dashboard" },
+        @{ Port = $BridgePort; Name = "Mobile Bridge" }
     )) {
         try {
             $owner = Get-PortOwner $service.Port
@@ -2861,6 +2927,90 @@ function Invoke-SetupDiagnose {
     return $report
 }
 
+function Invoke-SetupUninstall {
+    # Reverses what setup created, in a bounded, reported order. It only touches
+    # objects this installer owns and is idempotent. The Hermes home is removed
+    # only with -Purge, and only when the path actually looks like a Console home.
+    Assert-SupportedWindows
+    $removed = New-Object System.Collections.Generic.List[string]
+    $failed = New-Object System.Collections.Generic.List[string]
+
+    foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue |
+            Where-Object { $_.TaskName -like "HermesConsole-*" })) {
+        $name = $task.TaskName
+        try {
+            Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
+            $removed.Add("task:$name")
+        } catch {
+            $failed.Add("task:$name")
+        }
+    }
+
+    if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
+        foreach ($rule in @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "HermesConsole-*" })) {
+            try {
+                Remove-NetFirewallRule -Name $rule.Name -ErrorAction Stop
+                $removed.Add("firewall:$($rule.Name)")
+            } catch {
+                $failed.Add("firewall:$($rule.Name)")
+            }
+        }
+    }
+
+    foreach ($artifact in @($PairingFile, $QrFile)) {
+        if ($artifact -and (Test-Path -LiteralPath $artifact)) {
+            try {
+                Remove-Item -LiteralPath $artifact -Force -ErrorAction Stop
+                $removed.Add("artifact:$([IO.Path]::GetFileName($artifact))")
+            } catch {
+                $failed.Add("artifact:$([IO.Path]::GetFileName($artifact))")
+            }
+        }
+    }
+
+    $purged = $false
+    if ($Purge) {
+        $leaf = Split-Path -Leaf $HermesHome
+        $parent = Split-Path -Parent $HermesHome
+        $looksLikeConsoleHome = $leaf -match '(?i)^hermes[ ._-]*(console|home)?$'
+        $looksLikeSystemPath = $parent -in @("", "C:\", "C:\Windows", "C:\Program Files", "C:\Program Files (x86)") -or
+            $leaf -in @("Windows", "Program Files", "Program Files (x86)", "Users")
+        if (-not $looksLikeConsoleHome -or $looksLikeSystemPath) {
+            throw "Refusing -Purge: $HermesHome is not a recognisable Hermes Console home. Remove it manually if that is really what you want. Services and pairing artifacts were already removed."
+        }
+        if (Test-Path -LiteralPath $HermesHome) {
+            try {
+                Remove-Item -LiteralPath $HermesHome -Recurse -Force -ErrorAction Stop
+                $removed.Add("home:$HermesHome")
+                $purged = $true
+            } catch {
+                $failed.Add("home:$HermesHome")
+            }
+        }
+    }
+
+    foreach ($item in $removed) { Write-Audit "Uninstall" "OK" $item }
+    foreach ($item in $failed) { Write-Audit "Uninstall" "FAIL" $item }
+    if ($removed.Count -eq 0 -and $failed.Count -eq 0) {
+        Write-Audit "Uninstall" "SKIP" "Nothing to remove; this host is already clean"
+    }
+    [PSCustomObject]@{
+        ok = ($failed.Count -eq 0)
+        removed = $removed.Count
+        failed = @($failed)
+        purged = $purged
+        home = $HermesHome
+        hint = if ($Purge) { "" } else { "The Hermes home was kept. Re-run with -Uninstall -Purge to remove $HermesHome as well." }
+    } | ConvertTo-Json -Compress
+}
+
+if ($Uninstall) {
+    Invoke-SetupUninstall
+    return
+}
+
 if ($Preflight) {
     Invoke-SetupPreflight
     return
@@ -2928,13 +3078,13 @@ home = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
 sh.CurrentDirectory = home
 sh.Environment("Process")("HERMES_HOME") = home
 sh.Environment("Process")("API_SERVER_HOST") = "__BIND_HOST__"
-sh.Environment("Process")("API_SERVER_PORT") = "8642"
+sh.Environment("Process")("API_SERVER_PORT") = "__GATEWAY_PORT__"
 exe = fso.BuildPath(home, "hermes-agent\venv\Scripts\hermes.exe")
 command = Chr(34) & exe & Chr(34) & " gateway run --replace"
 rc = sh.Run(command, 0, True)
 WScript.Quit rc
 '@
-    $gatewayRunner = Write-ServiceRunner "hermes-gateway" ($gatewayRunnerContent.Replace("__BIND_HOST__", $Pairing.BindHost))
+    $gatewayRunner = Write-ServiceRunner "hermes-gateway" ($gatewayRunnerContent.Replace("__BIND_HOST__", $Pairing.BindHost).Replace("__GATEWAY_PORT__", "$GatewayPort"))
     $dashboardRunnerContent = @'
 Option Explicit
 Dim sh, fso, home, exe, dist, nodePath, command, rc
@@ -2949,12 +3099,12 @@ If fso.FolderExists(nodePath) Then
 End If
 exe = fso.BuildPath(home, "hermes-agent\venv\Scripts\hermes.exe")
 dist = fso.BuildPath(home, "hermes-agent\hermes_cli\web_dist\index.html")
-command = Chr(34) & exe & Chr(34) & " dashboard --host __BIND_HOST__ --port 9119 --no-open"
+command = Chr(34) & exe & Chr(34) & " dashboard --host __BIND_HOST__ --port __DASHBOARD_PORT__ --no-open"
 If fso.FileExists(dist) Then command = command & " --skip-build"
 rc = sh.Run(command, 0, True)
 WScript.Quit rc
 '@
-    $dashboardRunner = Write-ServiceRunner "hermes-dashboard" ($dashboardRunnerContent.Replace("__BIND_HOST__", $Pairing.BindHost))
+    $dashboardRunner = Write-ServiceRunner "hermes-dashboard" ($dashboardRunnerContent.Replace("__BIND_HOST__", $Pairing.BindHost).Replace("__DASHBOARD_PORT__", "$DashboardPort"))
     $bridgeRunnerContent = @'
 Option Explicit
 Dim sh, fso, home, python, bridge, envFile, stream, line, token, command, rc
@@ -2965,7 +3115,7 @@ sh.CurrentDirectory = home
 sh.Environment("Process")("HERMES_HOME") = home
 sh.Environment("Process")("BRIDGE_HERMES_HOME") = home
 sh.Environment("Process")("BRIDGE_HOST") = "__BIND_HOST__"
-sh.Environment("Process")("BRIDGE_PORT") = "9131"
+sh.Environment("Process")("BRIDGE_PORT") = "__BRIDGE_PORT__"
 sh.Environment("Process")("BRIDGE_SCOPES") = "read,memory,soul,skills,cron,config,command"
 sh.Environment("Process")("BRIDGE_READ_ONLY") = "false"
 envFile = fso.BuildPath(home, ".env")
@@ -2984,7 +3134,7 @@ command = Chr(34) & python & Chr(34) & " " & Chr(34) & bridge & Chr(34) & " --i-
 rc = sh.Run(command, 0, True)
 WScript.Quit rc
 '@
-    $bridgeRunner = Write-ServiceRunner "hermes-bridge" ($bridgeRunnerContent.Replace("__BIND_HOST__", $Pairing.BindHost))
+    $bridgeRunner = Write-ServiceRunner "hermes-bridge" ($bridgeRunnerContent.Replace("__BIND_HOST__", $Pairing.BindHost).Replace("__BRIDGE_PORT__", "$BridgePort"))
     $dashboardRestartRunner = Write-ServiceRunner "restart-hermes-dashboard" @'
 Option Explicit
 Dim sh, rc
@@ -3018,25 +3168,25 @@ WScript.Quit rc
         [bool]$script:TaskDefinitionsChanged["HermesConsole-Gateway"]
     $bridgeChanged = $script:BridgeChanged -or [bool]$script:RunnerChanged["hermes-bridge"] -or
         [bool]$script:TaskDefinitionsChanged["HermesConsole-MobileBridge"]
-    $gatewayHealthy = Test-HermesService "gateway" "http://127.0.0.1:8642" $ApiKey
+    $gatewayHealthy = Test-HermesService "gateway" "http://127.0.0.1:$GatewayPort" $ApiKey
     if (-not $gatewayHealthy -or ($gatewayTask -and $gatewayChanged)) {
-        Start-HermesProcess "HermesConsole-Gateway" 8642
+        Start-HermesProcess "HermesConsole-Gateway" $GatewayPort
     } else {
         Write-Audit "Gateway service" "SKIP" "Already healthy and authenticated"
     }
-    if (-not (Wait-HermesService "gateway" "http://127.0.0.1:8642" $ApiKey 60)) {
-        throw "Gateway readiness failed. Inspect its Scheduled Task and the owner of TCP 8642."
+    if (-not (Wait-HermesService "gateway" "http://127.0.0.1:$GatewayPort" $ApiKey 60)) {
+        throw "Gateway readiness failed. Inspect its Scheduled Task and the owner of TCP $GatewayPort."
     }
-    Write-Ok "Gateway identity and authentication passed on 8642"
+    Write-Ok "Gateway identity and authentication passed on $GatewayPort"
 
-    $bridgeHealthy = Test-HermesService "bridge" "http://127.0.0.1:9131" $ApiKey $BridgeVersion
+    $bridgeHealthy = Test-HermesService "bridge" "http://127.0.0.1:$BridgePort" $ApiKey $BridgeVersion
     if (-not $bridgeHealthy -or ($bridgeTask -and $bridgeChanged)) {
-        Start-HermesProcess "HermesConsole-MobileBridge" 9131
+        Start-HermesProcess "HermesConsole-MobileBridge" $BridgePort
     } else {
         Write-Audit "Mobile Bridge service" "SKIP" "Already healthy, authenticated and current"
     }
-    if (-not (Wait-HermesService "bridge" "http://127.0.0.1:9131" $ApiKey 15 $BridgeVersion)) {
-        throw "Mobile Bridge did not pass health, auth and self-update checks. Inspect its Scheduled Task and TCP 9131."
+    if (-not (Wait-HermesService "bridge" "http://127.0.0.1:$BridgePort" $ApiKey 15 $BridgeVersion)) {
+        throw "Mobile Bridge did not pass health, auth and self-update checks. Inspect its Scheduled Task and TCP $BridgePort."
     }
     Write-Ok "Mobile Bridge $BridgeVersion health, auth and self-update passed"
 
@@ -3047,7 +3197,7 @@ WScript.Quit rc
     # so a later rollback does not remove the credential; that residual only
     # gates the Dashboard and is documented as non-transactional.
     $currentCredentials = Invoke-HermesJsonRequest -Method Get `
-        -Url "http://127.0.0.1:9131/bridge/dashboard/credentials" -Token $ApiKey -TimeoutSeconds 4
+        -Url "http://127.0.0.1:$BridgePort/bridge/dashboard/credentials" -Token $ApiKey -TimeoutSeconds 4
     if ($currentCredentials.ok -ne $true) {
         throw "Dashboard credential state could not be read through the Mobile Bridge."
     }
@@ -3059,7 +3209,7 @@ WScript.Quit rc
         $username = if ($currentCredentials.username) { $currentCredentials.username } else { "admin" }
         $body = @{ username = $username; password = $password } | ConvertTo-Json -Compress
         $credentials = Invoke-HermesJsonRequest -Method Post `
-            -Url "http://127.0.0.1:9131/bridge/dashboard/credentials" `
+            -Url "http://127.0.0.1:$BridgePort/bridge/dashboard/credentials" `
             -Token $ApiKey -Body $body -TimeoutSeconds 6
         $password = $null
         $body = $null
@@ -3071,15 +3221,15 @@ WScript.Quit rc
         Write-Audit "Dashboard credentials" "SKIP" "Existing password retained"
     }
 
-    $dashboardHealthy = Test-HermesService "dashboard" "http://127.0.0.1:9119" $ApiKey
+    $dashboardHealthy = Test-HermesService "dashboard" "http://127.0.0.1:$DashboardPort" $ApiKey
     $dashboardStarting = $dashboardTask -and
         (Test-HermesTaskRunning "HermesConsole-Dashboard")
     if (-not $dashboardHealthy -and -not $dashboardStarting) {
-        Start-HermesProcess "HermesConsole-Dashboard" 9119
+        Start-HermesProcess "HermesConsole-Dashboard" $DashboardPort
     } elseif ($dashboardStarting -and -not $dashboardHealthy) {
         # A previous setup can have timed out while npm/Vite kept building in
         # the persistent task. Restarting here creates a second build and can
-        # leave an orphan on 9119. Reuse the in-flight canonical task instead.
+        # leave an orphan on $DashboardPort. Reuse the in-flight canonical task instead.
         Write-Audit "Dashboard service" "INFO" "Existing Dashboard startup/build is still running; waiting"
     } else {
         Write-Audit "Dashboard service" "SKIP" "Already healthy with its existing build"
@@ -3087,22 +3237,66 @@ WScript.Quit rc
     # A first native-Windows launch may need npm install + the Vite build.
     # Hermes itself allows a long idle window for that work; do not fail the
     # setup after 25 seconds while the Scheduled Task is still building.
-    if (-not (Wait-HermesService "dashboard" "http://127.0.0.1:9119" $ApiKey 240)) {
-        throw "Dashboard readiness failed. Check Node.js/PATH, its Scheduled Task and TCP 9119."
+    # The first start builds the Dashboard (npm/Vite): on slow machines or with
+    # antivirus scanning, a fixed budget is too short and used to report a false
+    # failure. While the canonical task is still Running there is real progress,
+    # so the wait extends with an explicit trail up to the ceiling and only then
+    # fails. The script must stay pure ASCII (enforced by the suite).
+    if (-not (Wait-HermesService "dashboard" "http://127.0.0.1:$DashboardPort" $ApiKey 240 "" `
+            -ExtendWhileTaskRunning "HermesConsole-Dashboard" -MaxSeconds 1800)) {
+        throw "Dashboard readiness failed. Check Node.js/PATH, its Scheduled Task and TCP $DashboardPort."
     }
-    Write-Ok "Dashboard identity and Gateway state passed on 9119"
+    Write-Ok "Dashboard identity and Gateway state passed on $DashboardPort"
 
     Write-SetupPhase "Verifying private phone access"
     Ensure-PrivateFirewallRules $Pairing
 
-    if (-not (Wait-HermesService "gateway" $Pairing.GatewayBase $ApiKey 12 "" -PhoneFacing)) {
-        throw "Gateway works locally but not through $($Pairing.GatewayBase). Check bind, VPN/LAN, proxy and host/cloud firewall. No QR was generated."
+    # La primera direccion privada no siempre es la que alcanza el movil: en
+    # equipos multi-NIC (VPN, Hyper-V/WSL, segunda tarjeta) se prueban las otras
+    # candidatas acotadamente y se adopta la primera que responde de verdad,
+    # en lugar de fallar con una direccion que el telefono no alcanza.
+    $candidateAddresses = @($Pairing.Address)
+    foreach ($candidate in @(Get-ReachableHostCandidates | ForEach-Object { $_.Address })) {
+        if ($candidate -and $candidateAddresses -notcontains $candidate) { $candidateAddresses += $candidate }
     }
-    if (-not (Wait-HermesService "bridge" $Pairing.BridgeBase $ApiKey 12 $BridgeVersion -PhoneFacing)) {
-        throw "Mobile Bridge works locally but not through $($Pairing.BridgeBase). Check routing/proxy rules for /bridge/*. No QR was generated."
+    if ($candidateAddresses.Count -gt 3) { $candidateAddresses = $candidateAddresses[0..2] }
+    $phoneFailure = ""
+    $verifiedPairing = $null
+    foreach ($address in $candidateAddresses) {
+        $candidatePairing = $Pairing
+        if ($address -ne $Pairing.Address) {
+            try {
+                $candidatePairing = Get-PairingConfiguration -HostOverride $address
+            } catch {
+                Write-Audit "Phone access" "INFO" "Skipping $address : $($_.Exception.Message)"
+                continue
+            }
+        }
+        $failure = ""
+        if (-not (Wait-HermesService "gateway" $candidatePairing.GatewayBase $ApiKey 12 "" -PhoneFacing)) {
+            $failure = "Gateway works locally but not through $($candidatePairing.GatewayBase). Check bind, VPN/LAN, proxy and host/cloud firewall. No QR was generated."
+        } elseif (-not (Wait-HermesService "bridge" $candidatePairing.BridgeBase $ApiKey 12 $BridgeVersion -PhoneFacing)) {
+            $failure = "Mobile Bridge works locally but not through $($candidatePairing.BridgeBase). Check routing/proxy rules for /bridge/*. No QR was generated."
+        } elseif (-not (Wait-HermesService "dashboard" $candidatePairing.DashboardBase $ApiKey 12 "" -PhoneFacing)) {
+            $failure = "Dashboard works locally but not through $($candidatePairing.DashboardBase). Check routing/proxy rules for /api/status. No QR was generated."
+        }
+        if (-not $failure) {
+            $verifiedPairing = $candidatePairing
+            if ($address -ne $Pairing.Address) {
+                Write-Audit "Phone access" "OK" "Reachable address adopted: $address (the first candidate did not answer from the phone side)"
+            }
+            break
+        }
+        if (-not $phoneFailure) { $phoneFailure = $failure }
+        if ($address -ne $Pairing.Address) {
+            Write-Audit "Phone access" "INFO" "Candidate $address also failed the phone-facing probes"
+        }
     }
-    if (-not (Wait-HermesService "dashboard" $Pairing.DashboardBase $ApiKey 12 "" -PhoneFacing)) {
-        throw "Dashboard works locally but not through $($Pairing.DashboardBase). Check routing/proxy rules for /api/status. No QR was generated."
+    if (-not $verifiedPairing) { throw $phoneFailure }
+    if ($verifiedPairing.Address -ne $Pairing.Address) {
+        $Pairing = $verifiedPairing
+        # El tipo puede haber cambiado (LAN <-> malla): la regla debe reverificarse.
+        Ensure-PrivateFirewallRules $Pairing
     }
 
     Write-SetupPhase "Generating pairing QR and summary"
@@ -3156,7 +3350,10 @@ WScript.Quit rc
     } | ConvertTo-Json -Compress
 } catch {
     $safeError = Protect-AuditText $_.Exception.Message
+    # Sin pista, el usuario que falla no sabe que existe un informe redactado.
+    $diagnoseHint = "Re-run this same command with -Diagnose to write a redacted report under '$AuditDir' (no tokens, API keys or pairing credentials)."
     try { Write-Audit "Setup" "ERROR" $safeError } catch {}
+    try { Write-Audit "Setup" "INFO" $diagnoseHint } catch {}
     $rollback = $null
     if ($script:SetupTransaction -and -not $script:IntegrationCommitted) {
         try {
@@ -3186,8 +3383,9 @@ WScript.Quit rc
         error = $safeError
         rollback = $rollbackState
         audit = $AuditLog
+        hint = $diagnoseHint
     } | ConvertTo-Json -Compress
-    throw $safeError
+    throw "$safeError $diagnoseHint"
 } finally {
     if ($script:MutationQuiescent) { Remove-OwnedSetupFiles -Paths $AttemptPaths }
 }

@@ -1048,5 +1048,78 @@ class InstallerHygieneTests(unittest.TestCase):
             self.assertIn("--remove-rich-rule=" + rule, commands)
 
 
+
+class ServicePortTests(unittest.TestCase):
+    """Los puertos dejan de estar fijos: se resuelven del entorno, se rechaza una
+    colision y ningun consumidor (unidades, runners, firewall, probes) los repite."""
+
+    def setUp(self) -> None:
+        self.source = SETUP.read_text(encoding="utf-8")
+
+    def test_ports_are_resolved_with_documented_defaults(self) -> None:
+        for variable, name, default in (
+            ("GATEWAY_PORT", "HERMES_GATEWAY_PORT", "8642"),
+            ("DASHBOARD_PORT", "HERMES_DASHBOARD_PORT", "9119"),
+            ("BRIDGE_PORT", "HERMES_BRIDGE_PORT", "9131"),
+        ):
+            with self.subTest(port=name):
+                self.assertIn(f'{variable}="${{{name}:-{default}}}"', self.source)
+
+    def _port_block(self) -> str:
+        """El bloque de resolucion de puertos, aislado de la instalacion."""
+        start = self.source.index('GATEWAY_PORT="${HERMES_GATEWAY_PORT:-8642}"')
+        end = self.source.index('PAIR_SCHEME="${HERMES_PAIR_SCHEME:-http}"', start)
+        return self.source[start:end]
+
+    def _run_ports(self, overrides: dict) -> subprocess.CompletedProcess:
+        environment = dict(os.environ)
+        for key in ("HERMES_GATEWAY_PORT", "HERMES_DASHBOARD_PORT", "HERMES_BRIDGE_PORT"):
+            environment.pop(key, None)
+        environment.update(overrides)
+        return subprocess.run(
+            ["sh", "-c", "set -eu\n" + self._port_block() + "\necho RESOLVED\n"],
+            capture_output=True, text=True, env=environment,
+        )
+
+    def test_the_port_block_is_resolved_at_the_top_level(self) -> None:
+        # Si el bloque se colgara de alguna funcion, el rechazo llegaria tarde.
+        for line in self._port_block().splitlines():
+            if line.startswith("GATEWAY_PORT=") or line.startswith("DASHBOARD_PORT=") \
+                    or line.startswith("BRIDGE_PORT="):
+                self.assertFalse(line.startswith(" "), f"no es de nivel superior: {line}")
+        self.assertLess(self.source.index("GATEWAY_PORT="), self.source.index("PAIR_SCHEME="))
+
+    def test_a_port_collision_is_refused_without_resolving(self) -> None:
+        result = self._run_ports({"HERMES_GATEWAY_PORT": "9119"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be three different ports", result.stdout + result.stderr)
+        self.assertNotIn("RESOLVED", result.stdout)
+
+    def test_invalid_and_out_of_range_ports_are_refused(self) -> None:
+        for override, expected in (
+            ({"HERMES_GATEWAY_PORT": "abc"}, "must be TCP ports"),
+            ({"HERMES_GATEWAY_PORT": "0"}, "out of range"),
+            ({"HERMES_DASHBOARD_PORT": "70000"}, "out of range"),
+            ({"HERMES_BRIDGE_PORT": "9131.5"}, "must be TCP ports"),
+        ):
+            with self.subTest(override=override):
+                result = self._run_ports(override)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stdout + result.stderr)
+                self.assertNotIn("RESOLVED", result.stdout)
+
+    def test_valid_overrides_resolve_without_touching_the_host(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            before = sorted(os.listdir(raw))
+            result = self._run_ports({
+                "HERMES_GATEWAY_PORT": "18642",
+                "HERMES_DASHBOARD_PORT": "19119",
+                "HERMES_BRIDGE_PORT": "19131",
+            })
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("RESOLVED", result.stdout)
+            self.assertEqual(before, sorted(os.listdir(raw)))
+            self.assertTrue(os.path.isdir(raw))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

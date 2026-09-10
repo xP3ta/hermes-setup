@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose")]
+    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint")]
     [string]$Case = "All",
     [string]$SetupScript = "",
     [string]$PairScript = ""
@@ -164,6 +164,16 @@ function Test-ParserBootstrap {
         $env:LOCALAPPDATA = $oldLocal
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Test-FailureHint {
+    # Quien falla tiene que saber que existe un informe redactado y como pedirlo.
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+    Assert-True ($setupRaw -match 'Re-run this same command with -Diagnose') `
+        "a failed run points the user at the redacted report"
+    Assert-True ($setupRaw -match 'hint = \$diagnoseHint') "the failure object carries the diagnostic hint"
+    Assert-True ($setupRaw -match 'Invoke-SetupUninstall') "the installer exposes an uninstall path for stuck states"
+    Assert-True ($setupRaw -match '-Uninstall -Purge') "the uninstall hint names the purge switch explicitly"
 }
 
 function Test-UrlPolicy {
@@ -401,8 +411,8 @@ function Test-Health {
     [void](Assert-Throws { Install-HermesIfNeeded } 'launcher.*health|health.*launcher|did not pass' "post-install launcher failure stays broken")
     Assert-True ($script:HealthChecks -ge 2) "installer checks the launcher both before and after repair"
     $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
-    Assert-True ($setupRaw -match 'Wait-HermesService\s+"gateway"\s+"http://127\.0\.0\.1:8642"\s+\$ApiKey\s+60') `
-        "clean native Gateway startup receives the proven readiness window"
+    Assert-True ($setupRaw -match 'Wait-HermesService\s+"gateway"\s+"http://127\.0\.0\.1:\$GatewayPort"\s+\$ApiKey\s+60') `
+        "clean native Gateway startup receives the proven readiness window on the resolved port"
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
@@ -1114,6 +1124,11 @@ function Test-PreflightDiagnose {
     # host inventory those helpers collect. Earlier cases leave global stubs
     # behind (synthetic CIM, synthetic web requests), so define our own.
     function global:Assert-SupportedWindows { }
+    # Los puertos se resuelven en el nivel superior del producto; aqui se fijan a
+    # los mismos defaults para que los helpers importados tengan su entorno.
+    $script:GatewayPort = 8642
+    $script:DashboardPort = 9119
+    $script:BridgePort = 9131
     function global:Get-CimInstance {
         param($ClassName, $Filter, $ErrorAction)
         if ($ClassName -eq "Win32_LogicalDisk") {
@@ -1195,13 +1210,237 @@ function Test-PreflightDiagnose {
     }
 }
 
+function Test-ServicePorts {
+    # Los puertos dejan de estar fijos: se resuelven del entorno con defaults
+    # historicos, se rechaza una colision y todo consumidor los usa resueltos.
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+    foreach ($item in @(
+        @{ Name = "HERMES_GATEWAY_PORT"; Default = "8642"; Variable = "GatewayPort" },
+        @{ Name = "HERMES_DASHBOARD_PORT"; Default = "9119"; Variable = "DashboardPort" },
+        @{ Name = "HERMES_BRIDGE_PORT"; Default = "9131"; Variable = "BridgePort" }
+    )) {
+        $pattern = '\$' + $item.Variable + '\s*=\s*Get-BoundedIntegerParameter\s+"' + $item.Name + '"'
+        Assert-True ($setupRaw -match $pattern) "$($item.Name) is resolved through the bounded parser"
+        Assert-True ($setupRaw -match ('"' + $item.Name + '"[^\r\n]*else\s*\{\s*"' + $item.Default + '"\s*\}')) `
+            "$($item.Name) keeps $($item.Default) as its documented default"
+    }
+    Assert-True ($setupRaw -match 'must be three different ports') "a port collision is refused before any change"
+    # Los runners y la regla de firewall no pueden volver a fijar literales.
+    Assert-True ($setupRaw -match '__GATEWAY_PORT__' -and $setupRaw -match '__DASHBOARD_PORT__' -and $setupRaw -match '__BRIDGE_PORT__') `
+        "generated service runners take the ports from placeholders"
+    Assert-True ($setupRaw -match 'Replace\("__BRIDGE_PORT__", "\$BridgePort"\)') "the bridge runner substitutes its resolved port"
+    Assert-True ($setupRaw -match '-LocalPort @\(\$GatewayPort, \$DashboardPort, \$BridgePort\)') `
+        "the firewall rule opens exactly the three resolved ports"
+    Assert-True ($setupRaw -match '\$requiredPorts = @\("\$GatewayPort", "\$DashboardPort", "\$BridgePort"\)') `
+        "the firewall rule is verified against the same resolved ports"
+    Assert-True ($setupRaw -notmatch '"http://127\.0\.0\.1:8642"' -and $setupRaw -notmatch 'LocalPort 8642') `
+        "no consumer keeps a hardcoded service port"
+    # El rechazo es real y temprano: se ejecuta el script con dos puertos iguales.
+    $exe = (Get-Process -Id $PID).Path
+    $oldGateway = $env:HERMES_GATEWAY_PORT
+    try {
+        $env:HERMES_GATEWAY_PORT = "9119"
+        # El hijo escribe el rechazo por stderr y la suite corre con
+        # ErrorActionPreference Stop: se captura explicitamente para que un
+        # stderr esperado no se convierta en un fallo del arnes.
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $output = @(& $exe -NoProfile -ExecutionPolicy Bypass -File $SetupScript -Preflight 2>&1 |
+                ForEach-Object { [string]$_ })
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        $joined = $output -join "`n"
+        Assert-True ($joined -match 'must be three different ports') "a duplicated port stops the run with a bounded reason"
+        Assert-True ($joined -notmatch 'Adding the firewall rule') "the collision is refused before any mutation phase"
+    } finally {
+        if ($null -eq $oldGateway) { Remove-Item Env:HERMES_GATEWAY_PORT -ErrorAction SilentlyContinue }
+        else { $env:HERMES_GATEWAY_PORT = $oldGateway }
+    }
+}
+
+function Test-AdaptiveWait {
+    # El primer arranque puede tardar mas que el presupuesto: mientras la tarea
+    # siga corriendo hay progreso real y la espera se extiende; si la tarea murio
+    # falla acotada, y si sigue viva pero nada responde se corta en el techo.
+    Import-ProductFunction $setup "Wait-HermesService"
+    Import-ProductFunction $setup "Test-ProgressHolder"
+    $script:auditLines = New-Object System.Collections.Generic.List[string]
+    $script:probeCount = 0
+    $script:holderAlive = $true
+    $script:probeThreshold = 7
+    function global:Write-Audit { param($Step, $State, $Detail) [void]$script:auditLines.Add("$Step|$State|$Detail") }
+    function global:Test-HermesService {
+        param($Kind, $BaseUrl, $Token, $ExpectedVersion, [switch]$PhoneFacing)
+        $script:probeCount++
+        return ($script:probeCount -ge $script:probeThreshold)
+    }
+    function global:Test-ProgressHolder { param([string]$TaskName) return $script:holderAlive }
+
+    # A) Progreso real: el servicio responde despues del presupuesto base y la
+    #    espera se extiende en lugar de fallar.
+    $script:probeCount = 0
+    $script:holderAlive = $true
+    $script:probeThreshold = 7
+    $ok = Wait-HermesService "dashboard" "http://127.0.0.1:9119" "token" 1 "" -ExtendWhileTaskRunning "HermesConsole-Dashboard" -MaxSeconds 30
+    Assert-True $ok "the wait extends past the base budget while the service task is still running"
+    Assert-True ($script:probeCount -ge 7) "the extension keeps polling until the service answers"
+
+    # B) Sin progreso (la tarea ya no corre): falla en el presupuesto base.
+    $script:probeCount = 0
+    $script:holderAlive = $false
+    $script:probeThreshold = [int]::MaxValue
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $dead = Wait-HermesService "dashboard" "http://127.0.0.1:9119" "token" 1 "" -ExtendWhileTaskRunning "HermesConsole-Dashboard" -MaxSeconds 30
+    $deadElapsed = $watch.Elapsed.TotalSeconds
+    Assert-True (-not $dead) "a dead service task fails instead of waiting to the ceiling"
+    Assert-True ($deadElapsed -lt 10) "the failure stays bounded by the base budget ($([int]$deadElapsed)s)"
+
+    # C) Tarea viva pero el servicio nunca responde: se corta en el techo.
+    $script:probeCount = 0
+    $script:holderAlive = $true
+    $script:probeThreshold = [int]::MaxValue
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $ceiling = Wait-HermesService "dashboard" "http://127.0.0.1:9119" "token" 1 "" -ExtendWhileTaskRunning "HermesConsole-Dashboard" -MaxSeconds 4
+    $ceilingElapsed = $watch.Elapsed.TotalSeconds
+    Assert-True (-not $ceiling) "the extension stops at the ceiling instead of hanging forever"
+    Assert-True ($ceilingElapsed -ge 3 -and $ceilingElapsed -lt 12) "the ceiling is honoured ($([int]$ceilingElapsed)s)"
+    Assert-True (($script:auditLines -join "`n") -match 'readiness') "the wait keeps an explicit audit trail"
+
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+    Assert-True ($setupRaw -match 'Still starting \(' -and $setupRaw -match 'extended to \$\{MaxSeconds\}s') `
+        "the extension writes an explicit trail in the audit log"
+    Assert-True ($setupRaw -match 'ExtendWhileTaskRunning "HermesConsole-Dashboard" -MaxSeconds 1800') `
+        "the Dashboard readiness budget is extended only while its canonical task runs"
+}
+
+function Test-AddressCandidates {
+    # La primera direccion privada no siempre alcanza el movil: el setup debe
+    # tener una lista ordenada y adoptar la primera que responde de verdad.
+    foreach ($name in @("Get-ReachableHostCandidates", "Get-ReachableHost", "Test-PrivateIpv4", "Test-Cgnat")) {
+        Import-ProductFunction $setup $name
+    }
+    # Delegar en el cmdlet real salvo para tailscale: un stub que devuelve $null
+    # para todo deja sin efecto a los demas casos y al propio despachador.
+    function global:Get-Command {
+        param($Name, $ErrorAction, [switch]$CommandType)
+        if ($Name -like "*tailscale*") { return $null }
+        return Microsoft.PowerShell.Core\Get-Command $Name
+    }
+    function global:Get-NetIPAddress {
+        param($AddressFamily, $ErrorAction)
+        return @(
+            [PSCustomObject]@{ IPAddress = "127.0.0.1"; InterfaceAlias = "Loopback"; InterfaceIndex = 1; AddressState = "Preferred"; PrefixLength = 8 },
+            [PSCustomObject]@{ IPAddress = "172.19.240.1"; InterfaceAlias = "vEthernet (WSL)"; InterfaceIndex = 9; AddressState = "Preferred"; PrefixLength = 20 },
+            [PSCustomObject]@{ IPAddress = "192.168.10.55"; InterfaceAlias = "Ethernet"; InterfaceIndex = 5; AddressState = "Preferred"; PrefixLength = 24 },
+            [PSCustomObject]@{ IPAddress = "10.20.30.40"; InterfaceAlias = "Ethernet 2"; InterfaceIndex = 6; AddressState = "Preferred"; PrefixLength = 24 }
+        )
+    }
+    Remove-Item Env:HERMES_PAIR_HOST -ErrorAction SilentlyContinue
+    $candidates = @(Get-ReachableHostCandidates)
+    $addresses = @($candidates | ForEach-Object { $_.Address })
+    Assert-True ($addresses.Count -ge 2) "a multi-homed host yields more than one candidate"
+    Assert-True (-not ($addresses -contains "127.0.0.1")) "loopback is never a phone-facing candidate"
+    Assert-True (-not ($addresses -contains "172.19.240.1")) "virtual adapters are deprioritised out of the candidate list"
+    Assert-True ($addresses[0] -in @("192.168.10.55", "10.20.30.40")) "the first candidate is a real private address"
+    $chosen = Get-ReachableHost
+    Assert-True ($chosen.Address -eq $addresses[0] -and $chosen.Kind -eq "lan") "the default host stays the first candidate as before"
+
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+    Assert-True ($setupRaw -match 'Reachable address adopted') "the installer adopts a reachable candidate explicitly"
+    Assert-True ($setupRaw -match 'Get-PairingConfiguration -HostOverride') "alternate candidates are built through the explicit host override"
+    Assert-True ($setupRaw -match 'candidateAddresses\[0\.\.2\]') "the candidate sweep is bounded to at most three addresses"
+    Assert-True ($setupRaw -match 'Ensure-PrivateFirewallRules \$Pairing') "the firewall rule is re-verified when the address kind changes"
+    Assert-True ($setupRaw -match 'works locally but not through') "the bounded failure keeps its actionable wording"
+}
+
+function Test-Uninstall {
+    # -Uninstall solo toca lo que el instalador crea, es idempotente y -Purge
+    # jamas borra una ruta que no sea un home de Hermes Console.
+    Import-ProductFunction $setup "Invoke-SetupUninstall"
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-uninstall-" + [Guid]::NewGuid().ToString("N"))
+    [void](New-Item -ItemType Directory -Force -Path $temp)
+    $script:unregistered = New-Object System.Collections.Generic.List[string]
+    $script:removedRules = New-Object System.Collections.Generic.List[string]
+    $script:auditLines = New-Object System.Collections.Generic.List[string]
+    function global:Assert-SupportedWindows { }
+    function global:Write-Audit { param($Step, $State, $Detail) [void]$script:auditLines.Add("$State|$Detail") }
+    function global:Get-ScheduledTask {
+        param([string]$TaskName, $ErrorAction)
+        if ($TaskName) { return $null }
+        return @(
+            [PSCustomObject]@{ TaskName = "HermesConsole-Gateway" },
+            [PSCustomObject]@{ TaskName = "HermesConsole-Dashboard" },
+            [PSCustomObject]@{ TaskName = "OtroProducto-Updater" }
+        )
+    }
+    function global:Stop-ScheduledTask { param([string]$TaskName, $ErrorAction) }
+    function global:Unregister-ScheduledTask { param([string]$TaskName, [switch]$Confirm, $ErrorAction) $script:unregistered.Add($TaskName) }
+    function global:Get-NetFirewallRule {
+        param([string]$Name, $ErrorAction)
+        return @(
+            [PSCustomObject]@{ Name = "HermesConsole-abc123" },
+            [PSCustomObject]@{ Name = "OtraAplicacion-xyz" }
+        )
+    }
+    function global:Remove-NetFirewallRule { param([string]$Name, $ErrorAction) $script:removedRules.Add($Name) }
+
+    $global:AuditDir = $temp
+    $global:HermesHome = Join-Path $temp "Hermes Console"
+    [void](New-Item -ItemType Directory -Force -Path $global:HermesHome)
+    [IO.File]::WriteAllText((Join-Path $global:HermesHome "hermes-pairing.json"), "{}")
+    $global:PairingFile = Join-Path $global:HermesHome "hermes-pairing.json"
+    $global:QrFile = Join-Path $global:HermesHome "hermes-pair.png"
+    [IO.File]::WriteAllBytes($global:QrFile, [byte[]](1, 2, 3))
+    $global:Purge = $false
+
+    $result = Invoke-SetupUninstall
+    $parsed = $result | ConvertFrom-Json
+    Assert-True ($parsed.ok -eq $true) "a clean uninstall reports success"
+    Assert-True ($script:unregistered -contains "HermesConsole-Gateway" -and $script:unregistered -contains "HermesConsole-Dashboard") `
+        "the installer's scheduled tasks are removed"
+    Assert-True (-not ($script:unregistered -contains "OtroProducto-Updater")) "a foreign scheduled task is never removed"
+    Assert-True ($script:removedRules -contains "HermesConsole-abc123") "the installer's firewall rule is removed"
+    Assert-True (-not ($script:removedRules -contains "OtraAplicacion-xyz")) "a foreign firewall rule is never removed"
+    Assert-True (-not (Test-Path -LiteralPath $global:PairingFile)) "the pairing record is removed"
+    Assert-True (Test-Path -LiteralPath $global:HermesHome) "the home survives without -Purge"
+
+    function global:Get-ScheduledTask { param([string]$TaskName, $ErrorAction) if ($TaskName) { return $null } return @() }
+    function global:Get-NetFirewallRule { param([string]$Name, $ErrorAction) return @() }
+    $again = Invoke-SetupUninstall | ConvertFrom-Json
+    Assert-True ($again.ok -eq $true -and $again.removed -eq 0) "a second uninstall is a no-op"
+    Assert-True (($script:auditLines -join "`n") -match 'already clean') "the no-op is reported explicitly"
+
+    $global:Purge = $true
+    $global:HermesHome = Join-Path $temp "Documentos-Cosas"
+    [void](New-Item -ItemType Directory -Force -Path $global:HermesHome)
+    $refused = $false
+    try { Invoke-SetupUninstall | Out-Null } catch { $refused = ($_.Exception.Message -match 'Refusing -Purge') }
+    Assert-True $refused "-Purge refuses to delete a path that is not a Hermes Console home"
+    Assert-True (Test-Path -LiteralPath $global:HermesHome) "the refused path is left untouched"
+
+    $global:HermesHome = Join-Path $temp "Hermes Console"
+    [void](New-Item -ItemType Directory -Force -Path $global:HermesHome)
+    [IO.File]::WriteAllText((Join-Path $global:HermesHome "config.yaml"), "x: 1")
+    $purged = Invoke-SetupUninstall | ConvertFrom-Json
+    Assert-True ($purged.purged -eq $true) "-Purge removes a recognised Console home"
+    Assert-True (-not (Test-Path -LiteralPath $global:HermesHome)) "the purged home is gone"
+
+    $global:Purge = $false
+    foreach ($name in @("HermesHome", "AuditDir", "PairingFile", "QrFile", "Purge")) {
+        Remove-Variable -Name $name -Scope Global -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 $cases = if ($Case -eq "All") {
-    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose")
+    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint")
 } else { @($Case) }
 
 foreach ($selected in $cases) {
     $Case = $selected
-    & (Get-Command "Test-$selected" -CommandType Function)
+    & (Microsoft.PowerShell.Core\Get-Command "Test-$selected" -CommandType Function)
 }
 
 Write-Host "RESULT: PASS=$script:Passed SKIP=$script:Skipped"

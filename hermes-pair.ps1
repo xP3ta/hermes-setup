@@ -297,15 +297,19 @@ $baseHost = if ($hostName.Contains(":")) { "[$hostName]" } else { $hostName }
 $gateway = if ($env:HERMES_PAIR_HOST -or $env:HERMES_PAIR_SCHEME -or $env:HERMES_PAIR_PORT) {
     "$($scheme)://$($baseHost):$port"
 } else { [string]$pairing.gateway }
+# Los defaults respetan los overrides de puerto del setup, o el enlace mostraria
+# puertos que no son los que escucha esta maquina.
+$dashboardPort = if ($env:HERMES_DASHBOARD_PORT) { $env:HERMES_DASHBOARD_PORT } else { "9119" }
+$bridgePort = if ($env:HERMES_BRIDGE_PORT) { $env:HERMES_BRIDGE_PORT } else { "9131" }
 $dashboard = if ($env:HERMES_DASHBOARD_URL) {
     $env:HERMES_DASHBOARD_URL.TrimEnd('/')
 } elseif ($env:HERMES_PAIR_HOST -or $env:HERMES_PAIR_SCHEME -or $env:HERMES_PAIR_PORT) {
-    if ($scheme -eq "https") { $gateway } else { "http://$($baseHost):9119" }
+    if ($scheme -eq "https") { $gateway } else { "http://$($baseHost):$dashboardPort" }
 } else { [string]$pairing.dashboard }
 $bridge = if ($env:HERMES_BRIDGE_URL) {
     $env:HERMES_BRIDGE_URL.TrimEnd('/')
 } elseif ($env:HERMES_PAIR_HOST -or $env:HERMES_PAIR_SCHEME -or $env:HERMES_PAIR_PORT) {
-    if ($scheme -eq "https") { $gateway } else { "http://$($baseHost):9131" }
+    if ($scheme -eq "https") { $gateway } else { "http://$($baseHost):$bridgePort" }
 } else { [string]$pairing.bridge }
 
 $expectedGateway = "$($scheme)://$($baseHost):$port"
