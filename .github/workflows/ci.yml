@@ -57,6 +57,14 @@ jobs:
         shell: bash
         run: python3 tests/review-unix-security.py
 
+      # Mobile Bridge handlers in-process against a disposable home: path
+      # confinement, structured redaction, destination scopes, unique backups.
+      - name: Review suite (Mobile Bridge)
+        shell: bash
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check aiohttp pyyaml
+          python3 tests/bridge_security_test.py
+
       - name: Run Unix tests
         shell: bash
         run: |
