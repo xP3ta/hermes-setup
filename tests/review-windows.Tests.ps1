@@ -1252,6 +1252,9 @@ function Test-ServicePorts {
             $ErrorActionPreference = $previousPreference
         }
         $joined = $output -join "`n"
+        # El hijo sale 1 a proposito (es el rechazo que se valida); sin esto el
+        # codigo del hijo se propaga como salida de la suite entera.
+        $global:LASTEXITCODE = 0
         Assert-True ($joined -match 'must be three different ports') "a duplicated port stops the run with a bounded reason"
         Assert-True ($joined -notmatch 'Adding the firewall rule') "the collision is refused before any mutation phase"
     } finally {
@@ -1444,3 +1447,7 @@ foreach ($selected in $cases) {
 }
 
 Write-Host "RESULT: PASS=$script:Passed SKIP=$script:Skipped"
+# Assert-True lanza en el primer fallo, asi que llegar aqui es exito: la salida no
+# puede depender de LASTEXITCODE de ningun hijo.
+$global:LASTEXITCODE = 0
+exit 0
