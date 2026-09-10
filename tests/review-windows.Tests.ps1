@@ -1058,13 +1058,13 @@ function Test-TopLevelTimeouts {
     $validator = Find-Function $setup.Ast "Get-BoundedIntegerParameter"
     Assert-True ($null -ne $validator) "product defines Get-BoundedIntegerParameter"
 
-    $conversions = [regex]::Matches($setup.Source, '(?m)^\$(?:InstallerTimeoutSec|TerminationTimeoutSec|LockTimeoutSec) = Get-BoundedIntegerParameter[^\r\n]*$')
+    $conversions = [regex]::Matches($setup.Source, '(?m)^\$(?:InstallerTimeoutSec|TerminationTimeoutSec|LockTimeoutSec) = Get-BoundedIntegerParameter[^\r\n]*\r?$')
     Assert-True ($conversions.Count -eq 3) "top level validates all three timeout params through Get-BoundedIntegerParameter"
 
     $lockCall = [regex]::Match($setup.Source, 'Enter-SetupLock\s+-Name\s+\$SetupLockName\s+-TimeoutMilliseconds\s+\(([^)]+)\)')
     Assert-True $lockCall.Success "top-level Enter-SetupLock call site found"
 
-    $storedLines = [regex]::Matches($setup.Source, '(?m)^\$script:(?:HermesInstallTimeoutSeconds|TerminationTimeoutSeconds) = [^\r\n]*$')
+    $storedLines = [regex]::Matches($setup.Source, '(?m)^\$script:(?:HermesInstallTimeoutSeconds|TerminationTimeoutSeconds) = [^\r\n]*\r?$')
     Assert-True ($storedLines.Count -eq 2) "top level stores install/termination timeouts in script variables"
 
     $body = New-Object System.Collections.Generic.List[string]
