@@ -23,9 +23,11 @@ Windows Firewall and persistent startup correctly. The Unix installer uses
 `systemd --user` on Linux and `launchd` on macOS. On
 Unix environments without either manager it starts a safe per-user fallback
 and warns that the processes will not survive a reboot. The Windows installer
-uses per-user Scheduled Tasks (with a Startup-folder fallback), stores no token
-in task arguments and only creates restricted Windows Firewall rules for
-**Private/LAN or Tailscale** sources when PowerShell is already elevated.
+uses exactly five per-user Scheduled Tasks (no Startup-folder fallback),
+stores no token in task arguments and only creates restricted Windows Firewall
+rules for **Private/LAN or Tailscale** sources when PowerShell is already
+elevated; without elevation it fails before changing anything and tells you to
+rerun from an elevated terminal.
 
 ## What it does
 

@@ -1,0 +1,1084 @@
+[CmdletBinding()]
+param(
+    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts")]
+    [string]$Case = "All",
+    [string]$SetupScript = "",
+    [string]$PairScript = ""
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+if (-not $SetupScript -or -not $PairScript) {
+    $suiteRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $scriptsRoot = Split-Path -Parent $suiteRoot
+    if (-not $SetupScript) { $SetupScript = Join-Path $scriptsRoot "hermes-mobile-setup.ps1" }
+    if (-not $PairScript) { $PairScript = Join-Path $scriptsRoot "hermes-pair.ps1" }
+}
+$script:Passed = 0
+$script:Skipped = 0
+
+function Assert-True([bool]$Condition, [string]$Message) {
+    if (-not $Condition) { throw "FAIL: $Message" }
+    $script:Passed++
+    Write-Host "PASS [$Case]: $Message"
+}
+
+function Assert-Throws([scriptblock]$Action, [string]$Pattern, [string]$Message) {
+    $caught = ""
+    try { & $Action } catch { $caught = $_.Exception.Message }
+    Assert-True ([bool]$caught) "$Message throws"
+    if ($Pattern) {
+        Assert-True ($caught -match $Pattern) "$Message reports the bounded reason (actual: $caught)"
+    }
+    return $caught
+}
+
+function Write-Skip([string]$Message) {
+    $script:Skipped++
+    Write-Host "SKIP [$Case]: $Message" -ForegroundColor Yellow
+}
+
+function Invoke-ChildProcessCapture([string]$FilePath, [string[]]$ArgumentList) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $captured = @(& $FilePath @ArgumentList 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return [PSCustomObject]@{ Output = $captured; ExitCode = $exitCode }
+}
+
+function Parse-Product([string]$Path) {
+    $tokens = $null
+    $errors = $null
+    $source = [IO.File]::ReadAllText($Path)
+    $ast = [Management.Automation.Language.Parser]::ParseInput(
+        $source, [ref]$tokens, [ref]$errors
+    )
+    return [PSCustomObject]@{ Source = $source; Ast = $ast; Errors = @($errors) }
+}
+
+function Find-Function([Management.Automation.Language.Ast]$Root, [string]$Name) {
+    return $Root.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $Name
+    }, $true)
+}
+
+function Import-ProductFunction($Parsed, [string]$Name) {
+    $functionAst = Find-Function $Parsed.Ast $Name
+    if ($null -eq $functionAst) { throw "Product function is missing: $Name" }
+    $definition = [regex]::Replace(
+        $functionAst.Extent.Text,
+        ('^function\s+' + [regex]::Escape($Name)),
+        "function global:$Name"
+    )
+    Invoke-Expression $definition
+}
+
+$setup = Parse-Product $SetupScript
+$pair = Parse-Product $PairScript
+
+function Test-ParserBootstrap {
+    Assert-True ($setup.Errors.Count -eq 0) "setup parses"
+    Assert-True ($pair.Errors.Count -eq 0) "pairing helper parses"
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+    Assert-True ($setupRaw -notmatch '(?i)-m\s+pip\s+install') "pairing QR never mutates the Hermes venv with pip"
+    Assert-True ($setupRaw -match 'function\s+Get-HermesUv' -and
+        $setupRaw -match 'run\s+--isolated\s+--no-project' -and
+        $setupRaw -match 'qrcode==8\.2') "pairing QR dependency is pinned in an isolated uv environment"
+    Assert-True ($setupRaw -notmatch '(?i)-Verb\s+RunAs') "setup never auto-elevates or opens a UAC window"
+    Assert-True ($setupRaw -match 'Assert-FirewallPreflight') "firewall privileges are checked before integration mutation"
+    Assert-True ($setupRaw -notmatch 'Install-RestrictedFirewallRuleElevated') "setup has no temporary elevation helper"
+    foreach ($temporaryName in @("BridgeNew", "ManifestFile", "PairingNew", "QrNew", "EnvNew", "Installer", "InstallerOut", "InstallerErr", "QrScript")) {
+        Assert-True ($setupRaw -match "Remove-OwnedSetupFiles[\s\S]+$temporaryName") "cleanup covers $temporaryName"
+    }
+    $launcherPath = Join-Path (Split-Path $SetupScript -Parent) "hermes-mobile-setup.vbs"
+    $launcherRaw = Get-Content -LiteralPath $launcherPath -Raw
+    Assert-True ($launcherRaw -notmatch '(?i)MsgBox|explorer\.exe|Invoke-Item|ShellExecute') "VBS launcher never opens status, QR, console, or viewer windows"
+    Assert-True ($launcherRaw -match 'shell\.Run\(command,\s*0,\s*True\)') "VBS launcher keeps its only child hidden and waits for cleanup"
+    Assert-True ($setupRaw -match 'CREATE_NO_WINDOW') "contained native children use CREATE_NO_WINDOW"
+    Assert-True ($setupRaw -match '-SkipComputerUse') "Console bootstrap skips unused Computer Use payloads"
+    # Regression (observed natively on Windows 11 25H2, PS 5.1): upstream
+    # `hermes dashboard --host 0.0.0.0` refuses a non-loopback bind without a
+    # registered auth provider and exits. Provisioning credentials only after
+    # the readiness gate deadlocked every fresh LAN install (240s timeout).
+    $credentialsStep = $setupRaw.IndexOf('Write-Audit "Dashboard credentials"')
+    $dashboardStart = $setupRaw.IndexOf('Start-HermesProcess "HermesConsole-Dashboard"')
+    $dashboardGate = $setupRaw.IndexOf('Wait-HermesService "dashboard"')
+    Assert-True ($credentialsStep -gt 0 -and $dashboardStart -gt 0 -and $credentialsStep -lt $dashboardStart) "dashboard credentials are provisioned before the dashboard start"
+    Assert-True ($dashboardGate -gt 0 -and $credentialsStep -lt $dashboardGate) "dashboard credentials are provisioned before the dashboard readiness gate"
+
+    $self = Parse-Product $PSCommandPath
+    Assert-True ($self.Errors.Count -eq 0) "review suite parses"
+    Import-ProductFunction $setup "Initialize-WindowsJobApi"
+    function global:Test-WindowsPlatform { return $true }
+    Initialize-WindowsJobApi
+    Assert-True ($null -ne ("HermesConsole.NativeJobProcess" -as [type])) "embedded Job Object C# helper compiles in the current runtime"
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-bootstrap-" + [Guid]::NewGuid().ToString("N"))
+    $fixtureHome = Join-Path $temp "must-not-exist"
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $oldReview = $env:HERMES_SETUP_REVIEW_MODE
+    $oldHome = $env:HERMES_HOME
+    $oldLocal = $env:LOCALAPPDATA
+    try {
+        $env:HERMES_SETUP_REVIEW_MODE = "synthetic-canary"
+        $env:HERMES_HOME = $fixtureHome
+        $env:LOCALAPPDATA = $temp
+        $hostExe = (Get-Process -Id $PID).Path
+
+        $fileRun = Invoke-ChildProcessCapture $hostExe @("-NoLogo", "-NoProfile", "-File", $SetupScript)
+        $fileOutput = @($fileRun.Output)
+        Assert-True ($fileRun.ExitCode -eq 0) "actual setup file safe smoke exits zero"
+        Assert-True (($fileOutput -join "`n") -match 'HERMES_SETUP_REVIEW_MODE_OK') "actual setup file reaches the safe fixture boundary"
+        Assert-True (-not (Test-Path -LiteralPath $fixtureHome)) "actual setup file safe smoke performs no target-home mutation"
+
+        $invalidRun = Invoke-ChildProcessCapture $hostExe @("-NoLogo", "-NoProfile", "-File", $SetupScript, "-InstallerTimeoutSec", "0")
+        $invalidOutput = @($invalidRun.Output)
+        Assert-True ($invalidRun.ExitCode -ne 0) "invalid installer timeout is rejected before launch"
+        Assert-True (($invalidOutput -join "`n") -match '(?i)InstallerTimeoutSec must be an integer between 1 and 86400') "invalid installer timeout reports stable English validation"
+        Assert-True (-not (Test-Path -LiteralPath $fixtureHome)) "invalid installer timeout performs no target-home mutation"
+
+        $escaped = $SetupScript.Replace("'", "''")
+        $iexCommand = "Get-Content -LiteralPath '$escaped' -Raw | Invoke-Expression"
+        $iexRun = Invoke-ChildProcessCapture $hostExe @("-NoLogo", "-NoProfile", "-Command", $iexCommand)
+        $iexOutput = @($iexRun.Output)
+        Assert-True ($iexRun.ExitCode -eq 0) "single-file pipeline/iex safe smoke exits zero"
+        Assert-True (($iexOutput -join "`n") -match 'HERMES_SETUP_REVIEW_MODE_OK') "single-file pipeline/iex needs no sibling helper"
+        Assert-True (-not (Test-Path -LiteralPath $fixtureHome)) "single-file pipeline/iex safe smoke performs no target-home mutation"
+    } finally {
+        $env:HERMES_SETUP_REVIEW_MODE = $oldReview
+        $env:HERMES_HOME = $oldHome
+        $env:LOCALAPPDATA = $oldLocal
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UrlPolicy {
+    foreach ($name in @(
+        "Test-Cgnat", "Test-PrivateIpv4", "Test-AllowedIpAddress",
+        "Test-PrivateHost", "Assert-AllowedServiceUrl", "Assert-HermesResponseStatus",
+        "Invoke-HermesJsonRequest"
+    )) { Import-ProductFunction $pair $name }
+
+    foreach ($url in @(
+        "http://10.1.2.3:8642",
+        "http://172.20.1.2:8642",
+        "http://192.168.2.2:8642",
+        "http://100.64.2.2:8642",
+        "http://169.254.2.2:8642",
+        "http://127.0.0.1:8642",
+        "http://[fd12:3456::2]:8642",
+        "http://[fe80::2]:8642",
+        "http://[::1]:8642",
+        "http://hermesbox:8642",
+        "http://node.tailnet.ts.net:8642",
+        "https://203.0.113.10:8642"
+    )) {
+        Assert-AllowedServiceUrl $url
+        Assert-True $true "allowed URL policy accepts $url"
+    }
+
+    foreach ($url in @(
+        "http://8.8.8.8:8642",
+        "http://[2001:4860:4860::8888]:8642",
+        "http://user:pass@192.168.1.2:8642",
+        "http://192.168.1.2:8642/path?token=canary",
+        "http://192.168.1.2:8642/#fragment"
+    )) {
+        [void](Assert-Throws { Assert-AllowedServiceUrl $url } 'Invalid|Public HTTP' "URL policy rejects $url")
+    }
+
+    [void](Assert-Throws {
+        Assert-HermesResponseStatus 302 $true
+    } 'Authenticated redirects are refused' "authenticated redirect status is rejected by the product policy")
+
+    Import-ProductFunction $setup "Get-RestrictedFirewallRuleState"
+    Import-ProductFunction $setup "Assert-FirewallPreflight"
+    $script:FirewallMutationCalls = 0
+    function global:Get-RestrictedFirewallRuleState { param($DisplayName, $Kind) return "Absent" }
+    function global:Test-CurrentProcessAdministrator { return $false }
+    function global:New-NetFirewallRule { $script:FirewallMutationCalls++ }
+    function global:Start-Process { $script:FirewallMutationCalls++ }
+    $firewallPairing = @{ Scheme = "http"; Kind = "mesh"; InterfaceIndex = $null }
+    [void](Assert-Throws {
+        Assert-FirewallPreflight $firewallPairing
+    } 'already elevated|no changes were made' "missing firewall privilege fails before setup mutation")
+    Assert-True ($script:FirewallMutationCalls -eq 0) "firewall preflight never opens UAC or mutates firewall"
+    function global:Get-RestrictedFirewallRuleState { param($DisplayName, $Kind) return "Conflict" }
+    function global:Test-CurrentProcessAdministrator { return $true }
+    [void](Assert-Throws {
+        Assert-FirewallPreflight $firewallPairing
+    } 'pre-existing.*not exact|not exact.*pre-existing' "non-exact pre-existing firewall rule fails even for administrator")
+    Assert-True ($script:FirewallMutationCalls -eq 0) "conflicting firewall preflight performs no mutation"
+
+    if ($env:OS -ne "Windows_NT") {
+        Write-Skip "loopback redirect integration is reserved for native Windows; this sandbox denies listener creation"
+        return
+    }
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-redirect-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $serverScript = Join-Path $temp "redirect-server.ps1"
+    $ready = Join-Path $temp "ready.txt"
+    $observed = Join-Path $temp "observed.txt"
+    $portFile = Join-Path $temp "port.txt"
+    $serverSource = @'
+param([string]$Ready, [string]$Observed, [string]$PortFile)
+$listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+$listener.Start()
+$port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+[IO.File]::WriteAllText($PortFile, [string]$port)
+[IO.File]::WriteAllText($Ready, "ready")
+try {
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    $count = 0
+    while ($count -lt 2 -and [DateTime]::UtcNow -lt $deadline) {
+        if (-not $listener.Pending()) { Start-Sleep -Milliseconds 25; continue }
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::ASCII, $false, 1024, $true)
+            $request = $reader.ReadLine()
+            $auth = ""
+            while ($true) {
+                $line = $reader.ReadLine()
+                if (-not $line) { break }
+                if ($line -match '^(?i)Authorization:\s*(.*)$') { $auth = $Matches[1] }
+            }
+            [IO.File]::AppendAllText($Observed, "$request|$auth`n")
+            $location = "http://127.0.0.1:$port/sink"
+            $response = "HTTP/1.1 302 Found`r`nLocation: $location`r`nContent-Length: 0`r`nConnection: close`r`n`r`n"
+            $bytes = [Text.Encoding]::ASCII.GetBytes($response)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush()
+            $count++
+        } finally { $client.Dispose() }
+    }
+} finally { $listener.Stop() }
+'@
+    [IO.File]::WriteAllText($serverScript, $serverSource, (New-Object Text.UTF8Encoding($false)))
+    $server = $null
+    try {
+        $hostExe = (Get-Process -Id $PID).Path
+        $server = Microsoft.PowerShell.Management\Start-Process -FilePath $hostExe -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-File", "`"$serverScript`"",
+            "-Ready", "`"$ready`"", "-Observed", "`"$observed`"", "-PortFile", "`"$portFile`""
+        ) -PassThru
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath $ready) -and $watch.Elapsed.TotalSeconds -lt 10) {
+            Start-Sleep -Milliseconds 25
+        }
+        Assert-True (Test-Path -LiteralPath $ready) "synthetic redirect fixture starts"
+        $port = [int][IO.File]::ReadAllText($portFile)
+        [void](Assert-Throws {
+            Invoke-HermesJsonRequest -Method Get -Url "http://127.0.0.1:$port/start" `
+                -Token "REVIEW-NONSECRET-CANARY" -TimeoutSeconds 3
+        } 'redirect' "authenticated request refuses redirect")
+        $server.WaitForExit(10000) | Out-Null
+        $lines = @([IO.File]::ReadAllLines($observed))
+        Assert-True ($lines.Count -eq 1) "authenticated redirect target receives no request"
+        Assert-True ($lines[0] -match 'REVIEW-NONSECRET-CANARY') "only the original loopback origin receives the synthetic canary"
+    } finally {
+        if ($server -and -not $server.HasExited) { $server.WaitForExit(10000) | Out-Null }
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-PairNoRepair {
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-pair-only-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $fixtureHome = Join-Path $temp "missing-home"
+    $oldHome = $env:HERMES_HOME
+    $oldLocal = $env:LOCALAPPDATA
+    $oldRaw = $env:HERMES_REPO_RAW
+    $oldReview = $env:HERMES_SETUP_REVIEW_MODE
+    try {
+        $env:HERMES_HOME = $fixtureHome
+        $env:LOCALAPPDATA = $temp
+        $env:HERMES_REPO_RAW = "http://127.0.0.1:1/never-used"
+        $env:HERMES_SETUP_REVIEW_MODE = $null
+        $hostExe = (Get-Process -Id $PID).Path
+        $pairRun = Invoke-ChildProcessCapture $hostExe @("-NoLogo", "-NoProfile", "-File", $PairScript)
+        $output = @($pairRun.Output)
+        Assert-True ($pairRun.ExitCode -ne 0) "pair-only fails closed when repair is required"
+        Assert-True (($output -join "`n") -match '(?i)-Repair') "pair-only requires explicit repair opt-in"
+        Assert-True (($output -join "`n") -notmatch '(?i)running the verified|repair completed') "pair-only does not start automatic repair"
+        Assert-True (-not (Test-Path -LiteralPath $fixtureHome)) "pair-only missing-installation failure performs no target-home mutation"
+
+        # Regression (observed natively on Windows 11 25H2, PS 5.1): probing the
+        # venv with `& $Python -c "import qrcode" 2>$null` under
+        # $ErrorActionPreference="Stop" turns native stderr into a terminating
+        # NativeCommandError and aborts pair before the link prints (exit 1).
+        $pairRaw = Get-Content -LiteralPath $PairScript -Raw
+        Assert-True ($pairRaw -notmatch '&\s+\$Python\s+-c\s+"import qrcode"') "pair QR never probes the venv interpreter directly under ErrorActionPreference Stop"
+        Assert-True ($pairRaw -match 'qrcode==8\.2' -and $pairRaw -match '"--isolated"') "pair QR reuses the pinned isolated uv runtime"
+        Assert-True ($pairRaw -match '\$ErrorActionPreference\s*=\s*"Continue"') "pair QR call site isolates native stderr from the Stop preference"
+        Assert-True ($pairRaw -match 'PYTHONIOENCODING\s*=\s*"utf-8"') "pair QR forces UTF-8 for the U+2588 block glyphs the legacy console codepage cannot encode"
+    } finally {
+        $env:HERMES_HOME = $oldHome
+        $env:LOCALAPPDATA = $oldLocal
+        $env:HERMES_REPO_RAW = $oldRaw
+        $env:HERMES_SETUP_REVIEW_MODE = $oldReview
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-Health {
+    Import-ProductFunction $setup "Test-HermesLauncher"
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-health-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $healthyPath = Join-Path $temp "healthy-hermes.exe"
+    $brokenPath = Join-Path $temp "broken-hermes.exe"
+    [IO.File]::WriteAllText($healthyPath, "synthetic")
+    [IO.File]::WriteAllText($brokenPath, "synthetic")
+    $script:ProbeCalls = 0
+    $script:TerminationTimeoutSeconds = 2
+    $script:MutationQuiescent = $true
+    $global:HealthyFixturePath = $healthyPath
+    function global:Invoke-ContainedProcess {
+        param($File, $Arguments, $TimeoutSeconds, $TerminationTimeoutSeconds, $StdoutPath, $StderrPath, $StandardInput)
+        $script:ProbeCalls++
+        if ($File -eq $global:HealthyFixturePath -and $Arguments -eq "--version") {
+            return [PSCustomObject]@{ ExitCode = 0; TimedOut = $false }
+        }
+        throw "synthetic launcher exit 42"
+    }
+    Assert-True (Test-HermesLauncher $healthyPath 2) "health requires a successful contained launcher invocation"
+    Assert-True (-not (Test-HermesLauncher $brokenPath 2)) "a broken launcher is never healthy"
+    Assert-True ($script:ProbeCalls -eq 2) "health verdict comes from the launcher invocation contract"
+
+    foreach ($name in @(
+        "Get-FreshHermesInstallArtifacts", "Remove-FreshHermesInstallArtifacts", "Install-HermesIfNeeded"
+    )) { Import-ProductFunction $setup $name }
+    $script:HealthChecks = 0
+    function global:Get-HermesExecutable { return "synthetic-hermes.exe" }
+    function global:Test-HermesLauncher {
+        param($Executable, $TimeoutSeconds)
+        $script:HealthChecks++
+        return $false
+    }
+    function global:Save-VerifiedHermesAgentInstaller {
+        param($Destination)
+        [IO.File]::WriteAllText($Destination, "# synthetic verified installer; never executed")
+    }
+    function global:Invoke-WebRequest {
+        param($Uri, $OutFile, [switch]$UseBasicParsing)
+        [IO.File]::WriteAllText($OutFile, "# synthetic installer; never executed")
+    }
+    function global:Invoke-ContainedProcess { return [PSCustomObject]@{ ExitCode = 0; TimedOut = $false } }
+    function global:Invoke-HiddenProcess { param($File, $Arguments, $TimeoutSeconds, $StdoutPath, $StderrPath, $Operation) }
+    function global:Get-PowerShellExecutable { return (Get-Process -Id $PID).Path }
+    function global:Write-Info { param($Message) }
+    function global:Write-Audit { param($Step, $State, $Detail) }
+    $global:AuditOnly = $false
+    $script:HermesInstallTimeoutSeconds = 2
+    $script:HermesAgentCommit = "0000000000000000000000000000000000000000"
+    $script:TerminationTimeoutSeconds = 2
+    $script:MutationQuiescent = $true
+    $script:OwnedTempPaths = New-Object System.Collections.Generic.List[string]
+    $global:HermesHome = Join-Path $temp "synthetic-hermes-home"
+    $global:InstallDir = Join-Path $global:HermesHome "hermes-agent"
+    $global:HermesBinDir = Join-Path $global:HermesHome "bin"
+    $global:AuditDir = $temp
+    $global:AttemptPaths = [PSCustomObject]@{
+        Installer = (Join-Path $temp "installer.ps1")
+        InstallerOut = (Join-Path $temp "installer.out")
+        InstallerErr = (Join-Path $temp "installer.err")
+    }
+    [void](Assert-Throws { Install-HermesIfNeeded } 'launcher.*health|health.*launcher|did not pass' "post-install launcher failure stays broken")
+    Assert-True ($script:HealthChecks -ge 2) "installer checks the launcher both before and after repair"
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+    Assert-True ($setupRaw -match 'Wait-HermesService\s+"gateway"\s+"http://127\.0\.0\.1:8642"\s+\$ApiKey\s+60') `
+        "clean native Gateway startup receives the proven readiness window"
+    Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Test-ContainmentFailure {
+    Import-ProductFunction $setup "Stop-ContainedProcessAfterTimeout"
+    $syntheticJob = New-Object PSObject
+    $syntheticJob | Add-Member -MemberType ScriptMethod -Name TerminateAndVerify -Value {
+        param([int]$Milliseconds)
+        return $false
+    }
+    $script:MutationQuiescent = $true
+    $script:UnresolvedContainedProcess = $null
+    $verified = Stop-ContainedProcessAfterTimeout $syntheticJob 25
+    Assert-True (-not $verified) "failed Job Object termination is never reported verified"
+    Assert-True (-not $script:MutationQuiescent) "failed termination forbids setup-lock release"
+    Assert-True ([object]::ReferenceEquals($syntheticJob, $script:UnresolvedContainedProcess)) "failed termination retains the exact containment owner"
+}
+
+function Test-LockOwnership {
+    foreach ($name in @(
+        "Test-WindowsPlatform", "Get-SetupLockName", "Enter-SetupLock", "Exit-SetupLock", "New-SetupAttemptPaths",
+        "Remove-OwnedSetupFiles", "Resolve-HermesHome", "ConvertTo-WindowsSid", "Test-SameWindowsIdentity",
+        "Assert-OwnedHermesHome", "Assert-OwnedHermesTasks", "Assert-OwnedPortRecords"
+    )) { Import-ProductFunction $setup $name }
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-lock-unit-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $owner = $null
+    $nextOwner = $null
+    $productOwner = $null
+    try {
+        Assert-True ((Get-SetupLockName (Join-Path $temp "home-a")) -eq
+            (Get-SetupLockName (Join-Path $temp "home-b"))) "single-flight mutex also serializes homes that share global task names"
+
+        $contenderHome = Join-Path $temp "contender-home"
+        New-Item -ItemType Directory -Path (Join-Path $contenderHome "console-services") -Force | Out-Null
+        $winnerPaths = New-SetupAttemptPaths -HermesHome $contenderHome
+        foreach ($path in @($winnerPaths.BridgeNew, $winnerPaths.ManifestFile, $winnerPaths.PairingNew)) {
+            [IO.File]::WriteAllText($path, "winner-canary")
+        }
+        $productLockName = Get-SetupLockName $contenderHome
+        $productOwner = Enter-SetupLock -Name $productLockName -TimeoutMilliseconds 100
+        $contenderScript = Join-Path $temp "lock-contender.ps1"
+        $enterLockSource = (Find-Function $setup.Ast "Enter-SetupLock").Extent.Text
+        [IO.File]::WriteAllText($contenderScript, @"
+param([string]`$Name)
+`$ErrorActionPreference = "Stop"
+$enterLockSource
+try {
+    `$lock = Enter-SetupLock -Name `$Name -TimeoutMilliseconds 1000
+    if (`$lock) { throw "Contender unexpectedly acquired the setup lock." }
+} catch {
+    Write-Output `$_.Exception.Message
+    exit 73
+}
+"@)
+        $hostExe = (Get-Process -Id $PID).Path
+        $contenderRun = Invoke-ChildProcessCapture $hostExe @("-NoLogo", "-NoProfile", "-File", $contenderScript, "-Name", $productLockName)
+        $contenderOutput = @($contenderRun.Output)
+        Assert-True ($contenderRun.ExitCode -eq 73) "actual cross-process setup-lock contender fails closed"
+        Assert-True (($contenderOutput -join "`n") -match 'Another Hermes Console setup owns the lock') "actual contender reports lock ownership"
+        Assert-True (([IO.File]::ReadAllText($winnerPaths.BridgeNew) -eq "winner-canary") -and
+            ([IO.File]::ReadAllText($winnerPaths.ManifestFile) -eq "winner-canary") -and
+            ([IO.File]::ReadAllText($winnerPaths.PairingNew) -eq "winner-canary")) "actual losing contender leaves winner staging untouched"
+        Exit-SetupLock -Lock $productOwner
+        $productOwner = $null
+
+        $attemptHome = Join-Path $temp "home"
+        New-Item -ItemType Directory -Path (Join-Path $attemptHome "console-services") -Force | Out-Null
+        $pathsA = New-SetupAttemptPaths -HermesHome $attemptHome
+        $pathsB = New-SetupAttemptPaths -HermesHome $attemptHome
+        Assert-True ($pathsA.BridgeNew -ne $pathsB.BridgeNew) "attempt staging paths are unique"
+        foreach ($path in @($pathsA.BridgeNew, $pathsA.ManifestFile, $pathsA.PairingNew)) {
+            [IO.File]::WriteAllText($path, "winner-canary")
+        }
+        Remove-OwnedSetupFiles -Paths $pathsB
+        Assert-True ((Test-Path $pathsA.BridgeNew) -and (Test-Path $pathsA.ManifestFile) -and (Test-Path $pathsA.PairingNew)) "loser cleanup cannot delete winner staging"
+
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) "hermes-console-setup.lock"))) `
+            "mutex lock leaves no filesystem artifact"
+        $nextOwner = Enter-SetupLock -Name $productLockName -TimeoutMilliseconds 100
+        Assert-True ($null -ne $nextOwner) "next setup acquires only after winner release"
+        $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+        Assert-True ($setupRaw -match 'Remove-Item\s+-LiteralPath\s+\$legacyPath') "setup removes the transitional lock file on release"
+
+        [void](Assert-Throws { Resolve-HermesHome -Candidate "relative-home" } 'absolute|ambiguous' "relative home is refused")
+        $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($temp))
+        [void](Assert-Throws { Resolve-HermesHome -Candidate $root } 'root|ambiguous' "filesystem-root home is refused")
+
+        $foreign = Join-Path $temp "foreign-home"
+        New-Item -ItemType Directory -Path $foreign | Out-Null
+        $marker = Join-Path $foreign "must-remain.txt"
+        [IO.File]::WriteAllText($marker, "untouched")
+        [void](Assert-Throws {
+            Assert-OwnedHermesHome -Path $foreign -CurrentIdentities @("DOMAIN\me") -KnownOwner "DOMAIN\other"
+        } 'owned|owner' "foreign home is refused")
+        Assert-True ([IO.File]::ReadAllText($marker) -eq "untouched") "foreign-home refusal performs no mutation"
+        Assert-True ($setupRaw -match '\$homeOwners\s*=\s*@\(Get-CurrentHomeOwnerIdentities\)') `
+            "home ownership uses an explicit elevated-owner identity set"
+        Assert-True ($setupRaw -match 'Assert-OwnedHermesHome[^\r\n]+\$homeOwners' -and
+            $setupRaw -match 'Assert-OwnedHermesTasks[^\r\n]+\$identities') `
+            "elevated home owners never broaden Scheduled Task principals"
+        Assert-True ($setupRaw -match 'Test-SameWindowsIdentity\s+\$task\.Principal\.UserId\s+\$CurrentIdentities') `
+            "Scheduled Task principals are compared by canonical Windows identity"
+        Assert-True ($setupRaw -match 'function\s+Stop-OwnedHermesListener' -and
+            $setupRaw -match 'Assert-OwnedPortRecords' -and $setupRaw -match '\.Handle' -and
+            $setupRaw -match '\.Kill\(' -and
+            $setupRaw -match 'Start-HermesProcess[\s\S]+Stop-OwnedHermesListener') `
+            "task restart terminates only a handle-anchored listener owned by the selected Hermes home"
+
+        $ownedFixtureHome = Join-Path $temp "owned-home"
+        $services = Join-Path $ownedFixtureHome "console-services"
+        $ownedTask = [PSCustomObject]@{
+            TaskName = "HermesConsole-Gateway"; TaskPath = "\"
+            Principal = [PSCustomObject]@{ UserId = "DOMAIN\me" }
+            Actions = @([PSCustomObject]@{
+                Execute = "C:\Windows\System32\wscript.exe"
+                Arguments = "//B //NoLogo `"$(Join-Path $services 'hermes-gateway.vbs')`""
+                WorkingDirectory = $ownedFixtureHome
+            })
+        }
+        Assert-OwnedHermesTasks -Tasks @($ownedTask) -CurrentIdentities @("DOMAIN\me") -ExpectedServicesDir $services
+        Assert-True $true "task owned by the current identity and exact Hermes home is accepted"
+        $ownedTask.Principal.UserId = "DOMAIN\other"
+        [void](Assert-Throws {
+            Assert-OwnedHermesTasks -Tasks @($ownedTask) -CurrentIdentities @("DOMAIN\me") -ExpectedServicesDir $services
+        } 'owned|owner|identity' "foreign task is refused")
+
+        $expectedExe = Join-Path $ownedFixtureHome "hermes-agent/venv/Scripts/hermes.exe"
+        $records = @([PSCustomObject]@{
+            Port = 8642; Pid = 42; ExecutablePath = $expectedExe; CommandLine = "`"$expectedExe`" gateway run"
+        })
+        Assert-OwnedPortRecords -Records $records -HermesHome $ownedFixtureHome
+        Assert-True $true "listener rooted in the selected Hermes home is accepted"
+        $records[0].ExecutablePath = "C:\foreign\hermes.exe"
+        $records[0].CommandLine = "C:\foreign\hermes.exe gateway run"
+        [void](Assert-Throws {
+            Assert-OwnedPortRecords -Records $records -HermesHome $ownedFixtureHome
+        } 'owned|listener|port' "foreign listener is refused")
+    } finally {
+        if ($productOwner) { Exit-SetupLock -Lock $productOwner }
+        if ($nextOwner) { Exit-SetupLock -Lock $nextOwner }
+        if ($owner) { Exit-SetupLock -Lock $owner }
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-TransactionRollback {
+    foreach ($name in @(
+        "Protect-AuditText", "Test-WindowsPlatform", "Get-IntegrationTaskNames", "Get-OwnedServiceProcessIds",
+        "New-SetupTransaction", "Add-TransactionFileSnapshot",
+        "Write-TransactionJournal", "Restore-TransactionFiles", "Complete-TransactionStorage",
+        "Invoke-SetupRollback", "Complete-SetupTransaction"
+    )) { Import-ProductFunction $setup $name }
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-transaction-unit-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $existing = Join-Path $temp "existing.bin"
+    $created = Join-Path $temp "created.bin"
+    $original = [byte[]](0, 255, 17, 128, 42)
+    [IO.File]::WriteAllBytes($existing, $original)
+    $originalWriteTime = [DateTime]::SpecifyKind([DateTime]::new(2024, 1, 2, 3, 4, 5), [DateTimeKind]::Utc)
+    [IO.File]::SetLastWriteTimeUtc($existing, $originalWriteTime)
+    $transaction = New-SetupTransaction -ParentDirectory $temp
+    try {
+        Add-TransactionFileSnapshot -Transaction $transaction -Label "existing" -Path $existing
+        Add-TransactionFileSnapshot -Transaction $transaction -Label "created" -Path $created
+        [IO.File]::WriteAllBytes($existing, [byte[]](9, 8, 7))
+        [IO.File]::SetLastWriteTimeUtc($existing, [DateTime]::UtcNow)
+        [IO.File]::WriteAllText($created, "attempt residue")
+
+        $script:firstHookRan = $false
+        $script:secondHookRan = $false
+        $result = Invoke-SetupRollback -Transaction $transaction -SkipNative -AdditionalRollback @(
+            { $script:firstHookRan = $true; throw "synthetic token=DO-NOT-PERSIST" },
+            { $script:secondHookRan = $true; throw "synthetic password=DO-NOT-PERSIST" }
+        )
+
+        Assert-True (-not $result.Complete) "synthetic rollback reports incomplete aggregation"
+        Assert-True ($result.Failures.Count -eq 2) "rollback aggregates every independent failure (actual: $($result.Failures.Count); $($result.Failures -join ','))"
+        Assert-True ($script:firstHookRan -and $script:secondHookRan) "rollback remains best-effort after a failure"
+        Assert-True ([Linq.Enumerable]::SequenceEqual([byte[]]$original, [IO.File]::ReadAllBytes($existing))) `
+            "rollback restores exact pre-mutation bytes"
+        Assert-True ([IO.File]::GetLastWriteTimeUtc($existing).Ticks -eq $originalWriteTime.Ticks) `
+            "rollback restores file metadata timestamps"
+        Assert-True (-not (Test-Path -LiteralPath $created)) "rollback restores original file non-existence"
+        Assert-True (Test-Path -LiteralPath $transaction.Directory) "incomplete rollback retains a recovery journal"
+        Assert-True (Test-Path -LiteralPath $transaction.PayloadDirectory -PathType Container) `
+            "incomplete rollback retains snapshot payloads required for recovery"
+        Assert-True (@(Get-ChildItem -LiteralPath $transaction.PayloadDirectory -File).Count -gt 0) `
+            "incomplete rollback keeps at least one preimage payload"
+        $journal = [IO.File]::ReadAllText($transaction.Journal)
+        Assert-True ($journal -notmatch 'DO-NOT-PERSIST|token=|password=') "transaction journal contains no injected secrets"
+    } finally {
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $cleanTemp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-transaction-clean-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $cleanTemp | Out-Null
+    $cleanFile = Join-Path $cleanTemp "clean.bin"
+    [IO.File]::WriteAllText($cleanFile, "before")
+    $cleanTransaction = New-SetupTransaction -ParentDirectory $cleanTemp
+    try {
+        Add-TransactionFileSnapshot -Transaction $cleanTransaction -Label "clean" -Path $cleanFile
+        [IO.File]::WriteAllText($cleanFile, "after")
+        $cleanResult = Invoke-SetupRollback -Transaction $cleanTransaction -SkipNative
+        Assert-True $cleanResult.Complete "portable file rollback completes without native hooks"
+        Assert-True ([IO.File]::ReadAllText($cleanFile) -eq "before") "complete rollback restores content"
+        Assert-True (-not (Test-Path -LiteralPath $cleanTransaction.Directory)) "complete rollback removes its transaction directory"
+    } finally {
+        Remove-Item -LiteralPath $cleanTemp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $commitTemp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-transaction-commit-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $commitTemp | Out-Null
+    $commitTransaction = New-SetupTransaction -ParentDirectory $commitTemp
+    try {
+        Complete-SetupTransaction -Transaction $commitTransaction
+        Assert-True $commitTransaction.Committed "commit records the logical transaction boundary"
+        Assert-True (-not (Test-Path -LiteralPath $commitTransaction.Directory)) `
+            "successful commit removes its transaction directory"
+    } finally {
+        Remove-Item -LiteralPath $commitTemp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # Native regression (observed on the Win11 validation VM): a failed attempt
+    # left a never-bound Dashboard process alive after a "complete" rollback,
+    # because quiescence only checked tasks and port listeners.
+    Import-ProductFunction $setup "Stop-AttemptServiceProcesses"
+    $sweepTemp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-sweep-native-" + [Guid]::NewGuid().ToString("N"))
+    $fakeBin = Join-Path $sweepTemp "home\hermes-agent\venv\Scripts"
+    New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
+    # The fixture must be self-contained: a bare pwsh.exe copy cannot start
+    # without its .NET host siblings, so always use Windows PowerShell 5.1.
+    Copy-Item -LiteralPath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") -Destination (Join-Path $fakeBin "python.exe")
+    $fakeExe = Join-Path $fakeBin "python.exe"
+    $global:InstallDir = Join-Path $sweepTemp "home\hermes-agent"
+    $preExistingId = 0
+    $orphanId = 0
+    try {
+        # Win32_Process.Create starts the fixtures outside this suite's own
+        # Job Object (earlier native cases constrain Start-Process children).
+        # Attribution is PID-based, not clock-based: Win32_Process.CreationDate
+        # is null under PowerShell 7, so the baseline must predate the attempt.
+        $preResult = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
+            -Arguments @{ CommandLine = "`"$fakeExe`" -NoProfile -Command `"Start-Sleep 120`" # dashboard --host 127.0.0.1" }
+        Assert-True ($preResult.ReturnValue -eq 0 -and $preResult.ProcessId -gt 0) "pre-existing synthetic process started"
+        $preExistingId = [int]$preResult.ProcessId
+        Start-Sleep -Seconds 2
+        $sweepTx = New-SetupTransaction -ParentDirectory $sweepTemp
+        $orphanResult = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
+            -Arguments @{ CommandLine = "`"$fakeExe`" -NoProfile -Command `"Start-Sleep 120`" # dashboard --host 0.0.0.0" }
+        Assert-True ($orphanResult.ReturnValue -eq 0 -and $orphanResult.ProcessId -gt 0) "attempt synthetic process started"
+        $orphanId = [int]$orphanResult.ProcessId
+        Start-Sleep -Seconds 2
+        $sweepFailures = @(Stop-AttemptServiceProcesses -Transaction $sweepTx)
+        Assert-True ($sweepFailures.Count -eq 0) "attempt process sweep reports no failures (actual: $($sweepFailures -join ','))"
+        Assert-True (-not (Get-Process -Id $orphanId -ErrorAction SilentlyContinue)) "attempt-started owned service process is terminated"
+        Assert-True ([bool](Get-Process -Id $preExistingId -ErrorAction SilentlyContinue)) "pre-attempt process of the same home is never killed"
+    } finally {
+        if ($preExistingId -gt 0) { Stop-Process -Id $preExistingId -Force -ErrorAction SilentlyContinue }
+        if ($orphanId -gt 0) { Stop-Process -Id $orphanId -Force -ErrorAction SilentlyContinue }
+        Remove-Variable -Name InstallDir -Scope Global -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $sweepTemp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+    $protected = Protect-AuditText "primary failure token=DO-NOT-PERSIST password=DO-NOT-PERSIST"
+    Assert-True ($protected -notmatch 'DO-NOT-PERSIST') "primary errors redact token and password values"
+    $taskNames = @(Get-IntegrationTaskNames)
+    Assert-True ($taskNames.Count -eq 5 -and @($taskNames | Select-Object -Unique).Count -eq 5) `
+        "transaction contract contains exactly five distinct Scheduled Tasks"
+    foreach ($label in @(
+        "env", "bridge", "bridge_rollback", "runner_gateway", "runner_dashboard",
+        "runner_bridge", "runner_restart_dashboard", "runner_restart_bridge",
+        "pairing", "pairing_qr"
+    )) {
+        Assert-True ($setupRaw -match "(?m)^\s*${label}\s*=") "transaction snapshots $label before mutation"
+    }
+    Assert-True ($setupRaw -match 'Export-ScheduledTask' -and $setupRaw -match 'Register-ScheduledTask[^\r\n]+-Xml') `
+        "native task rollback snapshots and restores exact XML"
+    Assert-True ($setupRaw -match 'Restore-TransactionTasks' -and $setupRaw -match 'Start-ScheduledTask') `
+        "native task rollback restores running state"
+    Assert-True ($setupRaw -notmatch 'Startup fallback|warning-and-continue|remote restart will be unavailable') `
+        "all five Scheduled Tasks are mandatory with no Startup fallback"
+    Assert-True ($setupRaw -match 'New-NetFirewallRule\s+-Name\s+\$ruleName' -and
+        $setupRaw -match 'Remove-NetFirewallRule\s+-Name\s+\$Transaction\.FirewallRuleName' -and
+        $setupRaw -notmatch 'Get-NetFirewallRule[^\r\n]+DisplayName[^\r\n]+\|\s*Remove-NetFirewallRule') `
+        "firewall rollback removes only the rule created by this attempt"
+    Assert-True ($setupRaw -match 'Write-ServiceRunner[\s\S]+Write-AtomicBytes' -and
+        $setupRaw -match '\$qrNew\s*=\s*\$AttemptPaths\.QrNew[\s\S]+Write-AtomicBytes\s+-Path\s+\$QrFile') `
+        "runners and pairing QR publish from atomic staging"
+    Assert-True ($setupRaw -match 'FileAttributes\]::ReparsePoint' -and
+        $setupRaw -match 'SecurityDescriptor' -and $setupRaw -match 'LastWriteTimeUtc') `
+        "transaction rejects filesystem links and snapshots security metadata"
+    Assert-True ($setupRaw -match 'Get-FreshHermesInstallArtifacts' -and
+        $setupRaw -match 'refusing to run the installer over it' -and
+        $setupRaw -match 'Remove-FreshHermesInstallArtifacts') `
+        "broken existing agent state is fail-closed and fresh installer failures are cleaned"
+    Assert-True ($setupRaw -match 'Remove-EmptyAttemptDirectories' -and
+        $setupRaw -match 'SetupDirectoryExistedAtStart') `
+        "rollback removes only empty setup directories created by this attempt"
+    # Credential provisioning precedes the Dashboard start (upstream refuses a
+    # non-loopback bind without auth), so it cannot be post-commit; the product
+    # must instead document the non-transactional residual explicitly.
+    Assert-True ($setupRaw -match 'survives rollback|does not remove the credential') `
+        "non-reversible credential provisioning is documented as surviving rollback"
+}
+
+function Test-FreshInstallCleanup {
+    foreach ($name in @(
+        "Get-FreshHermesInstallArtifacts", "Remove-FreshHermesInstallArtifacts", "Install-HermesIfNeeded"
+    )) { Import-ProductFunction $setup $name }
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-fresh-install-unit-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    try {
+        $global:HermesHome = $temp
+        $global:InstallDir = Join-Path $temp "hermes-agent"
+        $global:HermesBinDir = Join-Path $temp "bin"
+        $global:AuditOnly = $false
+        $global:AttemptPaths = [PSCustomObject]@{
+            Installer = (Join-Path $temp "installer.ps1")
+            InstallerOut = (Join-Path $temp "installer.stdout.log")
+            InstallerErr = (Join-Path $temp "installer.stderr.log")
+        }
+        $script:MutationQuiescent = $true
+        $script:HermesInstallTimeoutSeconds = 5
+        $script:HermesAgentCommit = "0000000000000000000000000000000000000000"
+        function global:Get-HermesExecutable { return $null }
+        function global:Test-HermesLauncher { return $false }
+        function global:Write-Audit {}
+        function global:Write-Info {}
+        function global:Get-PowerShellExecutable { return "synthetic-powershell" }
+        function global:Save-VerifiedHermesAgentInstaller {
+            param($Destination)
+            [IO.File]::WriteAllText($Destination, "synthetic verified installer")
+        }
+        function global:Invoke-WebRequest {
+            param($Uri, $OutFile, [switch]$UseBasicParsing)
+            [IO.File]::WriteAllText($OutFile, "synthetic installer")
+        }
+        function global:Invoke-HiddenProcess {
+            New-Item -ItemType Directory -Path $global:InstallDir, (Join-Path $global:HermesHome "node"), $global:HermesBinDir -Force | Out-Null
+            foreach ($name in @("hermes.exe", "hermes.cmd", "hermes.ps1", "hermes", "uv.exe", "uvx.exe", "uv", "uvx")) {
+                [IO.File]::WriteAllText((Join-Path $global:HermesBinDir $name), "attempt residue")
+            }
+            throw "synthetic installer failure"
+        }
+
+        [void](Assert-Throws { Install-HermesIfNeeded } 'synthetic installer failure' "fresh installer failure")
+        foreach ($artifact in @(Get-FreshHermesInstallArtifacts)) {
+            Assert-True (-not (Test-Path -LiteralPath $artifact)) "fresh failure removes $([IO.Path]::GetFileName($artifact))"
+        }
+        Assert-True (-not (Test-Path -LiteralPath $global:AttemptPaths.Installer)) "fresh failure removes downloaded installer"
+
+        New-Item -ItemType Directory -Path $global:InstallDir -Force | Out-Null
+        $marker = Join-Path $global:InstallDir "user-marker"
+        [IO.File]::WriteAllText($marker, "retain")
+        $script:installerInvocations = 0
+        function global:Invoke-WebRequest { $script:installerInvocations++ }
+        [void](Assert-Throws { Install-HermesIfNeeded } 'refusing to run the installer over it' "broken existing agent tree")
+        Assert-True ((Test-Path -LiteralPath $marker) -and $script:installerInvocations -eq 0) `
+            "broken existing tree is retained and installer is not invoked"
+    } finally {
+        foreach ($name in @(
+            "Get-HermesExecutable", "Test-HermesLauncher", "Write-Audit", "Write-Info",
+            "Get-PowerShellExecutable", "Save-VerifiedHermesAgentInstaller", "Invoke-WebRequest", "Invoke-HiddenProcess"
+        )) { Remove-Item -LiteralPath "Function:\global:$name" -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UpstreamInstallerPin {
+    Import-ProductFunction $setup "Save-VerifiedHermesAgentInstaller"
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-upstream-pin-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $target = Join-Path $temp "install.ps1"
+    try {
+        $verifiedBytes = [Text.Encoding]::UTF8.GetBytes("synthetic verified installer")
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $script:HermesAgentInstallerSha256 = ([BitConverter]::ToString($sha.ComputeHash($verifiedBytes))).Replace("-", "").ToLowerInvariant()
+        } finally { $sha.Dispose() }
+        $script:HermesAgentInstallerSize = $verifiedBytes.Length
+        $script:HermesAgentInstallerUrl = "https://example.invalid/immutable/install.ps1"
+        function global:Invoke-WebRequest {
+            param($Uri, $OutFile, [switch]$UseBasicParsing)
+            [IO.File]::WriteAllBytes($OutFile, $verifiedBytes)
+        }
+        Save-VerifiedHermesAgentInstaller -Destination $target
+        Assert-True ([IO.File]::ReadAllBytes($target).Length -eq $verifiedBytes.Length) "verified upstream installer is retained"
+
+        function global:Invoke-WebRequest {
+            param($Uri, $OutFile, [switch]$UseBasicParsing)
+            [IO.File]::WriteAllText($OutFile, "tampered installer")
+        }
+        $message = Assert-Throws { Save-VerifiedHermesAgentInstaller -Destination $target } `
+            'integrity verification failed' "tampered upstream installer"
+        Assert-True (-not (Test-Path -LiteralPath $target)) "tampered upstream installer is deleted before execution"
+
+        $raw = [IO.File]::ReadAllText($SetupScript)
+        $commitMatch = [regex]::Match($raw, '(?m)^\$script:HermesAgentCommit\s*=\s*"([a-f0-9]{40})"')
+        Assert-True $commitMatch.Success "Hermes Agent source is pinned to a full commit SHA"
+        $commit = $commitMatch.Groups[1].Value
+        Assert-True ($raw -match [regex]::Escape("raw.githubusercontent.com/NousResearch/hermes-agent/$commit/scripts/install.ps1")) `
+            "upstream installer URL uses the exact pinned commit"
+        Assert-True ($raw -match '(?m)^\$script:HermesAgentInstallerSha256\s*=\s*"[a-f0-9]{64}"' -and
+            $raw -match '(?m)^\$script:HermesAgentInstallerSize\s*=\s*\d+') `
+            "upstream installer bytes have pinned digest and size"
+        Assert-True ($raw -match 'Save-VerifiedHermesAgentInstaller[\s\S]+-Commit\s+\$\(\$script:HermesAgentCommit\)' -and
+            $raw -match '-Json') "verified installer pins installed source and requests structured failure status"
+        Assert-True ($raw -notmatch 'Invoke-WebRequest\s+-Uri\s+"https://hermes-agent\.nousresearch\.com/install\.ps1"') `
+            "setup never executes the mutable upstream installer endpoint"
+    } finally {
+        Remove-Item -LiteralPath "Function:\global:Invoke-WebRequest" -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-PlatformSupport {
+    Import-ProductFunction $setup "Test-WindowsPlatform"
+    Import-ProductFunction $setup "Assert-SupportedWindows"
+    $oldOs = $env:OS
+    $oldArch = $env:PROCESSOR_ARCHITECTURE
+    $oldWowArch = $env:PROCESSOR_ARCHITEW6432
+    try {
+        $env:OS = "Windows_NT"
+        $env:PROCESSOR_ARCHITECTURE = "AMD64"
+        $env:PROCESSOR_ARCHITEW6432 = $null
+        $script:SyntheticOs = [PSCustomObject]@{
+            ProductType = 1
+            Caption = "Microsoft Windows 11 Pro"
+            Version = "10.0.22631"
+            BuildNumber = "22631"
+        }
+        function global:Get-CimInstance { return $script:SyntheticOs }
+        Assert-SupportedWindows
+        Assert-True $true "Windows 11 x64 is accepted"
+
+        $env:PROCESSOR_ARCHITECTURE = "ARM64"
+        $script:SyntheticOs.Caption = "Microsoft Windows 10 Pro"
+        $script:SyntheticOs.BuildNumber = "19045"
+        Assert-SupportedWindows
+        Assert-True $true "Windows 10 ARM64 is accepted"
+
+        $script:SyntheticOs.ProductType = 3
+        $script:SyntheticOs.Caption = "Microsoft Windows Server 2025 Datacenter"
+        $script:SyntheticOs.Version = "10.0.26100"
+        $script:SyntheticOs.BuildNumber = "26100"
+        $env:PROCESSOR_ARCHITECTURE = "AMD64"
+        $message = Assert-Throws { Assert-SupportedWindows } `
+            'supports only Windows 10 and Windows 11 \(x64 or ARM64\).*Detected: Microsoft Windows Server 2025 Datacenter.*build 26100.*No changes were made' `
+            "Windows Server is rejected clearly"
+        Assert-True ($message -notmatch 'exception|stack|json|package') "unsupported-platform message contains no implementation noise"
+
+        $script:SyntheticOs.ProductType = 1
+        $script:SyntheticOs.Caption = "Microsoft Windows 8.1 Pro"
+        $script:SyntheticOs.Version = "6.3.9600"
+        $script:SyntheticOs.BuildNumber = "9600"
+        [void](Assert-Throws { Assert-SupportedWindows } 'supports only Windows 10 and Windows 11' "legacy Windows is rejected clearly")
+
+        $script:SyntheticOs.Caption = "Microsoft Windows 11 Pro"
+        $script:SyntheticOs.Version = "10.0.22631"
+        $script:SyntheticOs.BuildNumber = "22631"
+        $env:PROCESSOR_ARCHITECTURE = "x86"
+        [void](Assert-Throws { Assert-SupportedWindows } 'x64 or ARM64.*Detected:.*x86' "32-bit Windows is rejected clearly")
+
+        function global:Get-CimInstance { throw "synthetic CIM failure" }
+        [void](Assert-Throws { Assert-SupportedWindows } `
+            'could not verify the Windows version.*supports only Windows 10 and Windows 11.*No changes were made' `
+            "unverifiable Windows fails closed clearly")
+
+        $raw = [IO.File]::ReadAllText($SetupScript)
+        $preflight = $raw.LastIndexOf("`nAssert-SupportedWindows")
+        $lock = $raw.LastIndexOf("`n`$SetupLockHandle = Enter-SetupLock")
+        Assert-True ($preflight -ge 0 -and $lock -gt $preflight) "Windows support preflight runs before setup lock or mutation"
+    } finally {
+        $env:OS = $oldOs
+        $env:PROCESSOR_ARCHITECTURE = $oldArch
+        $env:PROCESSOR_ARCHITEW6432 = $oldWowArch
+        Remove-Item -LiteralPath "Function:\global:Get-CimInstance" -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ProcessDiagnostics {
+    Import-ProductFunction $setup "Invoke-HiddenProcess"
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-process-diagnostics-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $out = Join-Path $temp "installer.out.log"
+    $err = Join-Path $temp "installer.err.log"
+    try {
+        [IO.File]::WriteAllText($out, "installer progress that is not an error")
+        [IO.File]::WriteAllText($err, "+ ruamel-yaml==0.18.17 + six==1.17.0 + sniffio==1.3.1 + websockets==15.0.1 + youtube-transcript-api==1.2.4")
+        $script:TerminationTimeoutSeconds = 5
+        function global:Invoke-ContainedProcess {
+            return [PSCustomObject]@{ ExitCode = 23; TimedOut = $false }
+        }
+
+        $message = Assert-Throws {
+            Invoke-HiddenProcess -File "synthetic-installer" -Arguments "" -TimeoutSeconds 5 `
+                -StdoutPath $out -StderrPath $err -Operation "Hermes Agent installer"
+        } 'Hermes Agent installer failed \(exit code 23\)' "failed installer diagnostic"
+        Assert-True ($message -notmatch 'Hidden process|ruamel|sniffio|websockets|youtube-transcript|installer progress') `
+            "failed installer never dumps dependency progress or implementation jargon into the console"
+    } finally {
+        Remove-Item -LiteralPath "Function:\global:Invoke-ContainedProcess" -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ServiceRunnerEncoding {
+    foreach ($name in @("Write-AtomicBytes", "Write-ServiceRunner")) {
+        Import-ProductFunction $setup $name
+    }
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-runner-encoding-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $hadServicesDir = Test-Path "Variable:global:ServicesDir"
+    $oldServicesDir = if ($hadServicesDir) { $global:ServicesDir } else { $null }
+    $hadAuditOnly = Test-Path "Variable:global:AuditOnly"
+    $oldAuditOnly = if ($hadAuditOnly) { $global:AuditOnly } else { $null }
+    $hadAttemptId = Test-Path "Variable:global:AttemptId"
+    $oldAttemptId = if ($hadAttemptId) { $global:AttemptId } else { $null }
+    try {
+        $global:ServicesDir = $temp
+        $global:AuditOnly = $false
+        $global:AttemptId = "runner-encoding"
+        $script:RunnerChanged = @{}
+        $content = "' Unicode runner: café 漢字`r`nWScript.Quit 0`r`n"
+        $path = Write-ServiceRunner -Name "synthetic-runner" -Content $content
+        $bytes = [IO.File]::ReadAllBytes($path)
+        Assert-True ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) `
+            "VBS runner is written as UTF-16LE with a BOM for Windows Script Host"
+        Assert-True ([IO.File]::ReadAllText($path) -eq $content) `
+            "runner content round-trips through the same BOM-aware reader used for idempotence"
+
+        $script:RunnerChanged = @{}
+        [void](Write-ServiceRunner -Name "synthetic-runner" -Content $content)
+        Assert-True ($script:RunnerChanged["synthetic-runner"] -eq $false) `
+            "unchanged BOM runner is retained instead of rewritten on rerun"
+    } finally {
+        if ($hadServicesDir) { $global:ServicesDir = $oldServicesDir } else { Remove-Variable -Scope Global -Name ServicesDir -ErrorAction SilentlyContinue }
+        if ($hadAuditOnly) { $global:AuditOnly = $oldAuditOnly } else { Remove-Variable -Scope Global -Name AuditOnly -ErrorAction SilentlyContinue }
+        if ($hadAttemptId) { $global:AttemptId = $oldAttemptId } else { Remove-Variable -Scope Global -Name AttemptId -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-NativeJob {
+    $nativeWindows = $env:OS -eq "Windows_NT"
+    if (-not $nativeWindows) {
+        Write-Skip "Windows Job Object lifecycle requires native Windows; Linux parser/unit results are not lifecycle evidence"
+        return
+    }
+    foreach ($name in @(
+        "Test-WindowsPlatform", "Initialize-WindowsJobApi", "Invoke-ContainedProcess",
+        "Test-HermesLauncher", "Enter-SetupLock", "Exit-SetupLock"
+    )) {
+        Import-ProductFunction $setup $name
+    }
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-native-job-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $rootScript = Join-Path $temp "root.ps1"
+    $childScript = Join-Path $temp "child.ps1"
+    $heartbeat = Join-Path $temp "heartbeat.txt"
+    $out = Join-Path $temp "out.log"
+    $err = Join-Path $temp "err.log"
+    $lockName = "HermesNativeJob-" + [Guid]::NewGuid().ToString("N")
+    $lock = $null
+    [IO.File]::WriteAllText($childScript, 'param($Path); 1..150 | ForEach-Object { [IO.File]::AppendAllText($Path,"x"); Start-Sleep -Milliseconds 100 }')
+    [IO.File]::WriteAllText($rootScript, @'
+param($Child, $Heartbeat)
+$hostExe = (Get-Process -Id $PID).Path
+Start-Process -FilePath $hostExe -ArgumentList @("-NoProfile","-File","`"$Child`"","-Path","`"$Heartbeat`"") | Out-Null
+Start-Sleep -Seconds 15
+'@)
+    try {
+        $global:HermesHome = $temp
+        $script:TerminationTimeoutSeconds = 5
+        $hostExe = (Get-Process -Id $PID).Path
+        $arguments = "-NoLogo -NoProfile -File `"$rootScript`" -Child `"$childScript`" -Heartbeat `"$heartbeat`""
+        $script:MutationQuiescent = $true
+        $lock = Enter-SetupLock -Name $lockName -TimeoutMilliseconds 100
+        $message = Assert-Throws {
+            Invoke-ContainedProcess -File $hostExe -Arguments $arguments -TimeoutSeconds 2 `
+                -TerminationTimeoutSeconds 5 -StdoutPath $out -StderrPath $err
+        } 'terminated.*verified|verified.*quiescent' "timed-out contained process"
+        Assert-True $script:MutationQuiescent "verified Job Object termination permits later lock release"
+        $before = if (Test-Path $heartbeat) { (Get-Item $heartbeat).Length } else { 0 }
+        Start-Sleep -Milliseconds 800
+        $after = if (Test-Path $heartbeat) { (Get-Item $heartbeat).Length } else { 0 }
+        Assert-True ($before -eq $after) "descendant cannot keep mutating after verified timeout containment"
+
+        Exit-SetupLock -Lock $lock
+        $lock = $null
+        $afterTimeoutLock = Enter-SetupLock -Name $lockName -TimeoutMilliseconds 100
+        Assert-True ($null -ne $afterTimeoutLock) "lock becomes acquirable only after verified Job Object quiescence"
+        Exit-SetupLock -Lock $afterTimeoutLock
+
+        $healthyExe = Join-Path $temp "synthetic-hermes.exe"
+        $brokenExe = Join-Path $temp "synthetic-broken-hermes.exe"
+        $healthySource = 'public static class SyntheticHermes { public static int Main(string[] a) { return a.Length == 1 && a[0] == "--version" ? 0 : 9; } }'
+        $brokenSource = 'public static class SyntheticBrokenHermes { public static int Main(string[] a) { return 42; } }'
+        if ($PSVersionTable.PSEdition -eq "Core") {
+            $compiler = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+            if (-not (Test-Path -LiteralPath $compiler)) {
+                throw "Windows C# compiler is unavailable for the native executable fixture."
+            }
+            $healthyCs = Join-Path $temp "synthetic-hermes.cs"
+            $brokenCs = Join-Path $temp "synthetic-broken-hermes.cs"
+            Set-Content -LiteralPath $healthyCs -Value $healthySource -Encoding Ascii
+            Set-Content -LiteralPath $brokenCs -Value $brokenSource -Encoding Ascii
+            & $compiler /nologo /target:exe "/out:$healthyExe" $healthyCs
+            if ($LASTEXITCODE -ne 0) { throw "Failed to compile the healthy native fixture." }
+            & $compiler /nologo /target:exe "/out:$brokenExe" $brokenCs
+            if ($LASTEXITCODE -ne 0) { throw "Failed to compile the broken native fixture." }
+        } else {
+            Add-Type -TypeDefinition $healthySource -Language CSharp -OutputAssembly $healthyExe -OutputType ConsoleApplication
+            Add-Type -TypeDefinition $brokenSource -Language CSharp -OutputAssembly $brokenExe -OutputType ConsoleApplication
+        }
+        Assert-True (Test-HermesLauncher $healthyExe 5) "native synthetic Hermes launcher --version succeeds through the Job Object"
+        Assert-True (-not (Test-HermesLauncher $brokenExe 5)) "native synthetic broken launcher is not reported healthy"
+    } finally {
+        if ($lock) { Exit-SetupLock -Lock $lock }
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-TopLevelTimeouts {
+    # Regression (observed natively on Windows 11 25H2 build 26200, PS 5.1):
+    # the product params are declared [string] and keep that type constraint
+    # for the whole run, so the validated Int32 from Get-BoundedIntegerParameter
+    # is coerced back to string on assignment. Call sites that multiply the
+    # timeout must cast explicitly; otherwise "30" * 1000 repeats the string
+    # and Enter-SetupLock argument binding fails with an oversized value.
+    # This test rebuilds the product's real top level (param block, validator,
+    # conversion lines, call-site expressions) in a child file so the coercion
+    # semantics match production exactly; in-function emulation would shadow.
+    $paramBlock = $setup.Ast.ParamBlock
+    Assert-True ($null -ne $paramBlock) "product declares a param block"
+    $validator = Find-Function $setup.Ast "Get-BoundedIntegerParameter"
+    Assert-True ($null -ne $validator) "product defines Get-BoundedIntegerParameter"
+
+    $conversions = [regex]::Matches($setup.Source, '(?m)^\$(?:InstallerTimeoutSec|TerminationTimeoutSec|LockTimeoutSec) = Get-BoundedIntegerParameter[^\r\n]*$')
+    Assert-True ($conversions.Count -eq 3) "top level validates all three timeout params through Get-BoundedIntegerParameter"
+
+    $lockCall = [regex]::Match($setup.Source, 'Enter-SetupLock\s+-Name\s+\$SetupLockName\s+-TimeoutMilliseconds\s+\(([^)]+)\)')
+    Assert-True $lockCall.Success "top-level Enter-SetupLock call site found"
+
+    $storedLines = [regex]::Matches($setup.Source, '(?m)^\$script:(?:HermesInstallTimeoutSeconds|TerminationTimeoutSeconds) = [^\r\n]*$')
+    Assert-True ($storedLines.Count -eq 2) "top level stores install/termination timeouts in script variables"
+
+    $body = New-Object System.Collections.Generic.List[string]
+    $body.Add($paramBlock.Extent.Text)
+    $body.Add($validator.Extent.Text)
+    foreach ($line in $conversions) { $body.Add($line.Value) }
+    foreach ($line in $storedLines) { $body.Add($line.Value) }
+    $body.Add('$__ms = (' + $lockCall.Groups[1].Value + ')')
+    $body.Add('if ($__ms -is [int] -and $__ms -ge 0 -and $__ms -le 600000) { Write-Output "LOCK:INT:$__ms" } else { Write-Output "LOCK:BAD:" + $__ms.GetType().Name }')
+    $body.Add('foreach ($__v in @($script:HermesInstallTimeoutSeconds, $script:TerminationTimeoutSeconds)) { if ($__v -is [int]) { Write-Output "STORED:INT:$__v" } else { Write-Output "STORED:BAD:" + $__v.GetType().Name } }')
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-toplevel-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $fragmentFile = Join-Path $temp "toplevel-fragment.ps1"
+    try {
+        [IO.File]::WriteAllText($fragmentFile, ($body -join [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))
+        $hostExe = (Get-Process -Id $PID).Path
+        $run = Invoke-ChildProcessCapture $hostExe @("-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $fragmentFile)
+        $output = @($run.Output | ForEach-Object { [string]$_ })
+        Assert-True ($run.ExitCode -eq 0) "rebuilt top level executes cleanly (actual: $($output -join ' | '))"
+        Assert-True (($output -match '^LOCK:INT:30000$').Count -eq 1) "lock timeout milliseconds evaluate to Int32 30000, not a repeated string (actual: $($output -join ' | '))"
+        Assert-True (($output -match '^STORED:INT:').Count -eq 2) "install/termination timeouts stored as Int32, not coerced strings (actual: $($output -join ' | '))"
+    } finally {
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$cases = if ($Case -eq "All") {
+    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts")
+} else { @($Case) }
+
+foreach ($selected in $cases) {
+    $Case = $selected
+    & (Get-Command "Test-$selected" -CommandType Function)
+}
+
+Write-Host "RESULT: PASS=$script:Passed SKIP=$script:Skipped"

@@ -3,11 +3,24 @@
 
 param(
     [switch]$AuditOnly,
-    [switch]$NoFirewallPrompt
+    [switch]$NoFirewallPrompt,
+    [string]$InstallerTimeoutSec = "900",
+    [string]$TerminationTimeoutSec = "15",
+    [string]$LockTimeoutSec = "30"
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+function Get-BoundedIntegerParameter([string]$Name, [string]$Value, [int]$Minimum, [int]$Maximum) {
+    $parsed = 0
+    if (-not [int]::TryParse($Value, [ref]$parsed) -or $parsed -lt $Minimum -or $parsed -gt $Maximum) {
+        throw "$Name must be an integer between $Minimum and $Maximum. No changes were made."
+    }
+    return $parsed
+}
+$InstallerTimeoutSec = Get-BoundedIntegerParameter "InstallerTimeoutSec" $InstallerTimeoutSec 1 86400
+$TerminationTimeoutSec = Get-BoundedIntegerParameter "TerminationTimeoutSec" $TerminationTimeoutSec 1 300
+$LockTimeoutSec = Get-BoundedIntegerParameter "LockTimeoutSec" $LockTimeoutSec 0 600
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $RepoRaw = if ($env:HERMES_REPO_RAW) {
@@ -15,30 +28,930 @@ $RepoRaw = if ($env:HERMES_REPO_RAW) {
 } else {
     "https://raw.githubusercontent.com/xP3ta/hermes-setup/main"
 }
-$HermesHome = if ($env:HERMES_HOME) {
-    $env:HERMES_HOME
-} else {
-    Join-Path $env:LOCALAPPDATA "hermes"
+$script:HermesAgentCommit = "b1f003e18633298d549668b8e186af84cca45b76"
+$script:HermesAgentInstallerUrl = "https://raw.githubusercontent.com/NousResearch/hermes-agent/b1f003e18633298d549668b8e186af84cca45b76/scripts/install.ps1"
+$script:HermesAgentInstallerSha256 = "226c70a90ad47e8a4d34cb11aca4ecbeb649e2f9b67fbd009ea49791de2d56f5"
+$script:HermesAgentInstallerSize = 245718
+function Resolve-HermesHome([string]$Candidate) {
+    if ([string]::IsNullOrWhiteSpace($Candidate) -or
+        -not [IO.Path]::IsPathRooted($Candidate)) {
+        throw "HERMES_HOME is ambiguous; configure one absolute, non-root path."
+    }
+    try { $resolved = [IO.Path]::GetFullPath($Candidate) } catch {
+        throw "HERMES_HOME is ambiguous or invalid."
+    }
+    $root = [IO.Path]::GetPathRoot($resolved)
+    if (-not $root -or $resolved.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) -eq
+        $root.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)) {
+        throw "HERMES_HOME cannot be a filesystem root."
+    }
+    return $resolved.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
 }
+
+$homeCandidate = if ($env:HERMES_HOME) {
+    $env:HERMES_HOME
+} elseif ($env:LOCALAPPDATA) {
+    Join-Path $env:LOCALAPPDATA "hermes"
+} else {
+    throw "HERMES_HOME is ambiguous because LOCALAPPDATA is unavailable."
+}
+$HermesHome = Resolve-HermesHome $homeCandidate
 $InstallDir = Join-Path $HermesHome "hermes-agent"
+$HermesBinDir = Join-Path $HermesHome "bin"
 $ServicesDir = Join-Path $HermesHome "console-services"
 $LogsDir = Join-Path $HermesHome "logs"
 $AuditDir = Join-Path $HermesHome "audit"
+$script:SetupDirectoryExistedAtStart = @{}
+foreach ($setupDirectory in @($HermesHome, $HermesBinDir, $ServicesDir, $LogsDir, $AuditDir)) {
+    $script:SetupDirectoryExistedAtStart[$setupDirectory] = Test-Path -LiteralPath $setupDirectory -PathType Container
+}
 $AuditLog = Join-Path $AuditDir "safe-setup-audit.jsonl"
 $EnvFile = Join-Path $HermesHome ".env"
 $BridgeTarget = Join-Path $HermesHome "hermes_bridge.py"
-$BridgeNew = "$BridgeTarget.new"
 $BridgeBackup = "$BridgeTarget.rollback"
-$ManifestFile = Join-Path $HermesHome "bridge-release.json.new"
 $PairingFile = Join-Path $ServicesDir "pairing.json"
 $QrFile = Join-Path $ServicesDir "pairing-qr.png"
+$AttemptId = [Guid]::NewGuid().ToString("N")
+$BridgeNew = "$BridgeTarget.$AttemptId.new"
+$ManifestFile = Join-Path $HermesHome "bridge-release.$AttemptId.new"
+$PairingNew = "$PairingFile.$AttemptId.new"
+$EnvNew = "$EnvFile.$AttemptId.new"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:TaskDefinitionsChanged = @{}
 $script:RunnerChanged = @{}
 $script:BridgeChanged = $false
-$script:HermesInstallTimeoutSeconds = 900
+$script:HermesInstallTimeoutSeconds = [int]$InstallerTimeoutSec
+$script:TerminationTimeoutSeconds = [int]$TerminationTimeoutSec
+$script:MutationQuiescent = $true
+$script:UnresolvedContainedProcess = $null
+$script:SetupTransaction = $null
+$script:IntegrationCommitted = $false
+$script:FirewallRuleCreatedName = ""
 
-New-Item -ItemType Directory -Force -Path $HermesHome, $ServicesDir, $LogsDir, $AuditDir | Out-Null
+function Test-WindowsPlatform {
+    return $env:OS -eq "Windows_NT"
+}
+
+function Assert-SupportedWindows {
+    $support = "Hermes Console Setup supports only Windows 10 and Windows 11 (x64 or ARM64)."
+    if (-not (Test-WindowsPlatform)) {
+        throw "$support Detected: non-Windows operating system. This system is not supported. No changes were made."
+    }
+
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        if ($null -eq $os) { throw "Operating system inventory was empty." }
+        [version]$version = $null
+        if (-not [Version]::TryParse([string]$os.Version, [ref]$version)) {
+            throw "Operating system version was invalid."
+        }
+        $productType = [int]$os.ProductType
+        $build = [string]$os.BuildNumber
+        if ([string]::IsNullOrWhiteSpace($build)) { throw "Operating system build was empty." }
+    } catch {
+        throw "Hermes Console Setup could not verify the Windows version. It supports only Windows 10 and Windows 11 (x64 or ARM64). No changes were made."
+    }
+
+    $nativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    $architecture = switch ([string]$nativeArchitecture) {
+        "AMD64" { "x64"; break }
+        "ARM64" { "ARM64"; break }
+        "x86" { "x86"; break }
+        default { "unknown"; break }
+    }
+    $caption = (([string]$os.Caption -replace '[\r\n]+', ' ').Trim())
+    if ([string]::IsNullOrWhiteSpace($caption)) { $caption = "unknown Windows edition" }
+    if ($caption.Length -gt 120) { $caption = $caption.Substring(0, 120) }
+    $detected = "$caption, version $version, build $build, $architecture"
+
+    $supportedEdition = $productType -eq 1
+    $supportedVersion = $version.Major -eq 10
+    $supportedArchitecture = $architecture -in @("x64", "ARM64")
+    if (-not ($supportedEdition -and $supportedVersion -and $supportedArchitecture)) {
+        throw "$support Detected: $detected. This system is not supported. No changes were made."
+    }
+}
+
+function Get-SetupLockName([string]$Path) {
+    # Scheduled Task and Startup names are per-user globals, so competing
+    # homes must share one lock rather than coordinating by home. A named
+    # mutex preserves atomic exclusivity without leaving a lock file behind.
+    if (Test-WindowsPlatform) {
+        $scope = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    } else {
+        $scope = "{0}@{1}" -f [Environment]::UserName, [Environment]::MachineName
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($scope)
+        $digest = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace("-", "")
+    } finally {
+        $sha.Dispose()
+    }
+    $name = "xPeta.HermesConsole.Setup.$digest"
+    if (Test-WindowsPlatform) { return "Global\$name" }
+    return $name
+}
+
+function Enter-SetupLock {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [ValidateRange(0, 600000)][int]$TimeoutMilliseconds = 30000
+    )
+    $mutex = New-Object Threading.Mutex($false, $Name)
+    $acquired = $false
+    $legacyHandle = $null
+    $legacyPath = Join-Path ([IO.Path]::GetTempPath()) "hermes-console-setup.lock"
+    try {
+        try {
+            $acquired = $mutex.WaitOne($TimeoutMilliseconds)
+        } catch [Threading.AbandonedMutexException] {
+            # Windows transferred ownership because the previous process died.
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            throw "Another Hermes Console setup owns the lock; no changes were made."
+        }
+        try {
+            # Transitional dual lock: excludes the published file-lock version.
+            # This file exists only while setup runs and is removed on release.
+            $legacyHandle = [IO.File]::Open($legacyPath, [IO.FileMode]::OpenOrCreate,
+                [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        } catch [IO.IOException] {
+            throw "Another Hermes Console setup owns the legacy lock; no changes were made."
+        }
+        return [PSCustomObject]@{
+            Mutex = $mutex
+            LegacyHandle = $legacyHandle
+            LegacyPath = $legacyPath
+        }
+    } catch {
+        if ($legacyHandle) { $legacyHandle.Dispose() }
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Exit-SetupLock($Lock) {
+    if ($null -eq $Lock) { return }
+    $legacyPath = $Lock.LegacyPath
+    try {
+        if ($Lock.LegacyHandle) { $Lock.LegacyHandle.Dispose() }
+        if ($legacyPath) {
+            Remove-Item -LiteralPath $legacyPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($legacyPath -and (Test-Path -LiteralPath $legacyPath)) {
+            throw "Could not clean the temporary setup lock: $legacyPath"
+        }
+    } finally {
+        try { $Lock.Mutex.ReleaseMutex() } finally { $Lock.Mutex.Dispose() }
+    }
+}
+
+function New-SetupAttemptPaths([string]$HermesHome) {
+    $id = [Guid]::NewGuid().ToString("N")
+    $services = Join-Path $HermesHome "console-services"
+    return [PSCustomObject]@{
+        BridgeNew = (Join-Path $HermesHome "hermes_bridge.py.$id.new")
+        ManifestFile = (Join-Path $HermesHome "bridge-release.$id.new")
+        PairingNew = (Join-Path $services "pairing.json.$id.new")
+        QrNew = (Join-Path $services "pairing-qr.png.$id.new")
+        EnvNew = (Join-Path $HermesHome ".env.$id.new")
+        Installer = (Join-Path ([IO.Path]::GetTempPath()) "hermes-agent-install-$id.ps1")
+        InstallerOut = (Join-Path $services "hermes-install-$id.out.log")
+        InstallerErr = (Join-Path $services "hermes-install-$id.err.log")
+        QrScript = (Join-Path $services "make-pairing-qr-$id.py")
+    }
+}
+
+function Remove-OwnedSetupFiles($Paths) {
+    if ($null -eq $Paths) { return }
+    foreach ($name in @(
+        "BridgeNew", "ManifestFile", "PairingNew", "QrNew", "EnvNew", "Installer",
+        "InstallerOut", "InstallerErr", "QrScript"
+    )) {
+        $property = $Paths.PSObject.Properties[$name]
+        if ($property -and $property.Value) {
+            Remove-Item -LiteralPath ([string]$property.Value) -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-IntegrationTaskNames {
+    return @(
+        "HermesConsole-Gateway", "HermesConsole-Dashboard", "HermesConsole-MobileBridge",
+        "HermesConsole-Restart-Dashboard", "HermesConsole-Restart-MobileBridge"
+    )
+}
+
+function Get-ExactScheduledTask([string]$TaskName) {
+    Import-Module ScheduledTasks -ErrorAction Stop
+    $matches = @(Get-ScheduledTask -TaskPath "\" -ErrorAction Stop | Where-Object {
+        $_.TaskName -eq $TaskName -and $_.TaskPath -eq "\"
+    })
+    if ($matches.Count -gt 1) { throw "Scheduled Task '$TaskName' is ambiguous." }
+    if ($matches.Count -eq 1) { return $matches[0] }
+    return $null
+}
+
+function Get-IntegrationRunnerMap {
+    return [ordered]@{
+        "HermesConsole-Gateway" = "hermes-gateway.vbs"
+        "HermesConsole-Dashboard" = "hermes-dashboard.vbs"
+        "HermesConsole-MobileBridge" = "hermes-bridge.vbs"
+        "HermesConsole-Restart-Dashboard" = "restart-hermes-dashboard.vbs"
+        "HermesConsole-Restart-MobileBridge" = "restart-hermes-bridge.vbs"
+    }
+}
+
+function Write-TransactionJournal($Transaction, [string]$Event, [string]$State, [string]$Code = "") {
+    if ($null -eq $Transaction -or -not $Transaction.Journal) { return }
+    $safeEvent = if ($Event -match '^[A-Za-z0-9_.-]{1,64}$') { $Event } else { "redacted" }
+    $safeState = if ($State -match '^[A-Za-z0-9_.-]{1,32}$') { $State } else { "redacted" }
+    $safeCode = if ($Code -match '^[A-Za-z0-9_.-]{0,96}$') { $Code } else { "redacted" }
+    $row = [ordered]@{
+        time = (Get-Date).ToUniversalTime().ToString('o')
+        event = $safeEvent
+        state = $safeState
+        code = $safeCode
+    }
+    [IO.File]::AppendAllText(
+        $Transaction.Journal,
+        (($row | ConvertTo-Json -Compress) + [Environment]::NewLine),
+        (New-Object Text.UTF8Encoding($false))
+    )
+}
+
+function New-SetupTransaction {
+    [CmdletBinding()]
+    param([string]$ParentDirectory = ([IO.Path]::GetTempPath()))
+    $directory = Join-Path $ParentDirectory ("hermes-console-transaction-" + [Guid]::NewGuid().ToString("N"))
+    $payload = Join-Path $directory "payload"
+    New-Item -ItemType Directory -Path $payload -Force | Out-Null
+    if (Test-WindowsPlatform) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $acl = New-Object Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor `
+            [Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+            $identity.User,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            [Security.AccessControl.PropagationFlags]::None,
+            [Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $directory -AclObject $acl
+        Set-Acl -LiteralPath $payload -AclObject $acl
+    }
+    $transaction = [PSCustomObject]@{
+        Directory = $directory
+        PayloadDirectory = $payload
+        Journal = (Join-Path $directory "journal.jsonl")
+        FileSnapshots = (New-Object Collections.ArrayList)
+        TaskSnapshots = (New-Object Collections.ArrayList)
+        FirewallRuleName = ""
+        Committed = $false
+        BaselineServicePids = @()
+    }
+    # Baseline of owned service processes at attempt start: the rollback sweep
+    # terminates only processes absent from it. PID attribution avoids clocks
+    # entirely (Win32_Process.CreationDate is null under PowerShell 7).
+    if (Get-Command Get-OwnedServiceProcessIds -ErrorAction SilentlyContinue) {
+        $transaction.BaselineServicePids = @(Get-OwnedServiceProcessIds)
+    }
+    Write-TransactionJournal $transaction "transaction" "started"
+    return $transaction
+}
+
+function Add-TransactionFileSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Transaction,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    if ($Label -notmatch '^[A-Za-z0-9_.-]{1,64}$') { throw "Invalid transaction snapshot label." }
+    $exists = Test-Path -LiteralPath $Path
+    $snapshotPath = ""
+    $attributes = $null
+    $creationTicks = $null
+    $lastWriteTicks = $null
+    $securityDescriptor = ""
+    if ($exists) {
+        $item = Get-Item -LiteralPath $Path -Force
+        $linkType = if ($item.PSObject.Properties["LinkType"]) { [string]$item.LinkType } else { "" }
+        if ($item.PSIsContainer -or
+            (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            -not [string]::IsNullOrWhiteSpace($linkType)) {
+            throw "Transaction path is not a regular standalone file: $Path"
+        }
+        $snapshotPath = Join-Path $Transaction.PayloadDirectory ("file-{0:D3}.bin" -f $Transaction.FileSnapshots.Count)
+        [IO.File]::WriteAllBytes($snapshotPath, [IO.File]::ReadAllBytes($Path))
+        $attributes = [int64]$item.Attributes
+        $creationTicks = [int64]$item.CreationTimeUtc.Ticks
+        $lastWriteTicks = [int64]$item.LastWriteTimeUtc.Ticks
+        if (Test-WindowsPlatform) {
+            $securityDescriptor = (Get-Acl -LiteralPath $Path).Sddl
+        }
+    }
+    [void]$Transaction.FileSnapshots.Add([PSCustomObject]@{
+        Label = $Label
+        Path = $Path
+        Existed = [bool]$exists
+        SnapshotPath = $snapshotPath
+        Attributes = $attributes
+        CreationTimeUtcTicks = $creationTicks
+        LastWriteTimeUtcTicks = $lastWriteTicks
+        SecurityDescriptor = $securityDescriptor
+    })
+    Write-TransactionJournal $Transaction "file-snapshot" "ok" $Label
+}
+
+function Add-TransactionTaskSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Transaction,
+        [Parameter(Mandatory = $true)][string]$TaskName
+    )
+    Import-Module ScheduledTasks -ErrorAction Stop
+    $task = Get-ExactScheduledTask $TaskName
+    $exists = $null -ne $task
+    $xmlPath = ""
+    $enabled = $false
+    $running = $false
+    if ($exists) {
+        $xml = Export-ScheduledTask -TaskName $TaskName -TaskPath "\" -ErrorAction Stop
+        $xmlPath = Join-Path $Transaction.PayloadDirectory ("task-{0:D2}.xml" -f $Transaction.TaskSnapshots.Count)
+        [IO.File]::WriteAllText($xmlPath, [string]$xml, (New-Object Text.UTF8Encoding($false)))
+        $enabled = [bool]$task.Settings.Enabled
+        $running = $task.State.ToString() -eq "Running"
+    }
+    [void]$Transaction.TaskSnapshots.Add([PSCustomObject]@{
+        Name = $TaskName
+        Existed = [bool]$exists
+        XmlPath = $xmlPath
+        Enabled = $enabled
+        Running = $running
+    })
+    Write-TransactionJournal $Transaction "task-snapshot" "ok" $TaskName
+}
+
+function Initialize-SetupTransaction {
+    $transaction = New-SetupTransaction
+    try {
+        $files = [ordered]@{
+            env = $EnvFile
+            bridge = $BridgeTarget
+            bridge_rollback = $BridgeBackup
+            runner_gateway = (Join-Path $ServicesDir "hermes-gateway.vbs")
+            runner_dashboard = (Join-Path $ServicesDir "hermes-dashboard.vbs")
+            runner_bridge = (Join-Path $ServicesDir "hermes-bridge.vbs")
+            runner_restart_dashboard = (Join-Path $ServicesDir "restart-hermes-dashboard.vbs")
+            runner_restart_bridge = (Join-Path $ServicesDir "restart-hermes-bridge.vbs")
+            pairing = $PairingFile
+            pairing_qr = $QrFile
+            audit = $AuditLog
+        }
+        $startup = [Environment]::GetFolderPath("Startup")
+        if (-not $startup) { throw "The per-user Startup folder is unavailable for transaction snapshot." }
+        foreach ($name in @(Get-IntegrationTaskNames)) {
+            $label = "startup_" + ($name -replace '[^A-Za-z0-9_.-]', '_')
+            $files[$label] = Join-Path $startup "$name.lnk"
+        }
+        foreach ($entry in $files.GetEnumerator()) {
+            Add-TransactionFileSnapshot -Transaction $transaction -Label ([string]$entry.Key) -Path ([string]$entry.Value)
+        }
+        foreach ($name in @(Get-IntegrationTaskNames)) {
+            Add-TransactionTaskSnapshot -Transaction $transaction -TaskName $name
+        }
+        Write-TransactionJournal $transaction "snapshot" "complete"
+        return $transaction
+    } catch {
+        Complete-TransactionStorage -Transaction $transaction -Complete | Out-Null
+        throw
+    }
+}
+
+function Restore-TransactionFiles {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Transaction)
+    $failures = New-Object Collections.Generic.List[string]
+    foreach ($snapshot in @($Transaction.FileSnapshots)) {
+        try {
+            if (Test-Path -LiteralPath $snapshot.Path) {
+                $current = Get-Item -LiteralPath $snapshot.Path -Force
+                $currentLinkType = if ($current.PSObject.Properties["LinkType"]) { [string]$current.LinkType } else { "" }
+                if ($current.PSIsContainer -or
+                    (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+                    -not [string]::IsNullOrWhiteSpace($currentLinkType)) {
+                    throw "Rollback target is not a regular standalone file: $($snapshot.Path)"
+                }
+            }
+            if ($snapshot.Existed) {
+                if (-not (Test-Path -LiteralPath $snapshot.SnapshotPath -PathType Leaf)) {
+                    throw "Snapshot payload is unavailable."
+                }
+                $parent = Split-Path -Parent $snapshot.Path
+                if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+                    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                }
+                $stage = "$($snapshot.Path).restore-$([Guid]::NewGuid().ToString('N'))"
+                $discard = "$($snapshot.Path).discard-$([Guid]::NewGuid().ToString('N'))"
+                try {
+                    [IO.File]::WriteAllBytes($stage, [IO.File]::ReadAllBytes($snapshot.SnapshotPath))
+                    if (Test-Path -LiteralPath $snapshot.Path -PathType Leaf) {
+                        [IO.File]::Replace($stage, $snapshot.Path, $discard, $true)
+                    } else {
+                        Move-Item -LiteralPath $stage -Destination $snapshot.Path
+                    }
+                } finally {
+                    Remove-Item -LiteralPath $stage, $discard -Force -ErrorAction SilentlyContinue
+                }
+                $expected = (Get-FileHash -LiteralPath $snapshot.SnapshotPath -Algorithm SHA256).Hash
+                $actual = (Get-FileHash -LiteralPath $snapshot.Path -Algorithm SHA256).Hash
+                if ($actual -ne $expected) { throw "Restored bytes did not verify." }
+                [IO.File]::SetLastWriteTimeUtc(
+                    $snapshot.Path,
+                    [DateTime]::new([int64]$snapshot.LastWriteTimeUtcTicks, [DateTimeKind]::Utc)
+                )
+                if (Test-WindowsPlatform) {
+                    [IO.File]::SetCreationTimeUtc(
+                        $snapshot.Path,
+                        [DateTime]::new([int64]$snapshot.CreationTimeUtcTicks, [DateTimeKind]::Utc)
+                    )
+                    [IO.File]::SetAttributes($snapshot.Path, [IO.FileAttributes][int64]$snapshot.Attributes)
+                    if (-not [string]::IsNullOrWhiteSpace([string]$snapshot.SecurityDescriptor)) {
+                        $acl = New-Object Security.AccessControl.FileSecurity
+                        $acl.SetSecurityDescriptorSddlForm([string]$snapshot.SecurityDescriptor)
+                        Set-Acl -LiteralPath $snapshot.Path -AclObject $acl
+                    }
+                }
+            } else {
+                Remove-Item -LiteralPath $snapshot.Path -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $snapshot.Path) { throw "Attempt-created file remains." }
+            }
+            Write-TransactionJournal $Transaction "file-restore" "ok" $snapshot.Label
+        } catch {
+            $code = "file." + $snapshot.Label
+            [void]$failures.Add($code)
+            Write-TransactionJournal $Transaction "file-restore" "failed" $code
+        }
+    }
+    return @($failures)
+}
+
+function Get-OwnedServiceProcessIds {
+    # Owned identity = executable inside this install dir AND a service verb in
+    # the command line. Anything outside that identity is never touched.
+    $rootVar = Get-Variable -Name InstallDir -ErrorAction SilentlyContinue
+    if (-not $rootVar -or -not $rootVar.Value) { return @() }
+    $agentRoot = [IO.Path]::GetFullPath([string]$rootVar.Value)
+    $pattern = '(?i)(gateway\s+run|dashboard\s+--host|hermes_bridge\.py)'
+    return @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -and $_.ExecutablePath -and ($_.CommandLine -match $pattern) -and
+            [IO.Path]::GetFullPath([string]$_.ExecutablePath).StartsWith($agentRoot, [StringComparison]::OrdinalIgnoreCase)
+        } | ForEach-Object { [int]$_.ProcessId }
+    )
+}
+
+function Stop-AttemptServiceProcesses {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Transaction)
+    # Port-listener checks miss owned processes that never bound (observed
+    # natively: a Dashboard whose launch was refused pre-bind survived a
+    # "complete" rollback). Sweep owned service processes absent from the
+    # attempt baseline; pre-existing ones are never killed and failures stay
+    # visible in the rollback report.
+    $failures = New-Object Collections.Generic.List[string]
+    $baseline = @($Transaction.BaselineServicePids)
+    foreach ($id in @(Get-OwnedServiceProcessIds)) {
+        if ($baseline -contains $id) { continue }
+        try {
+            Stop-Process -Id $id -Force -ErrorAction Stop
+            $deadline = [DateTime]::Now.AddSeconds(5)
+            while ((Get-Process -Id $id -ErrorAction SilentlyContinue) -and [DateTime]::Now -lt $deadline) {
+                Start-Sleep -Milliseconds 100
+            }
+            if (Get-Process -Id $id -ErrorAction SilentlyContinue) { throw "still running" }
+            Write-TransactionJournal $Transaction "process-sweep" "ok" "pid $id"
+        } catch {
+            [void]$failures.Add("process.$id")
+            Write-TransactionJournal $Transaction "process-sweep" "failed" "pid $id"
+        }
+    }
+    return $failures.ToArray()
+}
+
+function Stop-TransactionTasksAndVerify {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Transaction)
+    Import-Module ScheduledTasks -ErrorAction Stop
+    $failures = New-Object Collections.Generic.List[string]
+    foreach ($name in @(Get-IntegrationTaskNames)) {
+        try {
+            if (Get-ExactScheduledTask $name) {
+                Stop-ScheduledTask -TaskName $name -TaskPath "\" -ErrorAction SilentlyContinue
+            }
+        } catch {
+            [void]$failures.Add("task-query.$name")
+        }
+    }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $running = @()
+        foreach ($name in @(Get-IntegrationTaskNames)) {
+            try {
+                $task = Get-ExactScheduledTask $name
+                if ($task -and $task.State.ToString() -eq "Running") { $running += $name }
+            } catch {
+                if (-not $failures.Contains("task-query.$name")) {
+                    [void]$failures.Add("task-query.$name")
+                }
+            }
+        }
+        if ($running.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 100
+    } while ($watch.Elapsed.TotalSeconds -lt 10)
+    foreach ($name in $running) { [void]$failures.Add("task-running.$name") }
+    foreach ($service in @(
+        @{ Port = 8642; Name = "HermesConsole-Gateway" },
+        @{ Port = 9119; Name = "HermesConsole-Dashboard" },
+        @{ Port = 9131; Name = "HermesConsole-MobileBridge" }
+    )) {
+        try {
+            $records = @(Get-ExistingHermesPortRecords | Where-Object { $_.Port -eq $service.Port })
+            if ($records.Count -gt 0) { Stop-OwnedHermesListener $service.Port $service.Name }
+            if (@(Get-ExistingHermesPortRecords | Where-Object { $_.Port -eq $service.Port }).Count -gt 0) {
+                throw "Listener remains."
+            }
+        } catch {
+            [void]$failures.Add("listener.$($service.Port)")
+        }
+    }
+    foreach ($failure in @(Stop-AttemptServiceProcesses -Transaction $Transaction)) {
+        [void]$failures.Add($failure)
+    }
+    if ($failures.Count -gt 0) { throw "Integration process quiescence was not verified." }
+    Write-TransactionJournal $Transaction "quiescence" "verified"
+}
+
+function Restore-TransactionTasks {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Transaction)
+    $failures = New-Object Collections.Generic.List[string]
+    Import-Module ScheduledTasks -ErrorAction Stop
+    foreach ($snapshot in @($Transaction.TaskSnapshots)) {
+        try {
+            $current = Get-ExactScheduledTask $snapshot.Name
+            if ($current) {
+                Unregister-ScheduledTask -TaskName $snapshot.Name -TaskPath "\" -Confirm:$false -ErrorAction Stop
+            }
+            if ($snapshot.Existed) {
+                $xml = [IO.File]::ReadAllText($snapshot.XmlPath)
+                Register-ScheduledTask -TaskName $snapshot.Name -TaskPath "\" -Xml $xml -Force -ErrorAction Stop | Out-Null
+                if ($snapshot.Enabled) {
+                    Enable-ScheduledTask -TaskName $snapshot.Name -TaskPath "\" -ErrorAction Stop | Out-Null
+                } else {
+                    Disable-ScheduledTask -TaskName $snapshot.Name -TaskPath "\" -ErrorAction Stop | Out-Null
+                }
+            }
+            Write-TransactionJournal $Transaction "task-definition-restore" "ok" $snapshot.Name
+        } catch {
+            $code = "task-definition." + $snapshot.Name
+            [void]$failures.Add($code)
+            Write-TransactionJournal $Transaction "task-definition-restore" "failed" $snapshot.Name
+        }
+    }
+    foreach ($snapshot in @($Transaction.TaskSnapshots | Where-Object { $_.Existed -and $_.Running })) {
+        try {
+            Start-ScheduledTask -TaskName $snapshot.Name -TaskPath "\" -ErrorAction Stop
+            $restored = Get-ScheduledTask -TaskName $snapshot.Name -TaskPath "\" -ErrorAction Stop
+            if ($restored.State.ToString() -ne "Running") { throw "Running state was not restored." }
+            Write-TransactionJournal $Transaction "task-running-restore" "ok" $snapshot.Name
+        } catch {
+            $code = "task-running." + $snapshot.Name
+            [void]$failures.Add($code)
+            Write-TransactionJournal $Transaction "task-running-restore" "failed" $snapshot.Name
+        }
+    }
+    return @($failures)
+}
+
+function Remove-AttemptFirewallRule {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Transaction)
+    if (-not $Transaction.FirewallRuleName) { return }
+    Import-Module NetSecurity -ErrorAction Stop
+    $rule = Get-NetFirewallRule -Name $Transaction.FirewallRuleName -ErrorAction SilentlyContinue
+    if ($rule) {
+        Remove-NetFirewallRule -Name $Transaction.FirewallRuleName -ErrorAction Stop
+    }
+    if (Get-NetFirewallRule -Name $Transaction.FirewallRuleName -ErrorAction SilentlyContinue) {
+        throw "Attempt-created firewall rule remains."
+    }
+    Write-TransactionJournal $Transaction "firewall-rollback" "ok"
+}
+
+function Complete-TransactionStorage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Transaction, [switch]$Complete)
+    if (-not (Test-Path -LiteralPath $Transaction.Directory)) { return $true }
+    if ($Complete) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $Transaction.Directory -Force -ErrorAction SilentlyContinue)) {
+            if ($item.FullName -ne $Transaction.Journal) {
+                Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $payloadRemaining = @(Get-ChildItem -LiteralPath $Transaction.Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $Transaction.Journal })
+        if ($payloadRemaining.Count -gt 0) { return $false }
+        Remove-Item -LiteralPath $Transaction.Journal -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Transaction.Directory -Force -ErrorAction SilentlyContinue
+        return -not (Test-Path -LiteralPath $Transaction.Directory)
+    }
+    # On incomplete rollback retain the complete private preimage. Removing a
+    # payload after its restore failed would destroy the recovery path.
+    Write-TransactionJournal $Transaction "cleanup" "incomplete" "private recovery payload retained"
+    return (Test-Path -LiteralPath $Transaction.PayloadDirectory -PathType Container)
+}
+
+function Invoke-SetupRollback {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Transaction,
+        [switch]$SkipNative,
+        [scriptblock[]]$AdditionalRollback = @()
+    )
+    $failures = New-Object Collections.Generic.List[string]
+    $quiescent = $true
+    Write-TransactionJournal $Transaction "rollback" "started"
+    if (-not $SkipNative) {
+        try { Stop-TransactionTasksAndVerify -Transaction $Transaction } catch {
+            $quiescent = $false
+            $script:MutationQuiescent = $false
+            [void]$failures.Add("quiescence")
+            Write-TransactionJournal $Transaction "quiescence" "failed"
+        }
+    }
+    if ($quiescent) {
+        foreach ($failure in @(Restore-TransactionFiles -Transaction $Transaction)) {
+            [void]$failures.Add([string]$failure)
+        }
+        if (-not $SkipNative) {
+            try {
+                foreach ($failure in @(Restore-TransactionTasks -Transaction $Transaction)) {
+                    [void]$failures.Add([string]$failure)
+                }
+            } catch {
+                [void]$failures.Add("task-restore")
+                Write-TransactionJournal $Transaction "task-restore" "failed"
+            }
+        }
+    } else {
+        [void]$failures.Add("restore-skipped-unverified-quiescence")
+        Write-TransactionJournal $Transaction "restore" "skipped" "unverified-quiescence"
+    }
+    if (-not $SkipNative) {
+        try { Remove-AttemptFirewallRule -Transaction $Transaction } catch {
+            [void]$failures.Add("firewall")
+            Write-TransactionJournal $Transaction "firewall-rollback" "failed"
+        }
+    }
+    foreach ($rollback in @($AdditionalRollback)) {
+        try { & $rollback } catch {
+            [void]$failures.Add("synthetic-hook")
+            Write-TransactionJournal $Transaction "rollback-hook" "failed"
+        }
+    }
+    $complete = $failures.Count -eq 0
+    Write-TransactionJournal $Transaction "rollback" $(if ($complete) { "complete" } else { "incomplete" }) `
+        $(if ($complete) { "" } else { "failure-count-$($failures.Count)" })
+    if (-not (Complete-TransactionStorage -Transaction $Transaction -Complete:$complete)) {
+        [void]$failures.Add("transaction-storage")
+        $complete = $false
+        Write-TransactionJournal $Transaction "storage-cleanup" "failed"
+        [void](Complete-TransactionStorage -Transaction $Transaction)
+    }
+    return [PSCustomObject]@{ Complete = $complete; Failures = @($failures) }
+}
+
+function Complete-SetupTransaction {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Transaction)
+    Write-TransactionJournal $Transaction "transaction" "committing"
+    # This is the logical commit point. Cleanup failures after it must never
+    # roll back a fully verified integration with a partially deleted snapshot.
+    $Transaction.Committed = $true
+    $script:IntegrationCommitted = $true
+    if (-not (Complete-TransactionStorage -Transaction $Transaction -Complete)) {
+        [void](Complete-TransactionStorage -Transaction $Transaction)
+        throw "Post-commit transaction storage cleanup failed; Windows integration remains committed."
+    }
+}
+
+function Write-AtomicBytes([string]$Path, [byte[]]$Bytes) {
+    $stage = "$Path.$AttemptId.stage"
+    $discard = "$Path.$AttemptId.discard"
+    try {
+        [IO.File]::WriteAllBytes($stage, $Bytes)
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($stage, $Path, $discard, $true)
+        } else {
+            Move-Item -LiteralPath $stage -Destination $Path
+        }
+    } finally {
+        Remove-Item -LiteralPath $stage, $discard -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-CurrentSetupIdentities {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $values = @($identity.Name)
+    if ($identity.User) { $values += $identity.User.Value }
+    return @($values | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-CurrentHomeOwnerIdentities {
+    $values = @(Get-CurrentSetupIdentities)
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $administratorsSid = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544")
+        $values += $administratorsSid.Value
+        try {
+            $values += $administratorsSid.Translate([Security.Principal.NTAccount]).Value
+        } catch {
+            # The well-known SID itself remains locale independent.
+        }
+    }
+    return @($values | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function ConvertTo-WindowsSid([string]$Identity) {
+    if ([string]::IsNullOrWhiteSpace($Identity)) { return $null }
+    try {
+        if ($Identity -match '^S-\d(?:-\d+)+$') {
+            return (New-Object Security.Principal.SecurityIdentifier($Identity)).Value
+        }
+        $account = New-Object Security.Principal.NTAccount($Identity)
+        return $account.Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return $null
+    }
+}
+
+function Test-SameWindowsIdentity([string]$Candidate, [string[]]$CurrentIdentities) {
+    if ($Candidate -in $CurrentIdentities) { return $true }
+    $candidateSid = ConvertTo-WindowsSid $Candidate
+    if (-not $candidateSid) { return $false }
+    foreach ($current in $CurrentIdentities) {
+        $currentSid = ConvertTo-WindowsSid $current
+        if ($currentSid -and $currentSid -eq $candidateSid) { return $true }
+    }
+    return $false
+}
+
+function Assert-OwnedHermesHome {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$CurrentIdentities,
+        [string]$KnownOwner = ""
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer) { throw "The selected Hermes home is not a directory." }
+    $owner = $KnownOwner
+    if (-not $owner) {
+        try { $owner = (Get-Acl -LiteralPath $Path -ErrorAction Stop).Owner } catch {
+            throw "The selected Hermes home owner could not be verified."
+        }
+    }
+    if (-not $owner -or $owner -notin $CurrentIdentities) {
+        throw "The selected Hermes home is owned by another identity; no changes were made."
+    }
+}
+
+function Assert-OwnedHermesTasks {
+    [CmdletBinding()]
+    param(
+        [object[]]$Tasks,
+        [Parameter(Mandatory = $true)][string[]]$CurrentIdentities,
+        [Parameter(Mandatory = $true)][string]$ExpectedServicesDir
+    )
+    $runners = @{
+        "HermesConsole-Gateway" = "hermes-gateway.vbs"
+        "HermesConsole-Dashboard" = "hermes-dashboard.vbs"
+        "HermesConsole-MobileBridge" = "hermes-bridge.vbs"
+        "HermesConsole-Restart-Dashboard" = "restart-hermes-dashboard.vbs"
+        "HermesConsole-Restart-MobileBridge" = "restart-hermes-bridge.vbs"
+    }
+    $legacy = @("Hermes Gateway", "Hermes Dashboard", "Hermes Mobile Bridge")
+    foreach ($task in @($Tasks)) {
+        if ($task.TaskName -in $legacy) {
+            throw "Legacy task '$($task.TaskName)' has ambiguous ownership; remove it explicitly before repair."
+        }
+        if (-not $runners.ContainsKey([string]$task.TaskName)) { continue }
+        if ($task.TaskPath -ne "\" -or -not $task.Principal -or
+            -not (Test-SameWindowsIdentity $task.Principal.UserId $CurrentIdentities)) {
+            throw "Task '$($task.TaskName)' is not owned by the current Hermes identity."
+        }
+        $actions = @($task.Actions)
+        if ($actions.Count -ne 1) { throw "Task '$($task.TaskName)' has an ambiguous action set." }
+        $action = $actions[0]
+        $expectedRunner = Join-Path $ExpectedServicesDir $runners[[string]$task.TaskName]
+        $expectedArguments = "//B //NoLogo `"$expectedRunner`""
+        $executeName = @(([string]$action.Execute) -split '[\\/]')[-1]
+        $expectedWorkingDirectory = Split-Path $ExpectedServicesDir -Parent
+        if ($executeName -ne "wscript.exe" -or $action.Arguments -ne $expectedArguments -or
+            $action.WorkingDirectory -ne $expectedWorkingDirectory) {
+            throw "Task '$($task.TaskName)' does not belong to the selected Hermes home."
+        }
+    }
+}
+
+function Assert-OwnedPortRecords {
+    [CmdletBinding()]
+    param([object[]]$Records, [Parameter(Mandatory = $true)][string]$HermesHome)
+    $trimChars = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $prefix = $HermesHome.TrimEnd($trimChars) + [IO.Path]::DirectorySeparatorChar
+    foreach ($record in @($Records)) {
+        $executable = [string]$record.ExecutablePath
+        $commandLine = [string]$record.CommandLine
+        $owned = $executable.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+            $commandLine.IndexOf($prefix, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        if (-not $owned) {
+            throw "TCP port $($record.Port) has a listener not owned by the selected Hermes home (PID $($record.Pid))."
+        }
+    }
+}
+
+function Get-ExistingHermesTasks {
+    $command = Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue
+    if (-not $command) { throw "Scheduled Task ownership cannot be verified on this Windows host." }
+    try {
+        $all = @(Get-ScheduledTask -ErrorAction Stop)
+    } catch { throw "Scheduled Task ownership cannot be verified: $($_.Exception.Message)" }
+    $names = @(
+        "HermesConsole-Gateway", "HermesConsole-Dashboard", "HermesConsole-MobileBridge",
+        "HermesConsole-Restart-Dashboard", "HermesConsole-Restart-MobileBridge",
+        "Hermes Gateway", "Hermes Dashboard", "Hermes Mobile Bridge"
+    )
+    return @($all | Where-Object { $_.TaskName -in $names })
+}
+
+function Get-ExistingHermesPortRecords {
+    if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
+        throw "TCP listener ownership cannot be verified on this Windows host."
+    }
+    $records = New-Object System.Collections.Generic.List[object]
+    foreach ($connection in @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+        Where-Object { $_.LocalPort -in @(8642, 9119, 9131) })) {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($connection.OwningProcess)" -ErrorAction Stop
+        if (-not $process) { throw "TCP listener ownership could not be resolved for PID $($connection.OwningProcess)." }
+        $records.Add([PSCustomObject]@{
+            Port = [int]$connection.LocalPort
+            Pid = [int]$connection.OwningProcess
+            ExecutablePath = [string]$process.ExecutablePath
+            CommandLine = [string]$process.CommandLine
+        })
+    }
+    return $records.ToArray()
+}
+
+function Assert-SetupOwnership {
+    if (-not (Test-WindowsPlatform)) { throw "This setup must run on native Windows." }
+    $identities = @(Get-CurrentSetupIdentities)
+    $homeOwners = @(Get-CurrentHomeOwnerIdentities)
+    Assert-OwnedHermesHome -Path $HermesHome -CurrentIdentities $homeOwners
+    $tasks = @(Get-ExistingHermesTasks)
+    Assert-OwnedHermesTasks -Tasks $tasks -CurrentIdentities $identities -ExpectedServicesDir $ServicesDir
+    Assert-OwnedPortRecords -Records @(Get-ExistingHermesPortRecords) -HermesHome $HermesHome
+
+    $startup = [Environment]::GetFolderPath("Startup")
+    if (-not $startup) { throw "The per-user Startup folder cannot be inspected." }
+    $current = Get-IntegrationRunnerMap
+    foreach ($name in $current.Keys) {
+        $path = Join-Path $startup "$name.lnk"
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $runner = Join-Path $ServicesDir $current[$name]
+        Assert-OwnedHermesShortcut $path $name $runner
+    }
+    foreach ($name in @("Hermes Gateway", "Hermes Dashboard", "Hermes Mobile Bridge")) {
+        if (Test-Path -LiteralPath (Join-Path $startup "$name.lnk")) {
+            throw "Legacy Startup shortcut '$name' has ambiguous ownership; remove it explicitly before repair."
+        }
+    }
+}
 
 function Protect-AuditText([string]$Text) {
     if (-not $Text) { return "" }
@@ -55,11 +968,13 @@ function Write-Audit([string]$Step, [string]$State, [string]$Detail = "") {
         state = $State
         detail = $safe
     }
-    [IO.File]::AppendAllText(
-        $AuditLog,
-        (($row | ConvertTo-Json -Compress) + [Environment]::NewLine),
-        $Utf8NoBom
-    )
+    if (-not $AuditOnly) {
+        [IO.File]::AppendAllText(
+            $AuditLog,
+            (($row | ConvertTo-Json -Compress) + [Environment]::NewLine),
+            $Utf8NoBom
+        )
+    }
     $color = if ($State -eq 'OK') { 'Green' } elseif ($State -in @('INFO', 'SKIP')) { 'Cyan' } else { 'Yellow' }
     $suffix = if ($safe) { ": $safe" } else { "" }
     Write-Host "[$State] $Step$suffix" -ForegroundColor $color
@@ -118,24 +1033,24 @@ function Test-HermesService(
     try {
         if ($PhoneFacing) { Assert-AllowedServiceUrl $base }
         if ($Kind -eq "gateway") {
-            $health = Invoke-RestMethod -Method Get -Uri "$base/health" -TimeoutSec 6
+            $health = Invoke-HermesJsonRequest -Method Get -Url "$base/health" -TimeoutSeconds 6
             if ($health.status -ne "ok" -or $health.platform -ne "hermes-agent") {
                 return $false
             }
-            $sessions = Invoke-RestMethod -Method Get -Uri "$base/api/sessions" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 6
+            $sessions = Invoke-HermesJsonRequest -Method Get -Url "$base/api/sessions" -Token $Token -TimeoutSeconds 6
             return $sessions.object -eq "list" -and $null -ne $sessions.data
         }
         if ($Kind -eq "bridge") {
-            $health = Invoke-RestMethod -Method Get -Uri "$base/bridge/health" -TimeoutSec 6
+            $health = Invoke-HermesJsonRequest -Method Get -Url "$base/bridge/health" -TimeoutSeconds 6
             if ($health.status -ne "ok" -or -not $health.version) { return $false }
             if ($ExpectedVersion -and $health.version -ne $ExpectedVersion) { return $false }
-            $caps = Invoke-RestMethod -Method Get -Uri "$base/bridge/capabilities" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 6
+            $caps = Invoke-HermesJsonRequest -Method Get -Url "$base/bridge/capabilities" -Token $Token -TimeoutSeconds 6
             return ($caps.object -eq "hermes.bridge.capabilities") -and
                 ($caps.operations.self_update -eq $true) -and
                 (@($caps.scopes) -contains "read") -and
                 (@($caps.scopes) -contains "config")
         }
-        $status = Invoke-RestMethod -Method Get -Uri "$base/api/status" -TimeoutSec 6
+        $status = Invoke-HermesJsonRequest -Method Get -Url "$base/api/status" -TimeoutSeconds 6
         return [bool]$status.version -and $status.gateway_running -eq $true
     } catch {
         return $false
@@ -220,9 +1135,7 @@ function Ensure-ApiKey {
     }
     if (-not $inserted) { $out.Add("API_SERVER_KEY=$key") }
     $payload = [string]::Join([Environment]::NewLine, $out) + [Environment]::NewLine
-    $newFile = "$EnvFile.new"
-    [IO.File]::WriteAllText($newFile, $payload, $Utf8NoBom)
-    Move-Item -LiteralPath $newFile -Destination $EnvFile -Force
+    Write-AtomicBytes -Path $EnvFile -Bytes ($Utf8NoBom.GetBytes($payload))
     Write-Audit "API key" "OK" "Generated or normalized in .env"
     return $key
 }
@@ -242,6 +1155,21 @@ function Test-PrivateIpv4([string]$Address) {
     return ($bytes[0] -eq 10) -or
         ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) -or
         ($bytes[0] -eq 192 -and $bytes[1] -eq 168)
+}
+
+function Test-AllowedIpAddress([string]$Address) {
+    $parsed = $null
+    if (-not ([Net.IPAddress]::TryParse($Address, [ref]$parsed))) { return $false }
+    if ($parsed.IsIPv4MappedToIPv6) { $parsed = $parsed.MapToIPv4() }
+    $bytes = $parsed.GetAddressBytes()
+    if ($bytes.Length -eq 4) {
+        return (Test-PrivateIpv4 $parsed.IPAddressToString) -or
+            (Test-Cgnat $parsed.IPAddressToString) -or
+            $bytes[0] -eq 127 -or
+            ($bytes[0] -eq 169 -and $bytes[1] -eq 254)
+    }
+    return $parsed.Equals([Net.IPAddress]::IPv6Loopback) -or
+        $parsed.IsIPv6LinkLocal -or (($bytes[0] -band 0xFE) -eq 0xFC)
 }
 
 function Get-ReachableHost {
@@ -291,15 +1219,19 @@ function Get-ReachableHost {
 }
 
 function Test-PrivateHost([string]$HostName) {
-    if (-not $HostName -or $HostName -eq "localhost") { return $false }
-    if ($HostName.EndsWith(".local") -or $HostName.EndsWith(".ts.net") -or $HostName -notmatch '\.') {
+    if (-not $HostName) { return $false }
+    $parsed = $null
+    if ([Net.IPAddress]::TryParse($HostName, [ref]$parsed)) {
+        return Test-AllowedIpAddress $parsed.IPAddressToString
+    }
+    if ($HostName -eq "localhost" -or $HostName.EndsWith(".local") -or
+        $HostName.EndsWith(".ts.net") -or $HostName -notmatch '\.') {
         return $true
     }
-    if ((Test-Cgnat $HostName) -or (Test-PrivateIpv4 $HostName)) { return $true }
     try {
         $addresses = @([Net.Dns]::GetHostAddresses($HostName))
         return $addresses.Count -gt 0 -and @($addresses | Where-Object {
-            -not ((Test-Cgnat $_.IPAddressToString) -or (Test-PrivateIpv4 $_.IPAddressToString))
+            -not (Test-AllowedIpAddress $_.IPAddressToString)
         }).Count -eq 0
     } catch {}
     return $false
@@ -314,12 +1246,61 @@ function Assert-AllowedServiceUrl([string]$Url) {
         $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $uri.Port -lt 1) {
         throw "Invalid service URL: $Url"
     }
-    if ($uri.IsLoopback) {
-        throw "Loopback is not reachable from the phone: $Url"
-    }
     if ($uri.Scheme -eq "https") { return }
     if (-not (Test-PrivateHost $uri.Host)) {
         throw "Public HTTP is blocked. Use a LAN/Tailscale address or HTTPS: $Url"
+    }
+}
+
+function Assert-HermesResponseStatus([int]$StatusCode, [bool]$Authenticated) {
+    if ($StatusCode -ge 300 -and $StatusCode -lt 400) {
+        $kind = if ($Authenticated) { "Authenticated" } else { "Service" }
+        throw "$kind redirects are refused."
+    }
+}
+
+function Invoke-HermesJsonRequest {
+    [CmdletBinding()]
+    param(
+        [ValidateSet("Get", "Post")][string]$Method,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [string]$Token = "",
+        [ValidateRange(1, 120)][int]$TimeoutSeconds = 6,
+        [string]$Body = ""
+    )
+    $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
+    $request.Method = $Method.ToUpperInvariant()
+    $request.AllowAutoRedirect = $false
+    $request.Timeout = $TimeoutSeconds * 1000
+    $request.ReadWriteTimeout = $TimeoutSeconds * 1000
+    $request.Accept = "application/json"
+    if ($Token) { $request.Headers["Authorization"] = "Bearer $Token" }
+    if ($Method -eq "Post") {
+        $request.ContentType = "application/json"
+        $payload = [Text.Encoding]::UTF8.GetBytes($Body)
+        $request.ContentLength = $payload.Length
+        $requestStream = $request.GetRequestStream()
+        try { $requestStream.Write($payload, 0, $payload.Length) } finally { $requestStream.Dispose() }
+    }
+    $response = $null
+    try {
+        $response = [Net.HttpWebResponse]$request.GetResponse()
+        $status = [int]$response.StatusCode
+        Assert-HermesResponseStatus $status ([bool]$Token)
+        $reader = New-Object IO.StreamReader($response.GetResponseStream(), [Text.Encoding]::UTF8)
+        try { $json = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        return $json | ConvertFrom-Json
+    } catch [Net.WebException] {
+        if ($_.Exception.Response) {
+            $errorResponse = [Net.HttpWebResponse]$_.Exception.Response
+            try {
+                $status = [int]$errorResponse.StatusCode
+                Assert-HermesResponseStatus $status ([bool]$Token)
+            } finally { $errorResponse.Dispose() }
+        }
+        throw
+    } finally {
+        if ($response) { $response.Dispose() }
     }
 }
 
@@ -396,113 +1377,105 @@ function Write-ServiceRunner([string]$Name, [string]$Content) {
         return $path
     }
     if ($AuditOnly) { throw "Runner $Name is missing or outdated." }
-    # Unicode es la codificación nativa y estable de Windows Script Host 5.1.
-    [IO.File]::WriteAllText($path, $Content, [Text.Encoding]::Unicode)
+    # Windows Script Host 5.1 consumes UTF-16LE reliably only when the BOM is present.
+    $runnerEncoding = New-Object Text.UnicodeEncoding($false, $true)
+    $runnerBytes = [byte[]]($runnerEncoding.GetPreamble() + $runnerEncoding.GetBytes($Content))
+    Write-AtomicBytes -Path $path -Bytes $runnerBytes
     $script:RunnerChanged[$Name] = $true
     return $path
 }
 
-function Install-StartupShortcut([string]$Name, [string]$ScriptPath) {
-    $startup = [Environment]::GetFolderPath("Startup")
-    if (-not $startup) { throw "The per-user Startup folder is unavailable." }
-    $shortcutPath = Join-Path $startup "$Name.lnk"
+function Assert-OwnedHermesShortcut([string]$Path, [string]$Name, [string]$ExpectedScriptPath) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
     $shell = New-Object -ComObject WScript.Shell
-    $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
-    $arguments = "//B //NoLogo `"$ScriptPath`""
-    if (Test-Path -LiteralPath $shortcutPath) {
-        $existing = $shell.CreateShortcut($shortcutPath)
-        if ($existing.TargetPath -eq $wscript -and $existing.Arguments -eq $arguments) {
-            Write-Audit "Startup $Name" "SKIP" "Existing invisible fallback retained"
-            return $false
-        }
+    $shortcut = $shell.CreateShortcut($Path)
+    $expectedTarget = Join-Path $env:SystemRoot "System32\wscript.exe"
+    $expectedArguments = "//B //NoLogo `"$ExpectedScriptPath`""
+    if ($shortcut.TargetPath -ne $expectedTarget -or
+        $shortcut.Arguments -ne $expectedArguments -or
+        $shortcut.WorkingDirectory -ne $HermesHome) {
+        throw "Startup shortcut '$Name' is not owned by the selected Hermes home."
     }
-    if ($AuditOnly) { throw "Startup fallback $Name is missing or outdated." }
-    $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $wscript
-    $shortcut.Arguments = $arguments
-    $shortcut.WorkingDirectory = $HermesHome
-    $shortcut.WindowStyle = 7 # Minimized/no activation; wscript runner itself is windowless.
-    $shortcut.Save()
-    Write-Audit "Startup $Name" "OK" "Invisible fallback installed"
-    return $true
 }
 
 function Register-HermesTask([string]$TaskName, [string]$ScriptPath) {
-    try {
-        Import-Module ScheduledTasks -ErrorAction Stop
-        $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
-        $arguments = "//B //NoLogo `"$ScriptPath`""
-        $current = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        $currentAction = if ($current) { @($current.Actions)[0] } else { $null }
-        $same = $current -and $current.Settings.Enabled -and
-            $currentAction.Execute -eq $wscript -and
-            $currentAction.Arguments -eq $arguments
-        if ($same) {
-            $script:TaskDefinitionsChanged[$TaskName] = $false
-            Write-Audit "Task $TaskName" "SKIP" "Existing invisible definition retained"
-            return $true
-        }
-        if ($AuditOnly) { throw "Scheduled Task $TaskName is missing or outdated." }
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        $action = New-ScheduledTaskAction -Execute $wscript `
-            -Argument $arguments `
-            -WorkingDirectory $HermesHome
-        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries -RestartCount 3 `
-            -RestartInterval (New-TimeSpan -Minutes 1) `
-            -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-            -Settings $settings -Principal $principal -Force | Out-Null
-        $script:TaskDefinitionsChanged[$TaskName] = $true
-        $startupLink = Join-Path ([Environment]::GetFolderPath("Startup")) "$TaskName.lnk"
-        Remove-Item -LiteralPath $startupLink -Force -ErrorAction SilentlyContinue
-        Write-Audit "Task $TaskName" "OK" "Created with invisible wscript.exe runner"
-        return $true
-    } catch {
-        if ($AuditOnly) { throw }
-        Write-Warn "Scheduled Task '$TaskName' is unavailable; using the per-user Startup fallback."
-        $changed = Install-StartupShortcut $TaskName $ScriptPath
-        $script:TaskDefinitionsChanged[$TaskName] = $changed
-        return $false
+    Import-Module ScheduledTasks -ErrorAction Stop
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
+    $arguments = "//B //NoLogo `"$ScriptPath`""
+    $current = Get-ExactScheduledTask $TaskName
+    if ($current) {
+        Assert-OwnedHermesTasks -Tasks @($current) `
+            -CurrentIdentities @(Get-CurrentSetupIdentities) -ExpectedServicesDir $ServicesDir
     }
+    $currentAction = if ($current) { @($current.Actions)[0] } else { $null }
+    $same = $current -and $current.Settings.Enabled -and
+        $currentAction.Execute -eq $wscript -and
+        $currentAction.Arguments -eq $arguments -and
+        $currentAction.WorkingDirectory -eq $HermesHome
+    if ($same) {
+        $script:TaskDefinitionsChanged[$TaskName] = $false
+        Write-Audit "Task $TaskName" "SKIP" "Existing invisible definition retained"
+        return $true
+    }
+    if ($AuditOnly) { throw "Scheduled Task $TaskName is missing or outdated." }
+    if ($current) { Stop-ScheduledTask -TaskName $TaskName -TaskPath "\" -ErrorAction SilentlyContinue }
+    $action = New-ScheduledTaskAction -Execute $wscript `
+        -Argument $arguments `
+        -WorkingDirectory $HermesHome
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $TaskName -TaskPath "\" -Action $action -Trigger $trigger `
+        -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
+    $script:TaskDefinitionsChanged[$TaskName] = $true
+    $startupLink = Join-Path ([Environment]::GetFolderPath("Startup")) "$TaskName.lnk"
+    Assert-OwnedHermesShortcut $startupLink $TaskName $ScriptPath
+    Remove-Item -LiteralPath $startupLink -Force -ErrorAction SilentlyContinue
+    Write-Audit "Task $TaskName" "OK" "Created with invisible wscript.exe runner"
+    return $true
 }
 
 function Register-HermesManualTask([string]$TaskName, [string]$ScriptPath) {
-    try {
-        Import-Module ScheduledTasks -ErrorAction Stop
-        $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
-        $arguments = "//B //NoLogo `"$ScriptPath`""
-        $current = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        $currentAction = if ($current) { @($current.Actions)[0] } else { $null }
-        $same = $current -and $current.Settings.Enabled -and
-            $currentAction.Execute -eq $wscript -and
-            $currentAction.Arguments -eq $arguments
-        if ($same) {
-            Write-Audit "Task $TaskName" "SKIP" "Manual restart definition retained"
-            return $true
-        }
-        if ($AuditOnly) { throw "Manual task $TaskName is missing or outdated." }
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        $action = New-ScheduledTaskAction -Execute $wscript `
-            -Argument $arguments `
-            -WorkingDirectory $HermesHome
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
-            -MultipleInstances IgnoreNew
-        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Settings $settings `
-            -Principal $principal -Force | Out-Null
-        Write-Audit "Task $TaskName" "OK" "Manual restart task created windowless"
-        return $true
-    } catch {
-        if ($AuditOnly) { throw }
-        Write-Warn "Restart task '$TaskName' could not be registered; remote restart will be unavailable."
-        return $false
+    Import-Module ScheduledTasks -ErrorAction Stop
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
+    $arguments = "//B //NoLogo `"$ScriptPath`""
+    $current = Get-ExactScheduledTask $TaskName
+    if ($current) {
+        Assert-OwnedHermesTasks -Tasks @($current) `
+            -CurrentIdentities @(Get-CurrentSetupIdentities) -ExpectedServicesDir $ServicesDir
     }
+    $currentAction = if ($current) { @($current.Actions)[0] } else { $null }
+    $same = $current -and $current.Settings.Enabled -and
+        $currentAction.Execute -eq $wscript -and
+        $currentAction.Arguments -eq $arguments -and
+        $currentAction.WorkingDirectory -eq $HermesHome
+    if ($same) {
+        $script:TaskDefinitionsChanged[$TaskName] = $false
+        Write-Audit "Task $TaskName" "SKIP" "Manual restart definition retained"
+        return $true
+    }
+    if ($AuditOnly) { throw "Manual task $TaskName is missing or outdated." }
+    if ($current) { Stop-ScheduledTask -TaskName $TaskName -TaskPath "\" -ErrorAction SilentlyContinue }
+    $action = New-ScheduledTaskAction -Execute $wscript `
+        -Argument $arguments `
+        -WorkingDirectory $HermesHome
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+        -MultipleInstances IgnoreNew
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $TaskName -TaskPath "\" -Action $action -Settings $settings `
+        -Principal $principal -Force -ErrorAction Stop | Out-Null
+    $script:TaskDefinitionsChanged[$TaskName] = $true
+    $startupLink = Join-Path ([Environment]::GetFolderPath("Startup")) "$TaskName.lnk"
+    Assert-OwnedHermesShortcut $startupLink $TaskName $ScriptPath
+    Remove-Item -LiteralPath $startupLink -Force -ErrorAction SilentlyContinue
+    Write-Audit "Task $TaskName" "OK" "Manual restart task created windowless"
+    return $true
 }
 
 function Test-HermesTaskRunning([string]$TaskName) {
@@ -515,48 +1488,71 @@ function Test-HermesTaskRunning([string]$TaskName) {
     }
 }
 
+function Stop-OwnedHermesListener([int]$Port, [string]$TaskName) {
+    $records = @(Get-ExistingHermesPortRecords | Where-Object { $_.Port -eq $Port })
+    if ($records.Count -eq 0) { return }
+    if ($records.Count -ne 1) {
+        throw "$TaskName port $Port has an ambiguous listener set."
+    }
+    Assert-OwnedPortRecords -Records $records -HermesHome $HermesHome
+    $record = $records[0]
+    try {
+        $ownedProcess = Get-Process -Id $record.Pid -ErrorAction Stop
+        [void]$ownedProcess.Handle
+        $livePath = $ownedProcess.Path
+    } catch {
+        throw "$TaskName listener PID $($record.Pid) could not be handle-anchored safely."
+    }
+    if (-not $livePath -or -not $record.ExecutablePath -or
+        -not [IO.Path]::GetFullPath($livePath).Equals(
+            [IO.Path]::GetFullPath([string]$record.ExecutablePath),
+            [StringComparison]::OrdinalIgnoreCase)) {
+        $ownedProcess.Dispose()
+        throw "$TaskName listener identity changed before termination; refusing to kill it."
+    }
+    try {
+        $ownedProcess.Kill()
+        if (-not $ownedProcess.WaitForExit(5000)) {
+            throw "$TaskName owned listener did not terminate within 5 seconds."
+        }
+    } finally {
+        $ownedProcess.Dispose()
+    }
+    Wait-PortRelease $Port 5
+    Assert-PortAvailable $Port $TaskName
+}
+
 function Start-HermesProcess(
     [string]$TaskName,
-    [string]$ScriptPath,
-    [bool]$Registered,
     [int]$Port = 0
 ) {
-    if ($Registered) {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        if ($Port -gt 0) {
-            Wait-PortRelease $Port 5
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath "\" -ErrorAction Stop
+    if (-not $task -or -not $task.Settings.Enabled) {
+        throw "Mandatory Scheduled Task '$TaskName' is unavailable or disabled."
+    }
+    Stop-ScheduledTask -TaskName $TaskName -TaskPath "\" -ErrorAction SilentlyContinue
+    if ($Port -gt 0) {
+        Wait-PortRelease $Port 5
+        if (Get-PortOwner $Port) {
+            Stop-OwnedHermesListener $Port $TaskName
+        } else {
             Assert-PortAvailable $Port $TaskName
         }
-        Start-ScheduledTask -TaskName $TaskName
-    } else {
-        if ($Port -gt 0) { Assert-PortAvailable $Port $TaskName }
-        $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
-        $arguments = "//B //NoLogo `"$ScriptPath`""
-        Start-Process -FilePath $wscript `
-            -ArgumentList $arguments `
-            -WorkingDirectory $HermesHome -WindowStyle Hidden | Out-Null
     }
+    Start-ScheduledTask -TaskName $TaskName -TaskPath "\" -ErrorAction Stop
 }
 
 function Remove-LegacyTasks {
     foreach ($name in @("Hermes Gateway", "Hermes Dashboard", "Hermes Mobile Bridge")) {
-        try {
-            Import-Module ScheduledTasks -ErrorAction Stop
-            if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
-                if ($AuditOnly) { throw "Legacy task '$name' is still installed." }
-                Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-                Unregister-ScheduledTask -TaskName $name -Confirm:$false
-                Write-Audit "Legacy task $name" "OK" "Removed to prevent duplicate services"
-            }
-        } catch {
-            if ($AuditOnly -and $_.Exception.Message -like "Legacy task*") { throw }
+        Import-Module ScheduledTasks -ErrorAction Stop
+        if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+            throw "Legacy task '$name' requires explicit owner cleanup; setup will not remove it automatically."
         }
         $startup = [Environment]::GetFolderPath("Startup")
         if ($startup) {
             $legacyLink = Join-Path $startup "$name.lnk"
             if (Test-Path -LiteralPath $legacyLink) {
-                if ($AuditOnly) { throw "Legacy Startup shortcut '$name' is still installed." }
-                Remove-Item -LiteralPath $legacyLink -Force
+                throw "Legacy Startup shortcut '$name' requires explicit owner cleanup; setup will not remove it automatically."
             }
         }
     }
@@ -594,115 +1590,400 @@ function Wait-PortRelease([int]$Port, [int]$Seconds = 5) {
     }
 }
 
-function Invoke-HiddenProcess(
-    [string]$File,
-    [string]$Arguments,
-    [int]$TimeoutSeconds,
-    [string]$StdoutPath,
-    [string]$StderrPath
-) {
-    $process = Start-Process -FilePath $File -ArgumentList $Arguments `
-        -WorkingDirectory $HermesHome -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        try { $process.Kill() } catch {}
-        throw "Hidden process timed out after ${TimeoutSeconds}s: $File"
-    }
-    $process.WaitForExit()
-    $process.Refresh()
-    if ($process.ExitCode -ne 0) {
-        $tail = ""
-        if (Test-Path -LiteralPath $StderrPath) {
-            $tail = ([IO.File]::ReadAllText($StderrPath) -replace '[\r\n]+', ' ').Trim()
-            if ($tail.Length -gt 500) { $tail = $tail.Substring($tail.Length - 500) }
+function Initialize-WindowsJobApi {
+    if (-not (Test-WindowsPlatform)) { throw "Windows Job Objects require native Windows." }
+    if ("HermesConsole.NativeJobProcess" -as [type]) { return }
+    $source = @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace HermesConsole {
+    public sealed class NativeJobProcess : IDisposable {
+        const uint CREATE_SUSPENDED = 0x00000004;
+        const uint CREATE_NO_WINDOW = 0x08000000;
+        const uint STARTF_USESTDHANDLES = 0x00000100;
+        const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+        const uint GENERIC_WRITE = 0x40000000;
+        const uint FILE_SHARE_READ = 0x00000001;
+        const uint CREATE_ALWAYS = 2;
+        const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+        const uint HANDLE_FLAG_INHERIT = 0x00000001;
+        const uint WAIT_OBJECT_0 = 0;
+        const uint WAIT_TIMEOUT = 258;
+
+        IntPtr job;
+        IntPtr process;
+        bool disposed;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct SECURITY_ATTRIBUTES {
+            public int nLength;
+            public IntPtr lpSecurityDescriptor;
+            [MarshalAs(UnmanagedType.Bool)] public bool bInheritHandle;
         }
-        throw "Hidden process exited with $($process.ExitCode): $tail"
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct STARTUPINFO {
+            public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+            public int dwX; public int dwY; public int dwXSize; public int dwYSize;
+            public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute;
+            public uint dwFlags; public short wShowWindow; public short cbReserved2;
+            public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct PROCESS_INFORMATION {
+            public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+            public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct IO_COUNTERS {
+            public ulong ReadOperationCount; public ulong WriteOperationCount; public ulong OtherOperationCount;
+            public ulong ReadTransferCount; public ulong WriteTransferCount; public ulong OtherTransferCount;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+            public IO_COUNTERS IoInfo;
+            public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+            public long TotalUserTime; public long TotalKernelTime; public long ThisPeriodTotalUserTime;
+            public long ThisPeriodTotalKernelTime; public uint TotalPageFaultCount;
+            public uint TotalProcesses; public uint ActiveProcesses; public uint TotalTerminatedProcesses;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length, IntPtr returnLength);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateFile(string name, uint access, uint share, ref SECURITY_ATTRIBUTES security,
+            uint creation, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CreatePipe(out IntPtr readPipe, out IntPtr writePipe, ref SECURITY_ATTRIBUTES security, uint size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool CreateProcess(string application, StringBuilder commandLine, IntPtr processAttributes,
+            IntPtr threadAttributes, bool inheritHandles, uint flags, IntPtr environment, string currentDirectory,
+            ref STARTUPINFO startup, out PROCESS_INFORMATION processInfo);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint ResumeThread(IntPtr thread);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool TerminateProcess(IntPtr process, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr handle);
+
+        NativeJobProcess(IntPtr jobHandle, IntPtr processHandle) {
+            job = jobHandle; process = processHandle;
+        }
+
+        static void ThrowLast(string operation) {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), operation);
+        }
+        static string Quote(string value) {
+            return "\"" + value.Replace("\"", "\\\"") + "\"";
+        }
+        static void CloseIfValid(ref IntPtr handle) {
+            if (handle != IntPtr.Zero && handle != new IntPtr(-1)) { CloseHandle(handle); }
+            handle = IntPtr.Zero;
+        }
+
+        public static NativeJobProcess Start(string file, string arguments, string currentDirectory,
+            string stdoutPath, string stderrPath, string standardInput) {
+            IntPtr jobHandle = IntPtr.Zero;
+            IntPtr stdoutHandle = IntPtr.Zero;
+            IntPtr stderrHandle = IntPtr.Zero;
+            IntPtr stdinRead = IntPtr.Zero;
+            IntPtr stdinWrite = IntPtr.Zero;
+            PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+            bool assigned = false;
+            try {
+                jobHandle = CreateJobObject(IntPtr.Zero, null);
+                if (jobHandle == IntPtr.Zero) ThrowLast("CreateJobObject failed");
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                int limitSize = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+                IntPtr limitPtr = Marshal.AllocHGlobal(limitSize);
+                try {
+                    Marshal.StructureToPtr(limits, limitPtr, false);
+                    if (!SetInformationJobObject(jobHandle, 9, limitPtr, (uint)limitSize))
+                        ThrowLast("SetInformationJobObject failed");
+                } finally { Marshal.FreeHGlobal(limitPtr); }
+
+                SECURITY_ATTRIBUTES sa = new SECURITY_ATTRIBUTES();
+                sa.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+                sa.bInheritHandle = true;
+                stdoutHandle = CreateFile(stdoutPath, GENERIC_WRITE, FILE_SHARE_READ, ref sa,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+                if (stdoutHandle == new IntPtr(-1)) ThrowLast("CreateFile stdout failed");
+                stderrHandle = CreateFile(stderrPath, GENERIC_WRITE, FILE_SHARE_READ, ref sa,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, IntPtr.Zero);
+                if (stderrHandle == new IntPtr(-1)) ThrowLast("CreateFile stderr failed");
+                if (!CreatePipe(out stdinRead, out stdinWrite, ref sa, 0)) ThrowLast("CreatePipe failed");
+                if (!SetHandleInformation(stdinWrite, HANDLE_FLAG_INHERIT, 0)) ThrowLast("SetHandleInformation failed");
+
+                STARTUPINFO startup = new STARTUPINFO();
+                startup.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+                startup.dwFlags = STARTF_USESTDHANDLES;
+                startup.hStdInput = stdinRead;
+                startup.hStdOutput = stdoutHandle;
+                startup.hStdError = stderrHandle;
+                StringBuilder commandLine = new StringBuilder(Quote(file) + (String.IsNullOrEmpty(arguments) ? "" : " " + arguments));
+                if (!CreateProcess(file, commandLine, IntPtr.Zero, IntPtr.Zero, true,
+                    CREATE_SUSPENDED | CREATE_NO_WINDOW, IntPtr.Zero, currentDirectory, ref startup, out pi))
+                    ThrowLast("CreateProcess failed");
+                if (!AssignProcessToJobObject(jobHandle, pi.hProcess))
+                    ThrowLast("AssignProcessToJobObject failed");
+                assigned = true;
+                CloseIfValid(ref stdinRead);
+                CloseIfValid(ref stdoutHandle);
+                CloseIfValid(ref stderrHandle);
+
+                using (FileStream input = new FileStream(new SafeFileHandle(stdinWrite, true), FileAccess.Write)) {
+                    stdinWrite = IntPtr.Zero;
+                    if (!String.IsNullOrEmpty(standardInput)) {
+                        byte[] bytes = new UTF8Encoding(false).GetBytes(standardInput);
+                        input.Write(bytes, 0, bytes.Length);
+                    }
+                }
+                NativeJobProcess result = new NativeJobProcess(jobHandle, pi.hProcess);
+                jobHandle = IntPtr.Zero; pi.hProcess = IntPtr.Zero;
+                if (ResumeThread(pi.hThread) == UInt32.MaxValue) {
+                    int resumeError = Marshal.GetLastWin32Error();
+                    result.Dispose();
+                    throw new Win32Exception(resumeError, "ResumeThread failed");
+                }
+                CloseIfValid(ref pi.hThread);
+                return result;
+            } catch {
+                if (pi.hProcess != IntPtr.Zero) TerminateProcess(pi.hProcess, 125);
+                throw;
+            } finally {
+                CloseIfValid(ref pi.hThread); CloseIfValid(ref pi.hProcess);
+                CloseIfValid(ref stdinRead); CloseIfValid(ref stdinWrite);
+                CloseIfValid(ref stdoutHandle); CloseIfValid(ref stderrHandle);
+                if (jobHandle != IntPtr.Zero) {
+                    if (assigned) TerminateJobObject(jobHandle, 125);
+                    CloseHandle(jobHandle);
+                }
+            }
+        }
+
+        public bool WaitForQuiescence(int milliseconds) {
+            Stopwatch watch = Stopwatch.StartNew();
+            do {
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting = new JOBOBJECT_BASIC_ACCOUNTING_INFORMATION();
+                int size = Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+                IntPtr ptr = Marshal.AllocHGlobal(size);
+                try {
+                    if (!QueryInformationJobObject(job, 1, ptr, (uint)size, IntPtr.Zero))
+                        ThrowLast("QueryInformationJobObject failed");
+                    accounting = (JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(
+                        ptr, typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION));
+                    if (accounting.ActiveProcesses == 0) return true;
+                } finally { Marshal.FreeHGlobal(ptr); }
+                System.Threading.Thread.Sleep(25);
+            } while (watch.ElapsedMilliseconds < milliseconds);
+            return false;
+        }
+
+        public bool TerminateAndVerify(int milliseconds) {
+            if (!TerminateJobObject(job, 124)) return false;
+            return WaitForQuiescence(milliseconds);
+        }
+
+        public int GetRootExitCode() {
+            uint result = WaitForSingleObject(process, 0);
+            if (result == WAIT_TIMEOUT) throw new InvalidOperationException("Root process is still running.");
+            if (result != WAIT_OBJECT_0) ThrowLast("WaitForSingleObject failed");
+            uint exitCode;
+            if (!GetExitCodeProcess(process, out exitCode)) ThrowLast("GetExitCodeProcess failed");
+            return unchecked((int)exitCode);
+        }
+
+        public void Dispose() {
+            if (disposed) return;
+            disposed = true;
+            CloseIfValid(ref process);
+            CloseIfValid(ref job);
+            GC.SuppressFinalize(this);
+        }
+        ~NativeJobProcess() { Dispose(); }
+    }
+}
+'@
+    Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+}
+
+function Stop-ContainedProcessAfterTimeout($JobProcess, [int]$TimeoutMilliseconds) {
+    if ($JobProcess.TerminateAndVerify($TimeoutMilliseconds)) { return $true }
+    $script:MutationQuiescent = $false
+    $script:UnresolvedContainedProcess = $JobProcess
+    return $false
+}
+
+function Invoke-ContainedProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$File,
+        [string]$Arguments = "",
+        [ValidateRange(1, 86400)][int]$TimeoutSeconds,
+        [ValidateRange(1, 300)][int]$TerminationTimeoutSeconds = 15,
+        [Parameter(Mandatory = $true)][string]$StdoutPath,
+        [Parameter(Mandatory = $true)][string]$StderrPath,
+        [string]$StandardInput = ""
+    )
+    Initialize-WindowsJobApi
+    $jobProcess = $null
+    $retain = $false
+    $verifiedQuiescent = $false
+    try {
+        $jobProcess = [HermesConsole.NativeJobProcess]::Start(
+            $File, $Arguments, $HermesHome, $StdoutPath, $StderrPath, $StandardInput
+        )
+        if (-not $jobProcess.WaitForQuiescence($TimeoutSeconds * 1000)) {
+            if (-not (Stop-ContainedProcessAfterTimeout $jobProcess ($TerminationTimeoutSeconds * 1000))) {
+                $retain = $true
+                throw "Timed-out process containment could not be verified; the setup lock remains held for this host process."
+            }
+            $verifiedQuiescent = $true
+            throw "Process timed out after ${TimeoutSeconds}s; its Windows Job Object was terminated and verified quiescent."
+        }
+        $verifiedQuiescent = $true
+        return [PSCustomObject]@{
+            ExitCode = $jobProcess.GetRootExitCode()
+            TimedOut = $false
+        }
+    } catch {
+        if ($jobProcess -and -not $verifiedQuiescent) {
+            $script:MutationQuiescent = $false
+            $script:UnresolvedContainedProcess = $jobProcess
+            $retain = $true
+        }
+        throw
+    } finally {
+        if ($jobProcess -and -not $retain) { $jobProcess.Dispose() }
     }
 }
 
-function Test-RestrictedFirewallRule([string]$DisplayName, [string]$Kind) {
+function Invoke-HiddenProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$File,
+        [string]$Arguments = "",
+        [ValidateRange(1, 86400)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$StdoutPath,
+        [Parameter(Mandatory = $true)][string]$StderrPath,
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Operation
+    )
+    $result = Invoke-ContainedProcess -File $File -Arguments $Arguments `
+        -TimeoutSeconds $TimeoutSeconds -TerminationTimeoutSeconds $script:TerminationTimeoutSeconds `
+        -StdoutPath $StdoutPath -StderrPath $StderrPath
+    if ($null -eq $result.ExitCode) {
+        throw "$Operation failed because Windows did not provide a process exit code."
+    }
+    if ([int]$result.ExitCode -ne 0) {
+        throw "$Operation failed (exit code $([int]$result.ExitCode))."
+    }
+}
+
+function Get-RestrictedFirewallRuleState([string]$DisplayName, [string]$Kind) {
     try {
         Import-Module NetSecurity -ErrorAction Stop
+        $rules = @(Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue)
+        if ($rules.Count -eq 0) { return "Absent" }
+        if ($rules.Count -ne 1) { return "Conflict" }
+        $rule = $rules[0]
         $expectedProfile = if ($Kind -eq "mesh") { "Any" } else { "Private" }
         $expectedRemote = if ($Kind -eq "mesh") {
             @("100.64.0.0/10", "100.64.0.0/255.192.0.0")
         } else { @("LocalSubnet") }
-        $requiredPorts = @("8642", "9119", "9131")
-        foreach ($rule in @(Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue)) {
-            if ($rule.Enabled.ToString() -ne "True" -or
-                $rule.Direction.ToString() -ne "Inbound" -or
-                $rule.Action.ToString() -ne "Allow" -or
-                $rule.Profile.ToString() -ne $expectedProfile) {
-                continue
-            }
-            $portFilter = $rule | Get-NetFirewallPortFilter -ErrorAction Stop
-            $addressFilter = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
-            if ($portFilter.Protocol.ToString() -notin @("TCP", "6")) { continue }
-            $ports = @($portFilter.LocalPort | ForEach-Object {
-                $_.ToString().Split(',') | ForEach-Object { $_.Trim() }
-            })
-            $addresses = @($addressFilter.RemoteAddress | ForEach-Object {
-                $_.ToString().Split(',') | ForEach-Object { $_.Trim() }
-            })
-            if (@($requiredPorts | Where-Object { $_ -notin $ports }).Count -eq 0 -and
-                @($addresses | Where-Object { $_ -in $expectedRemote }).Count -gt 0) {
-                return $true
-            }
+        if ($rule.Enabled.ToString() -ne "True" -or
+            $rule.Direction.ToString() -ne "Inbound" -or
+            $rule.Action.ToString() -ne "Allow" -or
+            $rule.Profile.ToString() -ne $expectedProfile) {
+            return "Conflict"
         }
-    } catch {}
-    return $false
+        $portFilter = $rule | Get-NetFirewallPortFilter -ErrorAction Stop
+        $addressFilter = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
+        if ($portFilter.Protocol.ToString() -notin @("TCP", "6")) { return "Conflict" }
+        $ports = @($portFilter.LocalPort | ForEach-Object {
+            $_.ToString().Split(',') | ForEach-Object { $_.Trim() }
+        } | Sort-Object -Unique)
+        $requiredPorts = @("8642", "9119", "9131")
+        if (@(Compare-Object $requiredPorts $ports).Count -ne 0) { return "Conflict" }
+        $addresses = @($addressFilter.RemoteAddress | ForEach-Object {
+            $_.ToString().Split(',') | ForEach-Object { $_.Trim() }
+        } | Sort-Object -Unique)
+        if ($addresses.Count -ne 1 -or $addresses[0] -notin $expectedRemote) { return "Conflict" }
+        $localAddresses = @($addressFilter.LocalAddress | ForEach-Object {
+            $_.ToString().Split(',') | ForEach-Object { $_.Trim() }
+        } | Sort-Object -Unique)
+        if ($localAddresses.Count -ne 1 -or $localAddresses[0] -ne "Any") { return "Conflict" }
+        return "Exact"
+    } catch {
+        return "Unverifiable"
+    }
 }
 
-function Install-RestrictedFirewallRuleElevated([string]$Kind) {
-    # Elevate only the firewall mutation. The main installer keeps running as
-    # the original user, so Hermes, Scheduled Tasks and LOCALAPPDATA never end
-    # up under a different administrator profile.
-    $helper = Join-Path ([IO.Path]::GetTempPath()) (
-        "hermes-console-firewall-$([Guid]::NewGuid().ToString('N')).ps1"
-    )
-    $content = @'
-param([ValidateSet("mesh", "lan")][string]$Kind)
-$ErrorActionPreference = "Stop"
-Import-Module NetSecurity -ErrorAction Stop
-$display = if ($Kind -eq "mesh") {
-    "Hermes Console Tailscale"
-} else {
-    "Hermes Console private network"
+function Test-RestrictedFirewallRule([string]$DisplayName, [string]$Kind) {
+    return (Get-RestrictedFirewallRuleState $DisplayName $Kind) -eq "Exact"
 }
-Get-NetFirewallRule -DisplayName $display -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule -ErrorAction Stop
-if ($Kind -eq "mesh") {
-    New-NetFirewallRule -DisplayName $display -Direction Inbound -Action Allow `
-        -Protocol TCP -LocalPort 8642, 9119, 9131 -Profile Any `
-        -RemoteAddress "100.64.0.0/10" | Out-Null
-} else {
-    New-NetFirewallRule -DisplayName $display -Direction Inbound -Action Allow `
-        -Protocol TCP -LocalPort 8642, 9119, 9131 -Profile Private `
-        -RemoteAddress LocalSubnet | Out-Null
+
+function Test-CurrentProcessAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
-'@
-    [IO.File]::WriteAllText($helper, $content, $Utf8NoBom)
-    try {
-        if ($NoFirewallPrompt) {
-            throw "Firewall repair needs elevation and -NoFirewallPrompt was selected."
-        }
-        Write-Info "Windows will request administrator approval for the restricted firewall rule."
-        $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$helper`" -Kind $Kind"
-        $process = Start-Process -FilePath (Get-PowerShellExecutable) -Verb RunAs `
-            -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
-        if ($process.ExitCode -ne 0) {
-            throw "The elevated firewall helper exited with code $($process.ExitCode)."
-        }
-    } finally {
-        Remove-Item -LiteralPath $helper -Force -ErrorAction SilentlyContinue
+
+function Assert-FirewallPreflight([hashtable]$Pairing) {
+    if ($Pairing.Scheme -eq "https") { return }
+    $display = if ($Pairing.Kind -eq "mesh") {
+        "Hermes Console Tailscale"
+    } else {
+        "Hermes Console private network"
     }
+    if ($Pairing.Kind -eq "lan" -and $Pairing.InterfaceIndex) {
+        $profile = Get-NetConnectionProfile -InterfaceIndex $Pairing.InterfaceIndex -ErrorAction SilentlyContinue
+        if ($profile -and $profile.NetworkCategory -ne "Private") {
+            throw "The selected LAN is '$($profile.NetworkCategory)'. Mark it Private or use Tailscale before exposing Hermes. No changes were made."
+        }
+    }
+    $state = Get-RestrictedFirewallRuleState $display $Pairing.Kind
+    if ($state -eq "Unverifiable") {
+        throw "Existing Windows Firewall state could not be verified; no changes were made."
+    }
+    if ($state -eq "Conflict") {
+        throw "A pre-existing Hermes Windows Firewall rule is not exact; setup refuses to replace or broaden it. No changes were made."
+    }
+    if ($state -eq "Exact" -or (Test-CurrentProcessAdministrator)) { return }
+    throw "A restricted Windows Firewall rule is required. Re-run setup from an already elevated PowerShell terminal; setup never opens UAC or secondary windows. No changes were made."
 }
 
 function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
     if ($Pairing.Scheme -eq "https") { return }
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     $display = if ($Pairing.Kind -eq "mesh") {
         "Hermes Console Tailscale"
     } else {
@@ -714,79 +1995,212 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
             throw "The selected LAN is '$($profile.NetworkCategory)'. Mark it Private or use Tailscale before exposing Hermes."
         }
     }
-    if ($AuditOnly) {
-        if (-not (Test-RestrictedFirewallRule $display $Pairing.Kind)) {
-            throw "Restricted Windows Firewall rule is missing or invalid."
-        }
-        Write-Audit "Firewall" "SKIP" "Existing restricted rule verified"
+    $state = Get-RestrictedFirewallRuleState $display $Pairing.Kind
+    if ($state -eq "Exact") {
+        Write-Ok "Existing restricted Windows Firewall rule verified"
         return
     }
-    if (-not $admin) {
-        if (Test-RestrictedFirewallRule $display $Pairing.Kind) {
-            Write-Ok "Existing restricted Windows Firewall rule verified"
-            return
-        }
-        try {
-            Install-RestrictedFirewallRuleElevated $Pairing.Kind
-        } catch {
-            throw "Windows Firewall needs a restricted inbound rule and elevation was not completed: $($_.Exception.Message) No QR was generated."
-        }
-        if (-not (Test-RestrictedFirewallRule $display $Pairing.Kind)) {
-            throw "The elevated Windows Firewall rule could not be verified; no QR was generated."
-        }
-        Write-Ok "Restricted Windows Firewall rule installed and verified"
-        return
+    if ($state -ne "Absent") {
+        throw "A pre-existing Hermes Windows Firewall rule is not exact; setup will not modify it."
     }
+    if ($AuditOnly) { throw "Restricted Windows Firewall rule is missing." }
+    if (-not (Test-CurrentProcessAdministrator)) {
+        throw "A restricted Windows Firewall rule is required. Re-run setup from an already elevated PowerShell terminal; setup never opens UAC or secondary windows. No QR was generated."
+    }
+    if ($null -eq $script:SetupTransaction) { throw "Firewall creation requires an active setup transaction." }
+    $ruleName = "HermesConsole-$AttemptId"
     try {
         Import-Module NetSecurity -ErrorAction Stop
-        Get-NetFirewallRule -DisplayName $display -ErrorAction SilentlyContinue | Remove-NetFirewallRule
         if ($Pairing.Kind -eq "mesh") {
-            New-NetFirewallRule -DisplayName $display -Direction Inbound -Action Allow `
+            New-NetFirewallRule -Name $ruleName -DisplayName $display -Direction Inbound -Action Allow `
                 -Protocol TCP -LocalPort 8642, 9119, 9131 -Profile Any `
-                -RemoteAddress "100.64.0.0/10" | Out-Null
-            Write-Ok "Tailscale-only Windows Firewall rule installed"
+                -RemoteAddress "100.64.0.0/10" -ErrorAction Stop | Out-Null
         } else {
-            New-NetFirewallRule -DisplayName $display -Direction Inbound -Action Allow `
+            New-NetFirewallRule -Name $ruleName -DisplayName $display -Direction Inbound -Action Allow `
                 -Protocol TCP -LocalPort 8642, 9119, 9131 -Profile Private `
-                -RemoteAddress LocalSubnet | Out-Null
-            Write-Ok "Private-LAN Windows Firewall rule installed"
+                -RemoteAddress LocalSubnet -ErrorAction Stop | Out-Null
         }
+        $script:SetupTransaction.FirewallRuleName = $ruleName
+        $script:FirewallRuleCreatedName = $ruleName
+        if ((Get-RestrictedFirewallRuleState $display $Pairing.Kind) -ne "Exact") {
+            throw "Created firewall rule did not verify exactly."
+        }
+        Write-TransactionJournal $script:SetupTransaction "firewall-create" "ok"
+        Write-Ok $(if ($Pairing.Kind -eq "mesh") {
+            "Tailscale-only Windows Firewall rule installed"
+        } else {
+            "Private-LAN Windows Firewall rule installed"
+        })
     } catch {
-        throw "Could not configure a restricted Windows Firewall rule: $($_.Exception.Message)"
+        throw "Could not configure a restricted Windows Firewall rule without replacing existing state."
+    }
+}
+
+function Test-HermesLauncher([string]$Executable, [int]$TimeoutSeconds = 15) {
+    if (-not $Executable -or -not (Test-Path -LiteralPath $Executable)) { return $false }
+    $probeId = [Guid]::NewGuid().ToString("N")
+    $stdout = Join-Path ([IO.Path]::GetTempPath()) "hermes-launcher-$probeId.out.log"
+    $stderr = Join-Path ([IO.Path]::GetTempPath()) "hermes-launcher-$probeId.err.log"
+    try {
+        $result = Invoke-ContainedProcess -File $Executable -Arguments "--version" `
+            -TimeoutSeconds $TimeoutSeconds -TerminationTimeoutSeconds $script:TerminationTimeoutSeconds `
+            -StdoutPath $stdout -StderrPath $stderr
+        return $result.ExitCode -eq 0
+    } catch {
+        if (-not $script:MutationQuiescent) { throw }
+        return $false
+    } finally {
+        if ($script:MutationQuiescent) {
+            Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Test-PythonSnippet(
+    [string]$Python,
+    [string]$Code,
+    [string[]]$ExtraArguments = @(),
+    [int]$TimeoutSeconds = 15
+) {
+    if (-not $Python -or -not (Test-Path -LiteralPath $Python)) { return $false }
+    $probeId = [Guid]::NewGuid().ToString("N")
+    $stdout = Join-Path ([IO.Path]::GetTempPath()) "hermes-python-$probeId.out.log"
+    $stderr = Join-Path ([IO.Path]::GetTempPath()) "hermes-python-$probeId.err.log"
+    $escapedCode = $Code.Replace('"', '\"')
+    $arguments = "-c `"$escapedCode`""
+    foreach ($value in @($ExtraArguments)) {
+        $arguments += " `"$($value.Replace('"', '\"'))`""
+    }
+    try {
+        $result = Invoke-ContainedProcess -File $Python -Arguments $arguments `
+            -TimeoutSeconds $TimeoutSeconds -TerminationTimeoutSeconds $script:TerminationTimeoutSeconds `
+            -StdoutPath $stdout -StderrPath $stderr
+        return $result.ExitCode -eq 0
+    } catch {
+        if (-not $script:MutationQuiescent) { throw }
+        return $false
+    } finally {
+        if ($script:MutationQuiescent) {
+            Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-FreshHermesInstallArtifacts {
+    return @(
+        $InstallDir,
+        (Join-Path $HermesHome "node"),
+        (Join-Path $HermesBinDir "hermes.exe"),
+        (Join-Path $HermesBinDir "hermes.cmd"),
+        (Join-Path $HermesBinDir "hermes.ps1"),
+        (Join-Path $HermesBinDir "hermes"),
+        (Join-Path $HermesBinDir "uv.exe"),
+        (Join-Path $HermesBinDir "uvx.exe"),
+        (Join-Path $HermesBinDir "uv"),
+        (Join-Path $HermesBinDir "uvx")
+    )
+}
+
+function Remove-FreshHermesInstallArtifacts([string[]]$Paths) {
+    if (-not $script:MutationQuiescent) {
+        throw "Fresh Hermes artifacts cannot be cleaned while process quiescence is unresolved."
+    }
+    foreach ($path in $Paths) {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+        }
+    }
+}
+
+function Remove-EmptyAttemptDirectories {
+    $paths = @($script:SetupDirectoryExistedAtStart.Keys) |
+        Sort-Object { ([string]$_).Length } -Descending
+    foreach ($path in $paths) {
+        if ($script:SetupDirectoryExistedAtStart[$path]) { continue }
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) { continue }
+        if (@(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop).Count -eq 0) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+    }
+}
+
+function Save-VerifiedHermesAgentInstaller {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Destination)
+
+    Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+    try {
+        Invoke-WebRequest -Uri $script:HermesAgentInstallerUrl `
+            -OutFile $Destination -UseBasicParsing
+    } catch {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        throw "Hermes Agent installer download failed. Check internet, proxy, and TLS access. No installation changes were made."
+    }
+
+    try {
+        $item = Get-Item -LiteralPath $Destination -Force -ErrorAction Stop
+        $digest = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        if ($item.Length -ne $script:HermesAgentInstallerSize -or
+            $digest -ne $script:HermesAgentInstallerSha256) {
+            throw "Installer bytes did not match the pinned release."
+        }
+        $tokens = $null
+        $errors = $null
+        [void][Management.Automation.Language.Parser]::ParseFile(
+            $Destination, [ref]$tokens, [ref]$errors
+        )
+        if (@($errors).Count -ne 0) { throw "Installer did not parse as PowerShell." }
+    } catch {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        throw "Hermes Agent installer integrity verification failed. No installation changes were made."
     }
 }
 
 function Install-HermesIfNeeded {
     $hermes = Get-HermesExecutable
-    if ($hermes) {
-        try {
-            $version = (& $hermes --version 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0) {
-                Write-Audit "Hermes Agent" "SKIP" "Installed: $version"
-                return $hermes
-            }
-        } catch {}
+    if ($hermes -and (Test-HermesLauncher $hermes 15)) {
+        Write-Audit "Hermes Agent" "SKIP" "Installed launcher command verified"
+        return $hermes
     }
     if ($AuditOnly) { throw "Hermes Agent is not installed or is broken." }
+
+    $freshArtifacts = @(Get-FreshHermesInstallArtifacts)
+    $existingArtifacts = @($freshArtifacts | Where-Object { Test-Path -LiteralPath $_ })
+    if ($existingArtifacts.Count -gt 0) {
+        throw "Hermes Agent state exists but is not healthy; refusing to run the installer over it. Remove or repair the broken managed state explicitly."
+    }
+
     Write-Info "Installing Hermes Agent for native Windows..."
     Write-Info "The official installer can take several minutes on a clean Windows host; setup will wait safely."
-    $installer = Join-Path ([IO.Path]::GetTempPath()) "hermes-agent-install.ps1"
-    Invoke-WebRequest -Uri "https://hermes-agent.nousresearch.com/install.ps1" `
-        -OutFile $installer -UseBasicParsing
+    $installer = $AttemptPaths.Installer
     try {
+        Save-VerifiedHermesAgentInstaller -Destination $installer
         $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installer`" " +
-            "-SkipSetup -NonInteractive -HermesHome `"$HermesHome`" -InstallDir `"$InstallDir`""
-        Invoke-HiddenProcess (Get-PowerShellExecutable) $arguments `
-            $script:HermesInstallTimeoutSeconds `
-            (Join-Path $AuditDir "hermes-install.out.log") `
-            (Join-Path $AuditDir "hermes-install.err.log")
+            "-SkipSetup -SkipComputerUse -NonInteractive -Json -Commit $($script:HermesAgentCommit) " +
+            "-HermesHome `"$HermesHome`" -InstallDir `"$InstallDir`""
+        Invoke-HiddenProcess -File (Get-PowerShellExecutable) -Arguments $arguments `
+            -TimeoutSeconds $script:HermesInstallTimeoutSeconds `
+            -StdoutPath $AttemptPaths.InstallerOut `
+            -StderrPath $AttemptPaths.InstallerErr `
+            -Operation "Hermes Agent installer"
+
+        $hermes = Get-HermesExecutable
+        if (-not $hermes) { throw "Hermes Agent executable was not found after installation." }
+        if (-not (Test-HermesLauncher $hermes 15)) {
+            throw "Hermes Agent launcher did not pass health after the official installer completed."
+        }
+        Write-Audit "Hermes Agent" "OK" "Installed; launcher command verified"
+        return $hermes
+    } catch {
+        if ($script:MutationQuiescent) {
+            Remove-FreshHermesInstallArtifacts -Paths $freshArtifacts
+        }
+        throw
     } finally {
-        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+        if ($script:MutationQuiescent) {
+            Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+        }
     }
-    $hermes = Get-HermesExecutable
-    if (-not $hermes) { throw "Hermes Agent executable was not found after installation." }
-    Write-Audit "Hermes Agent" "OK" "Installed with the official installer"
-    return $hermes
 }
 
 function Install-VerifiedBridge([string]$Python) {
@@ -820,11 +2234,11 @@ function Install-VerifiedBridge([string]$Python) {
         if ($versions.Count -ne 1 -or $versions[0].Groups[1].Value -ne $manifest.version) {
             return $false
         }
-        $compileLog = Join-Path $AuditDir "bridge-compile.log"
-        # Compila en memoria: misma validación sintáctica que `-m py_compile`
-        # sin crear __pycache__ durante una auditoría de solo lectura.
-        & $Python -c 'import pathlib,sys;compile(pathlib.Path(sys.argv[1]).read_bytes(),sys.argv[1],"exec")' $Path *> $compileLog
-        return $LASTEXITCODE -eq 0
+        # Compila en memoria sin crear __pycache__. El proceso queda contenido
+        # y acotado igual que las demás herramientas nativas del setup.
+        return Test-PythonSnippet $Python `
+            'import pathlib,sys;compile(pathlib.Path(sys.argv[1]).read_bytes(),sys.argv[1],"exec")' `
+            @($Path) 20
     }
 
     if (Test-BridgeArtifact $BridgeTarget) {
@@ -850,49 +2264,81 @@ function Install-VerifiedBridge([string]$Python) {
     return [string]$manifest.version
 }
 
+function Get-HermesUv {
+    $candidate = Join-Path $HermesHome "bin\uv.exe"
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+    return $null
+}
+
 function Write-PairingQr([string]$Python, [string]$Link) {
-    & $Python -c "import qrcode" 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Invoke-HiddenProcess $Python '-m pip install -q "qrcode[pil]"' 90 `
-            (Join-Path $AuditDir "qrcode-install.out.log") `
-            (Join-Path $AuditDir "qrcode-install.err.log")
-    }
-    $qrScript = Join-Path $AuditDir "make-pairing-qr.py"
+    $qrScript = $AttemptPaths.QrScript
+    $qrNew = $AttemptPaths.QrNew
     $qrSource = @'
-import qrcode
+import binascii
+import struct
 import sys
+import zlib
+
+import qrcode
 
 link = sys.stdin.read()
 if not link:
     raise SystemExit("empty pairing payload")
-qrcode.make(link).save(sys.argv[1])
+qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=4, box_size=1)
+qr.add_data(link)
+qr.make(fit=True)
+matrix = qr.get_matrix()
+scale = 8
+width = len(matrix) * scale
+rows = []
+for row in matrix:
+    pixels = bytes(value for cell in row for value in ([0] if cell else [255]) * scale)
+    scanline = b"\x00" + pixels
+    rows.extend([scanline] * scale)
+
+def chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
+
+png = b"\x89PNG\r\n\x1a\n"
+png += chunk(b"IHDR", struct.pack(">IIBBBBB", width, width, 8, 0, 0, 0, 0))
+png += chunk(b"IDAT", zlib.compress(b"".join(rows), 9))
+png += chunk(b"IEND", b"")
+with open(sys.argv[1], "wb") as handle:
+    handle.write(png)
 '@
     [IO.File]::WriteAllText($qrScript, $qrSource, $Utf8NoBom)
+    $qrProcess = $Python
+    $qrArguments = "`"$qrScript`" `"$qrNew`""
+    if (-not (Test-PythonSnippet $Python "import qrcode" @() 10)) {
+        $uv = Get-HermesUv
+        if (-not $uv) {
+            throw "Pairing QR generation requires the verified Hermes uv runtime."
+        }
+        $qrProcess = $uv
+        $qrArguments = "run --isolated --no-project --python `"$Python`" --with qrcode==8.2 python `"$qrScript`" `"$qrNew`""
+    }
     try {
-        $start = New-Object Diagnostics.ProcessStartInfo
-        $start.FileName = $Python
-        $start.Arguments = "`"$qrScript`" `"$QrFile`""
-        $start.WorkingDirectory = $HermesHome
-        $start.UseShellExecute = $false
-        $start.CreateNoWindow = $true
-        $start.RedirectStandardInput = $true
-        $start.RedirectStandardOutput = $true
-        $start.RedirectStandardError = $true
-        $process = New-Object Diagnostics.Process
-        $process.StartInfo = $start
-        if (-not $process.Start()) { throw "Python QR process did not start." }
-        $process.StandardInput.Write($Link)
-        $process.StandardInput.Close()
-        if (-not $process.WaitForExit(30000)) {
-            try { $process.Kill() } catch {}
-            throw "Pairing QR generation timed out."
+        $qrOut = Join-Path $AuditDir "pairing-qr-$AttemptId.out.log"
+        $qrErr = Join-Path $AuditDir "pairing-qr-$AttemptId.err.log"
+        $result = Invoke-ContainedProcess -File $qrProcess `
+            -Arguments $qrArguments -TimeoutSeconds 90 `
+            -TerminationTimeoutSeconds $script:TerminationTimeoutSeconds `
+            -StdoutPath $qrOut -StderrPath $qrErr -StandardInput $Link
+        $validPng = $false
+        if ($result.ExitCode -eq 0 -and (Test-Path -LiteralPath $qrNew)) {
+            $png = [IO.File]::ReadAllBytes($qrNew)
+            $validPng = $png.Length -ge 24 -and
+                $png[0] -eq 0x89 -and $png[1] -eq 0x50 -and $png[2] -eq 0x4E -and $png[3] -eq 0x47 -and
+                $png[4] -eq 0x0D -and $png[5] -eq 0x0A -and $png[6] -eq 0x1A -and $png[7] -eq 0x0A
         }
-        $stderr = $process.StandardError.ReadToEnd()
-        if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $QrFile)) {
-            throw "Pairing QR generation failed: $stderr"
+        if (-not $validPng) {
+            throw "Pairing QR generation failed without producing a verified PNG file."
         }
+        Write-AtomicBytes -Path $QrFile -Bytes $png
     } finally {
-        Remove-Item -LiteralPath $qrScript -Force -ErrorAction SilentlyContinue
+        if ($script:MutationQuiescent) {
+            Remove-Item -LiteralPath $qrScript, $qrNew, $qrOut, $qrErr -Force -ErrorAction SilentlyContinue
+        }
     }
     Write-Audit "Pairing QR" "OK" $QrFile
     return $QrFile
@@ -919,18 +2365,18 @@ function Invoke-SetupInventory {
     if (-not $hermes) {
         [void]$missing.Add("Hermes Agent executable")
     } else {
-        try {
-            & $hermes --version *> $null
-            if ($LASTEXITCODE -ne 0) { [void]$missing.Add("Healthy Hermes Agent executable") }
-        } catch { [void]$missing.Add("Healthy Hermes Agent executable") }
+        if (-not (Test-HermesLauncher $hermes 15)) {
+            [void]$missing.Add("Healthy Hermes Agent executable")
+        }
     }
 
     $python = Get-HermesPython
     if (-not $python) {
         [void]$missing.Add("Hermes virtual-environment Python")
     } else {
-        & $python -c "import aiohttp" *> $null
-        if ($LASTEXITCODE -ne 0) { [void]$missing.Add("Python package aiohttp") }
+        if (-not (Test-PythonSnippet $python "import aiohttp" @() 15)) {
+            [void]$missing.Add("Python package aiohttp")
+        }
         try {
             [void](Install-VerifiedBridge $python)
         } catch {
@@ -982,19 +2428,7 @@ function Invoke-SetupInventory {
             $persistent = $task -and $task.Settings.Enabled -and
                 $action.Execute -eq $wscript -and $action.Arguments -eq $expectedArguments
         } catch {}
-        if (-not $persistent) {
-            $startup = [Environment]::GetFolderPath("Startup")
-            $shortcutPath = if ($startup) { Join-Path $startup "$name.lnk" } else { $null }
-            if ($shortcutPath -and (Test-Path -LiteralPath $shortcutPath)) {
-                try {
-                    $shell = New-Object -ComObject WScript.Shell
-                    $shortcut = $shell.CreateShortcut($shortcutPath)
-                    $persistent = $shortcut.TargetPath -eq $wscript -and
-                        $shortcut.Arguments -eq $expectedArguments
-                } catch {}
-            }
-        }
-        if (-not $persistent) { [void]$missing.Add("Exact per-user autostart for $name") }
+        if (-not $persistent) { [void]$missing.Add("Exact mandatory Scheduled Task for $name") }
     }
 
     foreach ($legacyName in @("Hermes Gateway", "Hermes Dashboard", "Hermes Mobile Bridge")) {
@@ -1043,9 +2477,9 @@ function Invoke-SetupInventory {
             }
         }
         try {
-            $credentials = Invoke-RestMethod -Method Get `
-                -Uri "http://127.0.0.1:9131/bridge/dashboard/credentials" `
-                -Headers @{ Authorization = "Bearer $key" } -TimeoutSec 4
+            $credentials = Invoke-HermesJsonRequest -Method Get `
+                -Url "http://127.0.0.1:9131/bridge/dashboard/credentials" `
+                -Token $key -TimeoutSeconds 4
             if ($credentials.password_set -ne $true) {
                 [void]$missing.Add("Dashboard password")
             }
@@ -1105,6 +2539,29 @@ function Invoke-SetupInventory {
     }
 }
 
+if ($env:HERMES_SETUP_REVIEW_MODE -eq "synthetic-canary") {
+    Write-Output "HERMES_SETUP_REVIEW_MODE_OK"
+    return
+}
+
+Assert-SupportedWindows
+$AttemptPaths = New-SetupAttemptPaths -HermesHome $HermesHome
+$BridgeNew = $AttemptPaths.BridgeNew
+$ManifestFile = $AttemptPaths.ManifestFile
+$PairingNew = $AttemptPaths.PairingNew
+$EnvNew = $AttemptPaths.EnvNew
+$SetupLockName = Get-SetupLockName $HermesHome
+$SetupLockHandle = Enter-SetupLock -Name $SetupLockName -TimeoutMilliseconds ([int]$LockTimeoutSec * 1000)
+
+try {
+Assert-SetupOwnership
+
+$Pairing = $null
+if (-not $AuditOnly) {
+    $Pairing = Get-PairingConfiguration
+    Assert-FirewallPreflight $Pairing
+}
+
 if ($AuditOnly) {
     Write-Audit "Setup" "INFO" "Audit-only mode; service files and tasks will not be modified"
     $inventory = Invoke-SetupInventory
@@ -1115,6 +2572,10 @@ if ($AuditOnly) {
     return
 }
 
+# Snapshot every reversible Windows integration target before its first mutation.
+$script:SetupTransaction = Initialize-SetupTransaction
+New-Item -ItemType Directory -Force -Path $HermesHome, $ServicesDir, $LogsDir, $AuditDir | Out-Null
+
 try {
     Write-Audit "Setup" "INFO" "Repair/install mode"
     Write-SetupPhase "Inspecting the existing installation"
@@ -1123,12 +2584,11 @@ try {
     $HermesExe = Install-HermesIfNeeded
     $PythonExe = Get-HermesPython
     if (-not $PythonExe) { throw "Hermes virtual-environment Python was not found." }
-    & $PythonExe -c "import aiohttp" *> $null
-    if ($LASTEXITCODE -ne 0) { throw "Hermes Python does not provide aiohttp." }
+    if (-not (Test-PythonSnippet $PythonExe "import aiohttp" @() 15)) {
+        throw "Hermes Python does not provide a working aiohttp import."
+    }
     Write-Audit "Hermes Python" "OK" "Python and aiohttp are available"
     $ApiKey = Ensure-ApiKey
-    $Pairing = Get-PairingConfiguration
-    $HadBridgeTarget = Test-Path -LiteralPath $BridgeTarget
     Write-SetupPhase "Verifying the Mobile Bridge release"
     $BridgeVersion = Install-VerifiedBridge $PythonExe
 
@@ -1223,12 +2683,8 @@ WScript.Quit rc
     $gatewayTask = Register-HermesTask "HermesConsole-Gateway" $gatewayRunner
     $dashboardTask = Register-HermesTask "HermesConsole-Dashboard" $dashboardRunner
     $bridgeTask = Register-HermesTask "HermesConsole-MobileBridge" $bridgeRunner
-    if ($dashboardTask) {
-        [void](Register-HermesManualTask "HermesConsole-Restart-Dashboard" $dashboardRestartRunner)
-    }
-    if ($bridgeTask) {
-        [void](Register-HermesManualTask "HermesConsole-Restart-MobileBridge" $bridgeRestartRunner)
-    }
+    [void](Register-HermesManualTask "HermesConsole-Restart-Dashboard" $dashboardRestartRunner)
+    [void](Register-HermesManualTask "HermesConsole-Restart-MobileBridge" $bridgeRestartRunner)
 
     Write-SetupPhase "Checking Gateway, Dashboard and credentials"
     $gatewayChanged = [bool]$script:RunnerChanged["hermes-gateway"] -or
@@ -1237,38 +2693,36 @@ WScript.Quit rc
         [bool]$script:TaskDefinitionsChanged["HermesConsole-MobileBridge"]
     $gatewayHealthy = Test-HermesService "gateway" "http://127.0.0.1:8642" $ApiKey
     if (-not $gatewayHealthy -or ($gatewayTask -and $gatewayChanged)) {
-        Start-HermesProcess "HermesConsole-Gateway" $gatewayRunner $gatewayTask 8642
+        Start-HermesProcess "HermesConsole-Gateway" 8642
     } else {
         Write-Audit "Gateway service" "SKIP" "Already healthy and authenticated"
     }
-    if (-not (Wait-HermesService "gateway" "http://127.0.0.1:8642" $ApiKey 15)) {
+    if (-not (Wait-HermesService "gateway" "http://127.0.0.1:8642" $ApiKey 60)) {
         throw "Gateway readiness failed. Inspect its Scheduled Task and the owner of TCP 8642."
     }
     Write-Ok "Gateway identity and authentication passed on 8642"
 
     $bridgeHealthy = Test-HermesService "bridge" "http://127.0.0.1:9131" $ApiKey $BridgeVersion
     if (-not $bridgeHealthy -or ($bridgeTask -and $bridgeChanged)) {
-        Start-HermesProcess "HermesConsole-MobileBridge" $bridgeRunner $bridgeTask 9131
+        Start-HermesProcess "HermesConsole-MobileBridge" 9131
     } else {
         Write-Audit "Mobile Bridge service" "SKIP" "Already healthy, authenticated and current"
     }
     if (-not (Wait-HermesService "bridge" "http://127.0.0.1:9131" $ApiKey 15 $BridgeVersion)) {
-        if ($script:BridgeChanged -and (Test-Path -LiteralPath $BridgeBackup)) {
-            Copy-Item -LiteralPath $BridgeBackup -Destination $BridgeTarget -Force
-            Start-HermesProcess "HermesConsole-MobileBridge" $bridgeRunner $bridgeTask 9131
-            [void](Wait-HermesService "bridge" "http://127.0.0.1:9131" $ApiKey 15)
-            Write-Audit "Mobile Bridge rollback" "WARN" "Restored the previous verified file after readiness failed"
-        } elseif (-not $HadBridgeTarget) {
-            Remove-Item -LiteralPath $BridgeTarget -Force -ErrorAction SilentlyContinue
-        }
         throw "Mobile Bridge did not pass health, auth and self-update checks. Inspect its Scheduled Task and TCP 9131."
     }
     Write-Ok "Mobile Bridge $BridgeVersion health, auth and self-update passed"
 
-    $bridgeHeaders = @{ Authorization = "Bearer $ApiKey" }
-    $currentCredentials = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:9131/bridge/dashboard/credentials" -Headers $bridgeHeaders -TimeoutSec 4
+    # Dashboard credentials must exist BEFORE the Dashboard starts: upstream
+    # refuses a non-loopback bind without a registered auth provider and exits,
+    # so gating Dashboard readiness first deadlocks every fresh LAN install.
+    # The Bridge has no reversible compare-and-swap for this config.yaml state,
+    # so a later rollback does not remove the credential; that residual only
+    # gates the Dashboard and is documented as non-transactional.
+    $currentCredentials = Invoke-HermesJsonRequest -Method Get `
+        -Url "http://127.0.0.1:9131/bridge/dashboard/credentials" -Token $ApiKey -TimeoutSeconds 4
     if ($currentCredentials.ok -ne $true) {
-        throw "Dashboard credential endpoint rejected the read."
+        throw "Dashboard credential state could not be read through the Mobile Bridge."
     }
     if ($currentCredentials.password_set -ne $true) {
         $passwordBytes = New-Object byte[] 24
@@ -1277,10 +2731,13 @@ WScript.Quit rc
         $password = [Convert]::ToBase64String($passwordBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
         $username = if ($currentCredentials.username) { $currentCredentials.username } else { "admin" }
         $body = @{ username = $username; password = $password } | ConvertTo-Json -Compress
-        $credentials = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:9131/bridge/dashboard/credentials" `
-            -Headers $bridgeHeaders -ContentType "application/json" -Body $body -TimeoutSec 6
+        $credentials = Invoke-HermesJsonRequest -Method Post `
+            -Url "http://127.0.0.1:9131/bridge/dashboard/credentials" `
+            -Token $ApiKey -Body $body -TimeoutSeconds 6
+        $password = $null
+        $body = $null
         if ($credentials.ok -ne $true) {
-            throw "Dashboard credential endpoint rejected the configuration."
+            throw "Dashboard credential provisioning was rejected by the Mobile Bridge."
         }
         Write-Audit "Dashboard credentials" "OK" "Created through the authenticated Mobile Bridge"
     } else {
@@ -1291,7 +2748,7 @@ WScript.Quit rc
     $dashboardStarting = $dashboardTask -and
         (Test-HermesTaskRunning "HermesConsole-Dashboard")
     if (-not $dashboardHealthy -and -not $dashboardStarting) {
-        Start-HermesProcess "HermesConsole-Dashboard" $dashboardRunner $dashboardTask 9119
+        Start-HermesProcess "HermesConsole-Dashboard" 9119
     } elseif ($dashboardStarting -and -not $dashboardHealthy) {
         # A previous setup can have timed out while npm/Vite kept building in
         # the persistent task. Restarting here creates a second build and can
@@ -1337,9 +2794,7 @@ WScript.Quit rc
         [IO.File]::ReadAllText($PairingFile).Trim() -eq $pairingJson) {
         Write-Audit "Pairing record" "SKIP" "Existing verified endpoints retained"
     } else {
-        $pairingNew = "$PairingFile.new"
-        [IO.File]::WriteAllText($pairingNew, $pairingJson, $Utf8NoBom)
-        Move-Item -LiteralPath $pairingNew -Destination $PairingFile -Force
+        Write-AtomicBytes -Path $PairingFile -Bytes ($Utf8NoBom.GetBytes($pairingJson))
         Write-Audit "Pairing record" "OK" "Verified endpoint metadata updated"
     }
 
@@ -1354,6 +2809,9 @@ WScript.Quit rc
     if ($Pairing.Scheme -eq "https") { $query += "https=1" }
     $link = "hermes://pair?" + ($query -join "&")
     [void](Write-PairingQr $PythonExe $link)
+
+    Complete-SetupTransaction -Transaction $script:SetupTransaction
+
     Write-Audit "Setup" "OK" "All local and phone-facing checks passed; pairing QR is ready"
     Write-Audit "Setup summary" "OK" "Hermes Agent, Gateway, Dashboard and Mobile Bridge are ready; private phone access passed"
     [PSCustomObject]@{
@@ -1371,13 +2829,48 @@ WScript.Quit rc
     } | ConvertTo-Json -Compress
 } catch {
     $safeError = Protect-AuditText $_.Exception.Message
-    Write-Audit "Setup" "ERROR" $safeError
+    try { Write-Audit "Setup" "ERROR" $safeError } catch {}
+    $rollback = $null
+    if ($script:SetupTransaction -and -not $script:IntegrationCommitted) {
+        try {
+            $rollback = Invoke-SetupRollback -Transaction $script:SetupTransaction
+        } catch {
+            $rollback = [PSCustomObject]@{ Complete = $false; Failures = @("rollback-engine") }
+        }
+    }
+    if ($rollback -and $rollback.Complete) {
+        try {
+            Remove-EmptyAttemptDirectories
+        } catch {
+            $rollback = [PSCustomObject]@{ Complete = $false; Failures = @("directory-cleanup") }
+        }
+    }
+    $rollbackState = if ($script:IntegrationCommitted) {
+        "not-applicable-post-commit"
+    } elseif ($rollback -and $rollback.Complete) {
+        "complete"
+    } elseif ($rollback) {
+        "incomplete-$($rollback.Failures.Count)"
+    } else {
+        "not-started"
+    }
     [PSCustomObject]@{
         ok = $false
         error = $safeError
+        rollback = $rollbackState
         audit = $AuditLog
     } | ConvertTo-Json -Compress
     throw $safeError
 } finally {
-    Remove-Item -LiteralPath $BridgeNew, $ManifestFile, "$PairingFile.new" -Force -ErrorAction SilentlyContinue
+    if ($script:MutationQuiescent) { Remove-OwnedSetupFiles -Paths $AttemptPaths }
+}
+} finally {
+    if ($script:MutationQuiescent) {
+        Remove-OwnedSetupFiles -Paths $AttemptPaths
+        Exit-SetupLock -Lock $SetupLockHandle
+    } else {
+        [AppDomain]::CurrentDomain.SetData("HermesConsole.UnresolvedJob", $script:UnresolvedContainedProcess)
+        [AppDomain]::CurrentDomain.SetData("HermesConsole.UnresolvedSetupLock", $SetupLockHandle)
+        Write-Warning "Process quiescence was not verified; this host retains the setup lock and Job Object."
+    }
 }

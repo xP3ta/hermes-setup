@@ -1,5 +1,5 @@
 # Hermes Console - verify all native Windows services, then reprint pairing QR.
-param()
+param([switch]$Repair)
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -55,16 +55,35 @@ function Test-PrivateIpv4([string]$Address) {
         ($bytes[0] -eq 192 -and $bytes[1] -eq 168)
 }
 
+function Test-AllowedIpAddress([string]$Address) {
+    $parsed = $null
+    if (-not ([Net.IPAddress]::TryParse($Address, [ref]$parsed))) { return $false }
+    if ($parsed.IsIPv4MappedToIPv6) { $parsed = $parsed.MapToIPv4() }
+    $bytes = $parsed.GetAddressBytes()
+    if ($bytes.Length -eq 4) {
+        return (Test-PrivateIpv4 $parsed.IPAddressToString) -or
+            (Test-Cgnat $parsed.IPAddressToString) -or
+            $bytes[0] -eq 127 -or
+            ($bytes[0] -eq 169 -and $bytes[1] -eq 254)
+    }
+    return $parsed.Equals([Net.IPAddress]::IPv6Loopback) -or
+        $parsed.IsIPv6LinkLocal -or (($bytes[0] -band 0xFE) -eq 0xFC)
+}
+
 function Test-PrivateHost([string]$HostName) {
-    if (-not $HostName -or $HostName -eq "localhost") { return $false }
-    if ($HostName.EndsWith(".local") -or $HostName.EndsWith(".ts.net") -or $HostName -notmatch '\.') {
+    if (-not $HostName) { return $false }
+    $parsed = $null
+    if ([Net.IPAddress]::TryParse($HostName, [ref]$parsed)) {
+        return Test-AllowedIpAddress $parsed.IPAddressToString
+    }
+    if ($HostName -eq "localhost" -or $HostName.EndsWith(".local") -or
+        $HostName.EndsWith(".ts.net") -or $HostName -notmatch '\.') {
         return $true
     }
-    if ((Test-Cgnat $HostName) -or (Test-PrivateIpv4 $HostName)) { return $true }
     try {
         $addresses = @([Net.Dns]::GetHostAddresses($HostName))
         return $addresses.Count -gt 0 -and @($addresses | Where-Object {
-            -not ((Test-Cgnat $_.IPAddressToString) -or (Test-PrivateIpv4 $_.IPAddressToString))
+            -not (Test-AllowedIpAddress $_.IPAddressToString)
         }).Count -eq 0
     } catch {}
     return $false
@@ -77,12 +96,61 @@ function Assert-AllowedServiceUrl([string]$Url) {
         $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $uri.Port -lt 1) {
         throw "Invalid phone-facing service URL: $Url"
     }
-    if ($uri.IsLoopback) {
-        throw "Loopback is not reachable from the phone: $Url"
-    }
     if ($uri.Scheme -eq "https") { return }
     if (-not (Test-PrivateHost $uri.Host)) {
         throw "Public HTTP is blocked. Use LAN/Tailscale or HTTPS: $Url"
+    }
+}
+
+function Assert-HermesResponseStatus([int]$StatusCode, [bool]$Authenticated) {
+    if ($StatusCode -ge 300 -and $StatusCode -lt 400) {
+        $kind = if ($Authenticated) { "Authenticated" } else { "Service" }
+        throw "$kind redirects are refused."
+    }
+}
+
+function Invoke-HermesJsonRequest {
+    [CmdletBinding()]
+    param(
+        [ValidateSet("Get", "Post")][string]$Method,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [string]$Token = "",
+        [ValidateRange(1, 120)][int]$TimeoutSeconds = 6,
+        [string]$Body = ""
+    )
+    $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
+    $request.Method = $Method.ToUpperInvariant()
+    $request.AllowAutoRedirect = $false
+    $request.Timeout = $TimeoutSeconds * 1000
+    $request.ReadWriteTimeout = $TimeoutSeconds * 1000
+    $request.Accept = "application/json"
+    if ($Token) { $request.Headers["Authorization"] = "Bearer $Token" }
+    if ($Method -eq "Post") {
+        $request.ContentType = "application/json"
+        $payload = [Text.Encoding]::UTF8.GetBytes($Body)
+        $request.ContentLength = $payload.Length
+        $requestStream = $request.GetRequestStream()
+        try { $requestStream.Write($payload, 0, $payload.Length) } finally { $requestStream.Dispose() }
+    }
+    $response = $null
+    try {
+        $response = [Net.HttpWebResponse]$request.GetResponse()
+        $status = [int]$response.StatusCode
+        Assert-HermesResponseStatus $status ([bool]$Token)
+        $reader = New-Object IO.StreamReader($response.GetResponseStream(), [Text.Encoding]::UTF8)
+        try { $json = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        return $json | ConvertFrom-Json
+    } catch [Net.WebException] {
+        if ($_.Exception.Response) {
+            $errorResponse = [Net.HttpWebResponse]$_.Exception.Response
+            try {
+                $status = [int]$errorResponse.StatusCode
+                Assert-HermesResponseStatus $status ([bool]$Token)
+            } finally { $errorResponse.Dispose() }
+        }
+        throw
+    } finally {
+        if ($response) { $response.Dispose() }
     }
 }
 
@@ -94,23 +162,23 @@ function Test-HermesService(
     $base = $BaseUrl.TrimEnd('/')
     try {
         if ($Kind -eq "gateway") {
-            $health = Invoke-RestMethod -Method Get -Uri "$base/health" -TimeoutSec 6
+            $health = Invoke-HermesJsonRequest -Method Get -Url "$base/health" -TimeoutSeconds 6
             if ($health.status -ne "ok" -or $health.platform -ne "hermes-agent") {
                 return $false
             }
-            $sessions = Invoke-RestMethod -Method Get -Uri "$base/api/sessions" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 6
+            $sessions = Invoke-HermesJsonRequest -Method Get -Url "$base/api/sessions" -Token $Token -TimeoutSeconds 6
             return $sessions.object -eq "list" -and $null -ne $sessions.data
         }
         if ($Kind -eq "bridge") {
-            $health = Invoke-RestMethod -Method Get -Uri "$base/bridge/health" -TimeoutSec 6
+            $health = Invoke-HermesJsonRequest -Method Get -Url "$base/bridge/health" -TimeoutSeconds 6
             if ($health.status -ne "ok" -or -not $health.version) { return $false }
-            $caps = Invoke-RestMethod -Method Get -Uri "$base/bridge/capabilities" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 6
+            $caps = Invoke-HermesJsonRequest -Method Get -Url "$base/bridge/capabilities" -Token $Token -TimeoutSeconds 6
             return ($caps.object -eq "hermes.bridge.capabilities") -and
                 ($caps.operations.self_update -eq $true) -and
                 (@($caps.scopes) -contains "read") -and
                 (@($caps.scopes) -contains "config")
         }
-        $status = Invoke-RestMethod -Method Get -Uri "$base/api/status" -TimeoutSec 6
+        $status = Invoke-HermesJsonRequest -Method Get -Url "$base/api/status" -TimeoutSeconds 6
         return [bool]$status.version -and $status.gateway_running -eq $true
     } catch {
         return $false
@@ -120,18 +188,43 @@ function Test-HermesService(
 function Render-Qr([string]$Link) {
     if (-not (Test-Path -LiteralPath $Python)) { return $false }
     $code = "import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)"
-    & $Python -c "import qrcode" 2>$null
-    if ($LASTEXITCODE -ne 0) { & $Python -m pip install -q qrcode *> $null }
-    & $Python -c $code $Link
-    return $LASTEXITCODE -eq 0
+    $uv = Join-Path $HermesHome "bin\uv.exe"
+    $qrProcess = $Python
+    $qrArguments = @("-c", $code, $Link)
+    if (Test-Path -LiteralPath $uv) {
+        # Never probe or mutate the Hermes venv: reuse the pinned, isolated
+        # uv QR runtime that the setup uses. Native stderr must not escape as
+        # a terminating NativeCommandError under `$ErrorActionPreference =
+        # "Stop"` (Windows PowerShell 5.1 turns it into a thrown error even
+        # with 2>$null, aborting the script before the link prints).
+        $qrProcess = $uv
+        $qrArguments = @("run", "--isolated", "--no-project", "--python", $Python,
+            "--with", "qrcode==8.2", "python", "-c", $code, $Link)
+    }
+    $previousPreference = $ErrorActionPreference
+    $previousIoEncoding = $env:PYTHONIOENCODING
+    try {
+        $ErrorActionPreference = "Continue"
+        # print_ascii emits U+2588 block characters; the legacy Windows console
+        # codepage (e.g. cp1252) cannot encode them and python would die with
+        # UnicodeEncodeError instead of printing the QR.
+        $env:PYTHONIOENCODING = "utf-8"
+        & $qrProcess @qrArguments 2>$null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        $env:PYTHONIOENCODING = $previousIoEncoding
+    }
 }
 
 function Invoke-VerifiedSetupRepair([string]$Reason) {
     $setupUrl = "$RepoRaw/hermes-mobile-setup.ps1"
     Write-Host ""
-    Write-Host "Hermes Console needs to upgrade or repair this installation before pairing." -ForegroundColor Yellow
+    Write-Host "Explicit repair was requested for Hermes Console." -ForegroundColor Yellow
     Write-Host "Reason: $Reason"
-    Write-Host "Running the verified Hermes Console setup now..." -ForegroundColor Cyan
+    Write-Host "Running the requested Hermes Console setup now..." -ForegroundColor Cyan
 
     try {
         $setupSource = [string](Invoke-RestMethod -Method Get -Uri $setupUrl -TimeoutSec 30)
@@ -155,23 +248,36 @@ function Invoke-VerifiedSetupRepair([string]$Reason) {
     Write-Host "Setup/repair completed. Use the QR printed above to connect Hermes Console." -ForegroundColor Green
 }
 
+function Require-ExplicitRepair([string]$Reason) {
+    if ($Repair) {
+        Invoke-VerifiedSetupRepair $Reason
+        return
+    }
+    throw "Pairing is read-only and requires repair: $Reason Re-run this script with -Repair to opt in explicitly."
+}
+
+if ($env:HERMES_SETUP_REVIEW_MODE -eq "synthetic-canary") {
+    Write-Output "HERMES_PAIR_REVIEW_MODE_OK"
+    return
+}
+
 $ApiKey = Get-ApiKey
 if (-not $ApiKey) {
-    Invoke-VerifiedSetupRepair "No valid API token was found."
+    Require-ExplicitRepair "No valid API token was found."
     return
 }
 if (-not (Test-Path -LiteralPath $PairingFile)) {
-    Invoke-VerifiedSetupRepair "This installation predates verified pairing."
+    Require-ExplicitRepair "This installation predates verified pairing."
     return
 }
 try {
     $pairing = Get-Content -LiteralPath $PairingFile -Raw | ConvertFrom-Json
 } catch {
-    Invoke-VerifiedSetupRepair "The saved pairing record is unreadable."
+    Require-ExplicitRepair "The saved pairing record is unreadable."
     return
 }
 if ($pairing.schema -ne 1) {
-    Invoke-VerifiedSetupRepair "The saved pairing record is outdated."
+    Require-ExplicitRepair "The saved pairing record is outdated."
     return
 }
 $hostName = if ($env:HERMES_PAIR_HOST) { $env:HERMES_PAIR_HOST.Trim() } else { [string]$pairing.host }
