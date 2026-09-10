@@ -846,16 +846,36 @@ function Test-PlatformSupport {
         $script:SyntheticOs.Version = "10.0.26100"
         $script:SyntheticOs.BuildNumber = "26100"
         $env:PROCESSOR_ARCHITECTURE = "AMD64"
+        Assert-SupportedWindows
+        Assert-True $true "Windows Server (server product type) is accepted"
+
+        $script:SyntheticOs.ProductType = 2
+        $script:SyntheticOs.Caption = "Microsoft Windows Server 2022 Datacenter"
+        $script:SyntheticOs.Version = "10.0.20348"
+        $script:SyntheticOs.BuildNumber = "20348"
+        Assert-SupportedWindows
+        Assert-True $true "Windows Server (domain controller product type) is accepted"
+
+        $script:SyntheticOs.ProductType = 3
+        $script:SyntheticOs.Caption = "Microsoft Windows 10 Pro"
+        $script:SyntheticOs.Version = "10.0.19045"
+        $script:SyntheticOs.BuildNumber = "19045"
+        $env:PROCESSOR_ARCHITECTURE = "IA64"
+        $env:PROCESSOR_ARCHITEW6432 = $null
         $message = Assert-Throws { Assert-SupportedWindows } `
-            'supports only Windows 10 and Windows 11 \(x64 or ARM64\).*Detected: Microsoft Windows Server 2025 Datacenter.*build 26100.*No changes were made' `
-            "Windows Server is rejected clearly"
+            'supports Windows 10, Windows 11 and Windows Server \(x64 or ARM64\).*Detected: Microsoft Windows 10 Pro, version 10\.0\.19045, build 19045, unknown.*No changes were made' `
+            "unknown architecture is rejected clearly"
         Assert-True ($message -notmatch 'exception|stack|json|package') "unsupported-platform message contains no implementation noise"
+        $script:SyntheticOs.ProductType = 1
+        $env:PROCESSOR_ARCHITECTURE = "AMD64"
+        Assert-SupportedWindows
+        Assert-True $true "supported configuration is re-checked after a rejection"
 
         $script:SyntheticOs.ProductType = 1
         $script:SyntheticOs.Caption = "Microsoft Windows 8.1 Pro"
         $script:SyntheticOs.Version = "6.3.9600"
         $script:SyntheticOs.BuildNumber = "9600"
-        [void](Assert-Throws { Assert-SupportedWindows } 'supports only Windows 10 and Windows 11' "legacy Windows is rejected clearly")
+        [void](Assert-Throws { Assert-SupportedWindows } 'supports Windows 10, Windows 11 and Windows Server' "legacy Windows is rejected clearly")
 
         $script:SyntheticOs.Caption = "Microsoft Windows 11 Pro"
         $script:SyntheticOs.Version = "10.0.22631"
@@ -865,7 +885,7 @@ function Test-PlatformSupport {
 
         function global:Get-CimInstance { throw "synthetic CIM failure" }
         [void](Assert-Throws { Assert-SupportedWindows } `
-            'could not verify the Windows version.*supports only Windows 10 and Windows 11.*No changes were made' `
+            'could not verify the Windows version.*supports Windows 10, Windows 11 and Windows Server.*No changes were made' `
             "unverifiable Windows fails closed clearly")
 
         $raw = [IO.File]::ReadAllText($SetupScript)
