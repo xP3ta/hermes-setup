@@ -551,8 +551,10 @@ class DeliverySyntaxTests(unittest.TestCase):
 
     def test_portable_helper_exact_heredoc_renders_valid_shell(self) -> None:
         setup = SETUP.read_text(encoding="utf-8")
+        # El bloque incluye el paso de sustitucion; el helper contiene a su vez
+        # heredocs 'PY', asi que el ancla es la ultima linea de la sustitucion.
         statement = re.search(
-            r"""^cat > "\$HELPER" <<'HELPER_EOF'\n.*?^PY$""",
+            r"""^cat > "\$HELPER" <<'HELPER_EOF'\n.*?write_text\(text, encoding="utf-8"\)\nPY$""",
             setup,
             re.MULTILINE | re.DOTALL,
         )
