@@ -18,6 +18,7 @@ import base64
 import difflib
 import hashlib
 import hmac
+import io
 import json
 import os
 import platform
@@ -36,7 +37,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.18.0"
+VERSION = "1.18.1"
 
 
 def _default_hermes_home():
@@ -78,7 +79,7 @@ LOCAL_OLLAMA_NUM_CTX = 8192
 # @skill. 2–5 segmentos. Sin shell libre (subprocess con lista de args).
 SKILL_RE = re.compile(
     r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+){1,4}(@[A-Za-z0-9_.-]+)?$")
-SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SKILL_QUERY_RE = re.compile(r"^[A-Za-z0-9 _.\-]{1,60}$")
 # IDs/nombres de cron aceptados por el CLI. El primer carácter alfanumérico
 # evita que un valor controlado por el cliente se interprete como una opción.
@@ -91,6 +92,11 @@ BRIDGE_VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9
 BRIDGE_SOURCE_VERSION_RE = re.compile(
     r'''^VERSION\s*=\s*["']((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))["']\s*(?:#.*)?$''',
     re.MULTILINE,
+)
+BACKUP_ID_RE = re.compile(
+    r"^(?P<name>soul|persona|memory|user|cron|config)-"
+    r"(?P<timestamp>[0-9]{8}-[0-9]{6})"
+    r"(?:-(?P<nonce>[a-f0-9]{12,32}))?$"
 )
 BRIDGE_SCRIPT_PATH = Path(__file__).resolve()
 
@@ -131,23 +137,77 @@ SCOPES = {s.strip() for s in os.environ.get(
 
 # Claves cuyo valor se enmascara al leer un destino ro_redacted (config.yaml
 # contiene API keys/tokens del agente: nunca se exponen en crudo).
-_SECRET_KEY_RE = re.compile(
-    r"^(\s*[\w.-]*(?:key|token|secret|password|passwd|credential|"
-    r"auth|api|webhook|dsn|bearer)[\w.-]*\s*:\s*)(['\"]?)(?!\s*$)(.+?)\2\s*$",
-    re.IGNORECASE)
+_SECRET_KEY_PARTS = {
+    "api", "apikey", "auth", "authorization", "bearer", "credential",
+    "credentials", "cookie", "cookies", "dsn", "env", "environment",
+    "headers", "key", "passwd", "password", "secret", "token", "webhook",
+}
+_REDACTION_FAILURE = "# Configuration withheld: safe YAML projection failed.\n{}\n"
 
 
 def _redact_secrets(text):
-    """Enmascara valores de claves sensibles (heurística por nombre de clave)."""
-    out = []
-    for line in text.splitlines(keepends=True):
-        nl = "\n" if line.endswith("\n") else ""
-        m = _SECRET_KEY_RE.match(line.rstrip("\n"))
-        if m and m.group(3).strip() not in ("", "''", '""', "[]", "{}", "null"):
-            out.append(f"{m.group(1)}'***redacted***'{nl}")
-        else:
-            out.append(line)
-    return "".join(out)
+    """Parsea YAML y devuelve una proyección sin valores de credenciales.
+
+    Los comentarios y el estilo original no se copian: ambos pueden contener
+    secretos. Cualquier fallo de parser, tipo inesperado o ciclo de aliases
+    devuelve un documento constante que no incluye bytes de entrada.
+    """
+    try:
+        import yaml
+
+        data = yaml.safe_load(text)
+        if not isinstance(data, dict):
+            raise ValueError("config root must be a mapping")
+
+        def is_secret_key(key):
+            key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+            parts = {
+                part for part in re.split(r"[^a-z0-9]+", key.lower()) if part
+            }
+            compact = "".join(parts)
+            return bool(parts & _SECRET_KEY_PARTS) or any(
+                marker in compact for marker in (
+                    "apikey", "token", "password", "passwd", "secret",
+                    "privatekey", "webhooksecret",
+                )
+            )
+
+        def project(value, active):
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, dict):
+                if id(value) in active:
+                    raise ValueError("cyclic YAML mapping")
+                active.add(id(value))
+                try:
+                    result = {}
+                    for key, child in value.items():
+                        if not isinstance(key, str):
+                            raise ValueError("non-string YAML key")
+                        result[key] = (
+                            "***redacted***"
+                            if is_secret_key(key)
+                            else project(child, active)
+                        )
+                    return result
+                finally:
+                    active.remove(id(value))
+            if isinstance(value, list):
+                if id(value) in active:
+                    raise ValueError("cyclic YAML sequence")
+                active.add(id(value))
+                try:
+                    return [project(child, active) for child in value]
+                finally:
+                    active.remove(id(value))
+            raise ValueError("unsupported YAML value")
+
+        safe = project(data, set())
+        return yaml.safe_dump(
+            safe, allow_unicode=True, default_flow_style=False, sort_keys=False
+        )
+    except Exception:
+        return _REDACTION_FAILURE
 
 
 def _now_iso():
@@ -159,11 +219,31 @@ def _load_token():
     if env:
         return env
     if TOKEN_FILE.exists():
-        return TOKEN_FILE.read_text().strip()
+        persisted = TOKEN_FILE.read_text().strip()
+        if persisted:
+            return persisted
     tok = secrets.token_urlsafe(48)
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(tok)
-    TOKEN_FILE.chmod(0o600)
+    pending = TOKEN_FILE.with_name(
+        f".{TOKEN_FILE.name}.tmp-{secrets.token_hex(6)}"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(pending), flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(tok)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(pending, TOKEN_FILE)
+        TOKEN_FILE.chmod(0o600)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        pending.unlink(missing_ok=True)
+        raise
     return tok
 
 
@@ -210,10 +290,10 @@ def _audit(op, args, result, extra=None):
 def _check_auth(request, scope):
     """None si OK; web.Response 401/403 si no."""
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer ") or not hmac.compare_digest(
-            auth[7:].strip(), TOKEN):
+    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    if not TOKEN or not presented or not hmac.compare_digest(presented, TOKEN):
         return _err("invalid_token", "Token inválido", 401)
-    if scope and scope not in SCOPES and "read" != scope:
+    if scope and scope not in SCOPES:
         return _err("missing_scope", f"El token no tiene el scope '{scope}'", 403)
     return None
 
@@ -230,6 +310,80 @@ def _self_update_path_allowed():
     # comprobar is_symlink() sobre él no detectaría un enlace en la ruta
     # canónica. Validamos la entrada sin resolver antes de aceptar el swap.
     return not expected.is_symlink() and BRIDGE_SCRIPT_PATH == expected.resolve()
+
+
+def _self_update_lock_path(target):
+    return target.with_name(target.name + ".update.lock")
+
+
+def _claim_self_update_lock(target, version):
+    lock = _self_update_lock_path(target)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(lock), flags, 0o600)
+    except FileExistsError as ex:
+        raise ValueError("update already pending") from ex
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(json.dumps({"version": version, "pid": os.getpid()}))
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        lock.unlink(missing_ok=True)
+        raise
+    return lock
+
+
+def _copy_file_exclusive(source, destination):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(destination), flags, 0o600)
+    try:
+        with source.open("rb") as input_file, os.fdopen(fd, "wb") as output:
+            shutil.copyfileobj(input_file, output)
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def _retain_self_update_rollback(backup):
+    if not backup.exists():
+        return None
+    if backup.is_symlink() or not backup.is_file():
+        raise ValueError("unsafe rollback path")
+    for _ in range(16):
+        retained = backup.with_name(
+            f"{backup.name}.retained-{time.strftime('%Y%m%d-%H%M%S')}-"
+            f"{secrets.token_hex(6)}"
+        )
+        try:
+            _copy_file_exclusive(backup, retained)
+        except FileExistsError:
+            continue
+        backup.unlink()
+        return retained
+    raise OSError("could not retain previous rollback")
+
+
+def _rollback_staged_update(target, backup):
+    """Restaura el candidato previo y libera la exclusión de actualización."""
+    if not backup.is_file() or backup.is_symlink():
+        return False
+    os.replace(backup, target)
+    target.chmod(0o600)
+    _self_update_lock_path(target).unlink(missing_ok=True)
+    return True
 
 
 def _stage_self_update(body):
@@ -266,25 +420,32 @@ def _stage_self_update(body):
         raise ValueError("unsupported path")
 
     target = BRIDGE_SCRIPT_PATH
+    _claim_self_update_lock(target, version)
     pending = target.with_name(target.name + ".new")
     backup = target.with_name(target.name + ".rollback")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    activated = False
     try:
+        _retain_self_update_rollback(backup)
         fd = os.open(str(pending), flags, 0o600)
         with os.fdopen(fd, "wb") as out:
             out.write(payload)
             out.flush()
             os.fsync(out.fileno())
-        shutil.copy2(target, backup)
-        backup.chmod(0o600)
+        _copy_file_exclusive(target, backup)
         os.replace(pending, target)
+        activated = True
         target.chmod(0o600)
     except Exception:
         try:
             pending.unlink(missing_ok=True)
         except Exception:
             pass
+        if activated:
+            _rollback_staged_update(target, backup)
+        else:
+            _self_update_lock_path(target).unlink(missing_ok=True)
         raise
     return target, backup, version
 
@@ -361,6 +522,7 @@ def _detached_popen(args):
 _SELF_UPDATE_WATCHDOG = r'''
 import json, os, subprocess, sys, time, urllib.request
 target, backup, version, health, restart_json = sys.argv[1:6]
+lock = target + ".update.lock"
 restart_command = json.loads(restart_json)
 for _ in range(10):
     time.sleep(2)
@@ -368,22 +530,39 @@ for _ in range(10):
         with urllib.request.urlopen(health, timeout=2) as response:
             data = json.loads(response.read(65536).decode("utf-8"))
         if data.get("status") == "ok" and data.get("version") == version:
+            try:
+                os.unlink(lock)
+            except FileNotFoundError:
+                pass
             raise SystemExit(0)
     except Exception:
         pass
+restored = False
 if os.path.isfile(backup):
-    os.replace(backup, target)
+    try:
+        os.replace(backup, target)
+        restored = True
+    except OSError:
+        pass
+if restored:
     if restart_command:
-        kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL, close_fds=True)
-        if os.name == "nt":
-            kwargs["creationflags"] = (
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "DETACHED_PROCESS", 0)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        else:
-            kwargs["start_new_session"] = True
-        subprocess.Popen(restart_command, **kwargs)
+        try:
+            kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, close_fds=True)
+            if os.name == "nt":
+                kwargs["creationflags"] = (
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    | getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            else:
+                kwargs["start_new_session"] = True
+            subprocess.Popen(restart_command, **kwargs)
+        except OSError:
+            pass
+    try:
+        os.unlink(lock)
+    except FileNotFoundError:
+        pass
 '''
 
 
@@ -462,6 +641,76 @@ def _unified_diff(old, new, label):
         fromfile=f"a/{label}", tofile=f"b/{label}"))
 
 
+def _create_backup(path, name):
+    """Copia [path] a un backup único creado con O_EXCL."""
+    backup_root = BACKUP_DIR.resolve()
+    if not _path_is_below(backup_root, HERMES_HOME):
+        raise OSError("backup directory escaped HERMES_HOME")
+    if not _path_is_below(path.resolve(), HERMES_HOME):
+        raise OSError("backup source escaped HERMES_HOME")
+    backup_root.mkdir(parents=True, exist_ok=True)
+    for _ in range(16):
+        backup_id = (
+            f"{name}-{time.strftime('%Y%m%d-%H%M%S')}-"
+            f"{secrets.token_hex(6)}"
+        )
+        destination = backup_root / f"{backup_id}{path.suffix}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(str(destination), flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            with path.open("rb") as source, os.fdopen(fd, "wb") as output:
+                shutil.copyfileobj(source, output)
+                output.flush()
+                os.fsync(output.fileno())
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            destination.unlink(missing_ok=True)
+            raise
+        return backup_id
+    raise OSError("could not allocate a unique backup")
+
+
+def _atomic_write_bytes(path, content):
+    """Escribe junto al destino y lo reemplaza solo tras fsync completo."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(16):
+        pending = path.with_name(f".{path.name}.tmp-{secrets.token_hex(6)}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(str(pending), flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise OSError("could not allocate an atomic write")
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(pending, path)
+        path.chmod(0o600)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        pending.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_write_text(path, content):
+    _atomic_write_bytes(path, content.encode("utf-8"))
+
+
 # ── Handlers ─────────────────────────────────────────────────────────────
 
 async def health(request):
@@ -502,10 +751,10 @@ async def capabilities(request):
             "skills_install": can_write and "skills" in SCOPES,
             "skills_remove": can_write and "skills" in SCOPES,
             "skills_toggle": can_write and "skills" in SCOPES,
-            "chat": "command" in SCOPES,
+            "chat": can_write and "command" in SCOPES,
             # marcador de soporte de perfil en el chat (la app lo usa para
             # decidir aislamiento completo vs personalidad).
-            "chat_profile": "command" in SCOPES,
+            "chat_profile": can_write and "command" in SCOPES,
             "logs_extended": True,
             "audit_read": True,
             "self_update": can_write and "config" in SCOPES
@@ -529,12 +778,20 @@ async def self_update(request):
         return _err("bad_json", "Cuerpo no es JSON válido")
     try:
         target, backup, version = _stage_self_update(body)
-        _launch_self_update_watchdog(target, backup, version)
     except ValueError:
         return _err("invalid_release", "Release del bridge no válida", 400)
     except Exception as ex:
         _audit("self_update", {}, "error", {"detail": type(ex).__name__})
         return _err("self_update_failed", "No se pudo preparar la actualización", 500)
+    try:
+        _launch_self_update_watchdog(target, backup, version)
+    except Exception as ex:
+        try:
+            _rollback_staged_update(target, backup)
+        except OSError:
+            pass
+        _audit("self_update", {}, "error", {"detail": type(ex).__name__})
+        return _err("self_update_failed", "No se pudo vigilar la actualización", 500)
 
     _audit("self_update", {"version": version}, "accepted")
     global _SELF_UPDATE_RESTART_TASK
@@ -590,7 +847,7 @@ async def read_file(request):
         content = _redact_secrets(content)
     return web.json_response({
         "ok": True, "file": name, "path": str(path), "mode": mode,
-        "writable": mode == "rw" and not READ_ONLY,
+        "writable": mode == "rw" and not READ_ONLY and scope in SCOPES,
         "redacted": redacted,
         "exists": True, "content": content,
         "size": len(content.encode("utf-8")),
@@ -638,13 +895,13 @@ async def write_file(request):
         })
 
     backup_id = None
-    if path.exists():
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        backup_id = f"{name}-{ts}"
-        shutil.copy2(path, BACKUP_DIR / f"{backup_id}{path.suffix}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
+    try:
+        if path.exists():
+            backup_id = _create_backup(path, name)
+        _atomic_write_text(path, content)
+    except OSError:
+        _audit("write", {"file": name}, "error", {"backup_id": backup_id})
+        return _err("write_failed", "No se pudo escribir el destino", 500)
     _audit("write", {"file": name}, "ok", {"backup_id": backup_id})
     return web.json_response({
         "ok": True, "file": name, "path": str(path),
@@ -653,7 +910,7 @@ async def write_file(request):
 
 
 async def rollback(request):
-    if (e := _check_auth(request, "memory")):
+    if (e := _check_auth(request, None)):
         return e
     if READ_ONLY:
         return _err("bridge_read_only", "Modo solo lectura", 403)
@@ -662,17 +919,36 @@ async def rollback(request):
     except Exception:
         return _err("bad_json", "Cuerpo no es JSON válido")
     backup_id = str(body.get("backup_id", ""))
-    if "/" in backup_id or ".." in backup_id:
+    backup_match = BACKUP_ID_RE.fullmatch(backup_id)
+    if not backup_match:
         return _err("bad_backup_id", "backup_id inválido")
-    # name-ts -> destino allowlisted
-    name = backup_id.rsplit("-", 2)[0]
-    path, _, _, err = _resolve_target(name)
+    name = backup_match.group("name")
+    path, scope, mode, err = _resolve_target(name)
     if err:
         return err
-    matches = list(BACKUP_DIR.glob(f"{backup_id}*"))
-    if not matches:
+    # El scope debe cubrir el destino, igual que en write(): un token que no
+    # puede editar config.yaml tampoco puede restaurarlo desde un backup.
+    if (e := _check_auth(request, scope)):
+        return e
+    if mode != "rw":
+        return _err("not_writable",
+                    f"El destino '{name}' es de solo lectura", 403)
+    if (e := _check_auth(request, scope)):
+        return e
+    backup = BACKUP_DIR / f"{backup_id}{path.suffix}"
+    try:
+        backup_root = BACKUP_DIR.resolve()
+        backup_resolved = backup.resolve()
+    except OSError:
         return _err("backup_not_found", "Backup no encontrado", 404)
-    shutil.copy2(matches[0], path)
+    if (backup.is_symlink() or not backup_resolved.is_file()
+            or not _path_is_below(backup_root, HERMES_HOME)
+            or not _path_is_below(backup_resolved, backup_root)):
+        return _err("backup_not_found", "Backup no encontrado", 404)
+    try:
+        _atomic_write_bytes(path, backup_resolved.read_bytes())
+    except OSError:
+        return _err("rollback_failed", "No se pudo restaurar el backup", 500)
     _audit("rollback", {"backup_id": backup_id}, "ok")
     return web.json_response({"ok": True, "restored": str(path)})
 
@@ -851,8 +1127,8 @@ def _resolve_profile(body):
 
     Defensa en profundidad: lista blanca estricta + rechazo de path-traversal +
     confinamiento del home bajo HERMES_HOME/profiles + el home debe existir. Un
-    perfil ausente/inválido degrada a default (None) en vez de fallar, para no
-    romper el chat ni crear homes fantasma."""
+    perfil ausente/inválido devuelve None; los handlers que aceptan perfiles
+    deben distinguirlo explícitamente del selector default."""
     p = body.get("profile")
     if not p or not isinstance(p, str):
         return None
@@ -870,8 +1146,21 @@ def _resolve_profile(body):
     except (ValueError, OSError):
         return None
     if not home.is_dir():
-        return None  # perfil inexistente → default (no crear nada)
+        return None
     return p
+
+
+def _requested_profile(body):
+    """Devuelve (perfil, error) sin degradar una selección explícita a default."""
+    raw = body.get("profile")
+    if raw is None:
+        return None, None
+    if isinstance(raw, str) and raw.strip() in {"", "default"}:
+        return None, None
+    profile = _resolve_profile(body)
+    if profile is None:
+        return None, _err("bad_profile", "Perfil inválido o inexistente")
+    return profile, None
 
 
 async def _ensure_ollama_running():
@@ -1076,6 +1365,8 @@ async def chat(request):
     """
     if (e := _check_auth(request, "command")):
         return e
+    if READ_ONLY:
+        return _err("bridge_read_only", "Modo solo lectura", 403)
     try:
         body = await request.json()
     except Exception:
@@ -1083,6 +1374,9 @@ async def chat(request):
     prompt = (body.get("prompt") or body.get("message") or "").strip()
     if not prompt:
         return _err("empty_prompt", "Falta el prompt")
+    prof, profile_error = _requested_profile(body)
+    if profile_error is not None:
+        return profile_error
     # Para proveedor ollama/custom: arranca ollama si está caído (causa nº1 del
     # silencio) y asegura el contexto >=64K (si no, el agente rechaza el turno).
     if (_config_model().get("provider") or "").lower() in ("custom", "ollama"):
@@ -1122,7 +1416,6 @@ async def chat(request):
         timeout = 300
     # Perfil de agente (opcional): aísla el turno en el home del perfil vía
     # `hermes --profile`. None → comportamiento actual (home default).
-    prof = _resolve_profile(body)
     # `-z` = oneshot: imprime SOLO el texto final (sin banner/spinner). El
     # prompt va como argumento (lista de args, sin shell).
     eff_timeout = min(max(timeout, 10), 600)
@@ -1373,6 +1666,8 @@ async def chat_stream(request):
     """
     if (e := _check_auth(request, "command")):
         return e
+    if READ_ONLY:
+        return _err("bridge_read_only", "Modo solo lectura", 403)
     try:
         body = await request.json()
     except Exception:
@@ -1380,6 +1675,9 @@ async def chat_stream(request):
     prompt = (body.get("prompt") or body.get("message") or "").strip()
     if not prompt:
         return _err("empty_prompt", "Falta el prompt")
+    prof, profile_error = _requested_profile(body)
+    if profile_error is not None:
+        return profile_error
     if (_config_model().get("provider") or "").lower() in ("custom", "ollama"):
         await _ensure_ollama_running()
     await _ensure_ollama_context()
@@ -1405,8 +1703,6 @@ async def chat_stream(request):
     # camino in-process NO puede aislar (HERMES_HOME se fija al importar
     # hermes_cli en el proceso del bridge), así que con perfil forzamos el
     # subprocess `hermes --profile`. None → comportamiento actual.
-    prof = _resolve_profile(body)
-
     # ---- ruta agente completo (full) + streaming SSE — sin cambios ----
     full = _build_chat_prompt(prompt, history)
     if len(full.encode()) > MAX_WRITE_BYTES:
@@ -2152,6 +2448,8 @@ async def diag_llamacpp(request):
     if (e := _check_auth(request, "command")):
         return e
     do_install = request.query.get("install", "1") not in ("0", "false", "no")
+    if READ_ONLY and do_install:
+        return _err("bridge_read_only", "Modo solo lectura", 403)
     lines = [f"Bridge v{VERSION}",
              "Benchmark llama.cpp — ¿tu GPU acelera el modelo local?"]
     tool, binary = _which_llamacpp()
@@ -2484,6 +2782,10 @@ def _find_skill_dir(name):
     SKILLS_DIRS. Devuelve un Path validado o None. [name] ya viene validado por
     SKILL_NAME_RE, pero comprobamos el confinamiento igualmente (defensa en
     profundidad: el resultado de resolve() debe colgar del root)."""
+    # Defensa en profundidad: un nombre hostil ('.', '..', 'a/b') no debe poder
+    # resolver a un directorio arbitrario por glob ni al propio root de skills.
+    if not SKILL_NAME_RE.match(name):
+        return None
     for root in SKILLS_DIRS:
         try:
             base = root.resolve()
@@ -2495,10 +2797,18 @@ def _find_skill_dir(name):
         # categoría (`<root>/<categoría>/<name>`, p.ej. creative/comfyui). Se
         # buscan ambos y se valida el confinamiento de cada candidato.
         candidates = [base / name] + list(base.glob(f"*/{name}"))
-        for cand in candidates:
+        for candidate in candidates:
             try:
-                cand = cand.resolve()
-                cand.relative_to(base)  # rechaza cualquier escape del root
+                if candidate.is_symlink():
+                    continue
+                cand = candidate.resolve()
+                if not _path_is_below(cand, base):
+                    continue
+                identity = cand / "SKILL.md"
+                if identity.is_symlink() or not identity.is_file():
+                    continue
+                if not _path_is_below(identity.resolve(), cand):
+                    continue
             except ValueError:
                 continue
             except Exception:
@@ -2506,6 +2816,31 @@ def _find_skill_dir(name):
             if cand.is_dir():
                 return cand
     return None
+
+
+def _archive_removed_skill(skill_dir, name):
+    """Mueve una skill no-hub a un backup único sin borrarla permanentemente."""
+    archive = (BACKUP_DIR / "removed-skills").resolve()
+    if not _path_is_below(archive, HERMES_HOME):
+        raise OSError("skill backup escaped HERMES_HOME")
+    archive.mkdir(parents=True, exist_ok=True)
+    for _ in range(16):
+        backup_id = (
+            f"{name}-{time.strftime('%Y%m%d-%H%M%S')}-"
+            f"{secrets.token_hex(6)}"
+        )
+        container = archive / backup_id
+        try:
+            container.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        try:
+            os.rename(skill_dir, container / "skill")
+            return backup_id
+        except Exception:
+            container.rmdir()
+            raise
+    raise OSError("could not allocate a unique skill backup")
 
 
 # El CLI solo desinstala skills "hub-installed". Para una builtin/bundled o
@@ -2541,24 +2876,26 @@ async def skills_remove(request):
     rc, log = await _run(cmd, timeout=180, stdin_text="y\n")
     low = log.lower()
 
-    # Camino especial: la skill no es hub-installed → el CLI no la tocó. Caemos
-    # al borrado directo del directorio de la skill (confinado y validado).
+    # Camino especial: la skill no es hub-installed → el CLI no la tocó. Movemos
+    # su directorio identificado a un backup recuperable y confinado.
     if _NOT_HUB_RE.search(low):
         skill_dir = _find_skill_dir(name)
         if skill_dir is not None:
             try:
-                shutil.rmtree(skill_dir)
+                backup_id = _archive_removed_skill(skill_dir, name)
             except Exception as ex:
                 _audit("skills_remove", {"name": name}, "fail",
-                       {"rc": rc, "mode": "direct", "error": str(ex)})
+                       {"rc": rc, "mode": "backup_move", "error": str(ex)})
                 return web.json_response(
                     {"ok": False, "name": name, "rc": rc,
-                     "log": f"{log}\nNo se pudo borrar {skill_dir}: {ex}"})
+                     "log": f"{log}\nNo se pudo respaldar la skill: {ex}"})
             _audit("skills_remove", {"name": name}, "ok",
-                   {"rc": rc, "mode": "direct", "dir": str(skill_dir)})
+                   {"rc": rc, "mode": "backup_move",
+                    "backup_id": backup_id})
             return web.json_response(
-                {"ok": True, "name": name, "rc": 0, "mode": "direct",
-                 "log": f"{log}\nBorrada directamente: {skill_dir}"})
+                {"ok": True, "name": name, "rc": 0,
+                 "mode": "backup_move", "backup_id": backup_id,
+                 "log": f"{log}\nMovida a backup recuperable: {backup_id}"})
         # No es hub-installed y no encontramos su directorio: no podemos quitarla
         # desde aquí con seguridad. Mensaje claro con el comando manual.
         _audit("skills_remove", {"name": name}, "fail",
@@ -2583,11 +2920,7 @@ CONFIG_PATH = HERMES_HOME / "config.yaml"
 
 
 def _backup_config():
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    backup_id = f"config-{ts}"
-    shutil.copy2(CONFIG_PATH, BACKUP_DIR / f"{backup_id}.yaml")
-    return backup_id
+    return _create_backup(CONFIG_PATH, "config")
 
 
 def _edit_config(mutator):
@@ -2606,8 +2939,9 @@ def _edit_config(mutator):
     backup_id = None
     if changed:
         backup_id = _backup_config()
-        with CONFIG_PATH.open("w") as f:
-            yaml.dump(data, f)
+        rendered = io.StringIO()
+        yaml.dump(data, rendered)
+        _atomic_write_text(CONFIG_PATH, rendered.getvalue())
     return changed, backup_id, data
 
 
