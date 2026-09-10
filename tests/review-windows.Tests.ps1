@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts")]
+    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose")]
     [string]$Case = "All",
     [string]$SetupScript = "",
     [string]$PairScript = ""
@@ -114,6 +114,14 @@ function Test-ParserBootstrap {
 
     $self = Parse-Product $PSCommandPath
     Assert-True ($self.Errors.Count -eq 0) "review suite parses"
+    # Windows PowerShell 5.1 reads a BOM-less file as ANSI: one non-ASCII byte
+    # (an em dash, a smart quote) silently terminates a string and breaks the
+    # whole script. Keep every published PowerShell artifact pure ASCII.
+    foreach ($artifact in @($SetupScript, $PairScript, $PSCommandPath)) {
+        $bytes = [IO.File]::ReadAllBytes($artifact)
+        Assert-True (@($bytes | Where-Object { $_ -gt 127 }).Count -eq 0) `
+            "$([IO.Path]::GetFileName($artifact)) stays pure ASCII for Windows PowerShell 5.1 without a BOM"
+    }
     Import-ProductFunction $setup "Initialize-WindowsJobApi"
     function global:Test-WindowsPlatform { return $true }
     Initialize-WindowsJobApi
@@ -943,7 +951,7 @@ function Test-ServiceRunnerEncoding {
         $global:AuditOnly = $false
         $global:AttemptId = "runner-encoding"
         $script:RunnerChanged = @{}
-        $content = "' Unicode runner: café 漢字`r`nWScript.Quit 0`r`n"
+        $content = "' Unicode runner: cafe ??`r`nWScript.Quit 0`r`n"
         $path = Write-ServiceRunner -Name "synthetic-runner" -Content $content
         $bytes = [IO.File]::ReadAllBytes($path)
         Assert-True ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) `
@@ -1092,8 +1100,103 @@ function Test-TopLevelTimeouts {
     }
 }
 
+function Test-PreflightDiagnose {
+    # Preflight: read-only checklist. Diagnose: redacted support bundle. Neither
+    # may take the setup lock, mutate a target home, or leak credentials.
+    Import-ProductFunction $setup "New-PreflightCheck"
+    Import-ProductFunction $setup "Protect-AuditText"
+    Import-ProductFunction $setup "Resolve-HermesHome"
+    Import-ProductFunction $setup "Invoke-SetupPreflight"
+    Import-ProductFunction $setup "Protect-DiagnosticText"
+    Import-ProductFunction $setup "Invoke-SetupDiagnose"
+    # Environment dependencies are stubbed: this case asserts the preflight and
+    # diagnostic contracts (bounded output, no mutation, redaction), not the
+    # host inventory those helpers collect. Earlier cases leave global stubs
+    # behind (synthetic CIM, synthetic web requests), so define our own.
+    function global:Assert-SupportedWindows { }
+    function global:Get-CimInstance {
+        param($ClassName, $Filter, $ErrorAction)
+        if ($ClassName -eq "Win32_LogicalDisk") {
+            return [PSCustomObject]@{ FreeSpace = 200GB; DeviceID = "C:" }
+        }
+        return [PSCustomObject]@{
+            Caption = "Microsoft Windows 11 Pro"
+            BuildNumber = "26200"
+            OSArchitecture = "64-bit"
+            Version = "10.0.26200"
+            ProductType = 1
+        }
+    }
+    function global:Invoke-WebRequest {
+        param($Uri, $Method, [switch]$UseBasicParsing, $TimeoutSec, $OutFile)
+        return [PSCustomObject]@{ StatusCode = 200 }
+    }
+    function global:Get-HermesExecutable { return $null }
+    function global:Test-HermesLauncher { param($Executable, $TimeoutSeconds) return $false }
+    function global:Get-PortOwner { param($Port) return $null }
+    function global:Get-ExistingHermesPortRecords { return @() }
+    function global:Assert-OwnedPortRecords { param($Records, $HermesHome) return }
+    function global:Get-PairingConfiguration {
+        return @{ Scheme = "https"; Address = "hermes.example.ts.net"; Port = 443; Kind = "mesh"; InterfaceIndex = $null }
+    }
+    function global:Get-IntegrationTaskNames { return @("HermesConsole-Gateway") }
+    function global:Invoke-SetupInventory {
+        return [PSCustomObject]@{ ready = $false; missing = @("stub item"); audit = "stub"; qr = $null }
+    }
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-preflight-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $fixtureHome = Join-Path $temp "home"
+    $oldHome = $env:HERMES_HOME
+    $oldRaw = $env:HERMES_REPO_RAW
+    $global:HermesHome = $fixtureHome
+    $global:AuditDir = Join-Path $fixtureHome "audit"
+    $global:AuditLog = Join-Path $global:AuditDir "safe-setup-audit.jsonl"
+    $global:LogsDir = Join-Path $fixtureHome "logs"
+    $global:InstallDir = Join-Path $fixtureHome "hermes-agent"
+    $global:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    try {
+        # A canary that must never reach any diagnostic output.
+        New-Item -ItemType Directory -Force -Path $global:AuditDir, $global:LogsDir | Out-Null
+        $canary = "CANARY-SECRET-0123456789abcdef"
+        [IO.File]::WriteAllText((Join-Path $fixtureHome ".env"), "API_SERVER_KEY=$canary`r`n")
+        [IO.File]::WriteAllText((Join-Path $global:LogsDir "gateway.log"),
+            "Authorization: Bearer $canary`r`nlink hermes://pair?host=10.0.0.5&token=$canary`r`n", $global:Utf8NoBom)
+        [IO.File]::WriteAllText($global:AuditLog,
+            ('{"step":"x","state":"OK","detail":"token=' + $canary + '"}' + [Environment]::NewLine), $global:Utf8NoBom)
+
+        # Protect-DiagnosticText removes bearers, key values and pairing links.
+        $redacted = Protect-DiagnosticText "Authorization: Bearer $canary and API_SERVER_KEY=$canary and hermes://pair?host=10.0.0.5&token=$canary"
+        Assert-True ($redacted -notmatch [regex]::Escape($canary)) "diagnostic redaction removes tokens and pairing links"
+
+        # Preflight: bounded checklist output and no target-home mutation.
+        # Write-Host emits on the information stream in PS 5.0+, so capture 6>&1.
+        $output = @(& { Invoke-SetupPreflight } 6>&1 2>&1 | ForEach-Object { [string]$_ })
+        $joined = $output -join "`n"
+        Assert-True ($joined -match '\[(PASS|FAIL|WARN)\] Windows edition') "preflight reports a bounded edition check"
+        Assert-True ($joined -match '"ok":(true|false)') "preflight prints a machine-readable summary"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixtureHome "console-services"))) `
+            "preflight performs no service-directory mutation"
+
+        # Diagnose: writes one report containing no secret material.
+        $report = Invoke-SetupDiagnose
+        Assert-True (Test-Path -LiteralPath $report) "diagnose writes a report"
+        $text = Get-Content -LiteralPath $report -Raw
+        Assert-True ($text -match 'setup_script_sha256') "diagnose records the setup identity"
+        Assert-True ($text -match '== Scheduled tasks ==') "diagnose includes service state sections"
+        Assert-True ($text -notmatch [regex]::Escape($canary)) "diagnose report contains no bearer, API key or pairing token"
+    } finally {
+        $env:HERMES_HOME = $oldHome
+        $env:HERMES_REPO_RAW = $oldRaw
+        foreach ($name in @("HermesHome", "AuditDir", "AuditLog", "LogsDir", "InstallDir")) {
+            Remove-Variable -Name $name -Scope Global -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $cases = if ($Case -eq "All") {
-    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts")
+    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose")
 } else { @($Case) }
 
 foreach ($selected in $cases) {
