@@ -3,6 +3,8 @@
 
 param(
     [switch]$AuditOnly,
+    [switch]$Preflight,
+    [switch]$Diagnose,
     [switch]$NoFirewallPrompt,
     [string]$InstallerTimeoutSec = "900",
     [string]$TerminationTimeoutSec = "15",
@@ -1009,7 +1011,7 @@ function Get-PowerShellExecutable {
 
 function Get-HermesExecutable {
     # Los runners persistentes usan este layout exacto. No aceptar un shim
-    # global de otra instalación: funcionaría durante el setup pero dejaría
+    # global de otra instalacio?n: funcionari?a durante el setup pero dejari?a
     # tareas apuntando a un venv distinto o inexistente.
     $candidate = Join-Path $InstallDir "venv\Scripts\hermes.exe"
     if (Test-Path -LiteralPath $candidate) { return $candidate }
@@ -1581,7 +1583,7 @@ function Get-PortOwner([int]$Port) {
 function Assert-PortAvailable([int]$Port, [string]$Service) {
     $owner = Get-PortOwner $Port
     if ($owner) {
-        # La línea de comandos puede contener tokens o credenciales. PID y
+        # La li?nea de comandos puede contener tokens o credenciales. PID y
         # nombre identifican al propietario sin copiar secretos al registro.
         throw "$Service port $Port is occupied by PID $($owner.Pid) $($owner.Name)."
     }
@@ -2239,7 +2241,7 @@ function Install-VerifiedBridge([string]$Python) {
             return $false
         }
         # Compila en memoria sin crear __pycache__. El proceso queda contenido
-        # y acotado igual que las demás herramientas nativas del setup.
+        # y acotado igual que las dema?s herramientas nativas del setup.
         return Test-PythonSnippet $Python `
             'import pathlib,sys;compile(pathlib.Path(sys.argv[1]).read_bytes(),sys.argv[1],"exec")' `
             @($Path) 20
@@ -2545,6 +2547,327 @@ function Invoke-SetupInventory {
 
 if ($env:HERMES_SETUP_REVIEW_MODE -eq "synthetic-canary") {
     Write-Output "HERMES_SETUP_REVIEW_MODE_OK"
+    return
+}
+
+function Test-OwnedListenerForHome([int]$Port, [string]$HomePath) {
+    try {
+        $records = @(Get-ExistingHermesPortRecords | Where-Object { $_.Port -eq $Port })
+        if ($records.Count -eq 0) { return $false }
+        try { Assert-OwnedPortRecords -Records $records -HermesHome $HomePath } catch { return $false }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function New-PreflightCheck([string]$Name, [string]$Status, [string]$Detail, [string]$Remedy) {
+    return [PSCustomObject]@{ Name = $Name; Status = $Status; Detail = $Detail; Remedy = $Remedy }
+}
+
+function Invoke-SetupPreflight {
+    # Read-only environment checklist: every condition a normal run needs, with
+    # one remediation line per failure. Runs before any lock, download or write.
+    $checks = New-Object System.Collections.Generic.List[object]
+    $nativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+
+    try {
+        Assert-SupportedWindows
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $checks.Add((New-PreflightCheck "Windows edition" "PASS" `
+            ("$(([string]$os.Caption).Trim()), build $($os.BuildNumber), $nativeArchitecture") ""))
+    } catch {
+        $checks.Add((New-PreflightCheck "Windows edition" "FAIL" $_.Exception.Message `
+            "Use Windows 10, Windows 11 or Windows Server on x64 or ARM64."))
+    }
+
+    $psVersion = $PSVersionTable.PSVersion.ToString()
+    if ($PSVersionTable.PSEdition -eq "Core" -and $PSVersionTable.PSVersion.Major -lt 7) {
+        $checks.Add((New-PreflightCheck "PowerShell" "FAIL" $psVersion `
+            "Use Windows PowerShell 5.1 or PowerShell 7 or newer."))
+    } else {
+        $checks.Add((New-PreflightCheck "PowerShell" "PASS" `
+            "$psVersion ($($PSVersionTable.PSEdition))" ""))
+    }
+
+    $isElevated = $false
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $isElevated = (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {}
+    $checks.Add((New-PreflightCheck "Elevation" $(if ($isElevated) { "PASS" } else { "WARN" }) `
+        $(if ($isElevated) { "elevated" } else { "standard user token" }) `
+        "Required only to create the restricted Windows Firewall rule; rerun from an elevated terminal if setup asks for it."))
+
+    try {
+        $resolvedHome = Resolve-HermesHome $HermesHome
+        $checks.Add((New-PreflightCheck "HERMES_HOME" "PASS" $resolvedHome ""))
+    } catch {
+        $checks.Add((New-PreflightCheck "HERMES_HOME" "FAIL" $_.Exception.Message `
+            "Set HERMES_HOME to one absolute, non-root path."))
+        $resolvedHome = $null
+    }
+
+    if ($resolvedHome) {
+        try {
+            if (Test-Path -LiteralPath $resolvedHome) {
+                $probe = Join-Path $resolvedHome (".hermes-preflight-" + [Guid]::NewGuid().ToString("N"))
+                [IO.File]::WriteAllText($probe, "probe")
+                Remove-Item -LiteralPath $probe -Force
+                $checks.Add((New-PreflightCheck "Home writable" "PASS" "write probe removed" ""))
+            } else {
+                $checks.Add((New-PreflightCheck "Home writable" "PASS" "fresh home will be created" ""))
+            }
+        } catch {
+            $checks.Add((New-PreflightCheck "Home writable" "FAIL" $_.Exception.Message `
+                "Grant the current user write access to HERMES_HOME or choose another path."))
+        }
+    }
+
+    foreach ($endpoint in @(
+        @{ Host = "raw.githubusercontent.com"; Why = "setup, Bridge and manifest downloads" },
+        @{ Host = "hermes-agent.nousresearch.com"; Why = "official Hermes Agent installer" }
+    )) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $response = Invoke-WebRequest -Uri "https://$($endpoint.Host)/" -Method Head -UseBasicParsing -TimeoutSec 10
+            $checks.Add((New-PreflightCheck "Reach $($endpoint.Host)" "PASS" `
+                "HTTP $([int]$response.StatusCode) - $($endpoint.Why)" ""))
+        } catch {
+            $checks.Add((New-PreflightCheck "Reach $($endpoint.Host)" "FAIL" $_.Exception.Message `
+                "Check DNS, proxy and outbound TLS; setup cannot download without it."))
+        }
+    }
+
+    $pairing = $null
+    try {
+        $pairing = Get-PairingConfiguration
+        $checks.Add((New-PreflightCheck "Phone-facing address" "PASS" `
+            "$($pairing.Scheme)://$($pairing.Address):$($pairing.Port) ($($pairing.Kind))" ""))
+    } catch {
+        $checks.Add((New-PreflightCheck "Phone-facing address" "FAIL" $_.Exception.Message `
+            "Connect Tailscale, join a private LAN, or set HERMES_PAIR_HOST with HERMES_PAIR_SCHEME=https."))
+    }
+
+    if ($pairing -and $pairing.Scheme -eq "http" -and $pairing.Kind -eq "lan" -and $pairing.InterfaceIndex) {
+        try {
+            $profile = Get-NetConnectionProfile -InterfaceIndex $pairing.InterfaceIndex -ErrorAction Stop
+            if ($profile.NetworkCategory -eq "Private") {
+                $checks.Add((New-PreflightCheck "Network profile" "PASS" "Private" ""))
+            } else {
+                $checks.Add((New-PreflightCheck "Network profile" "FAIL" $profile.NetworkCategory `
+                    "Mark the selected network as Private: Set-NetConnectionProfile -InterfaceIndex $($pairing.InterfaceIndex) -NetworkCategory Private"))
+            }
+        } catch {
+            $checks.Add((New-PreflightCheck "Network profile" "WARN" $_.Exception.Message `
+                "Verify the network is Private before exposing Hermes on the LAN."))
+        }
+    }
+
+    foreach ($service in @(
+        @{ Port = 8642; Name = "Gateway" },
+        @{ Port = 9119; Name = "Dashboard" },
+        @{ Port = 9131; Name = "Mobile Bridge" }
+    )) {
+        try {
+            $owner = Get-PortOwner $service.Port
+            if (-not $owner) {
+                $checks.Add((New-PreflightCheck "Port $($service.Port)" "PASS" "free" ""))
+            } elseif ($resolvedHome -and (Test-OwnedListenerForHome $service.Port $resolvedHome)) {
+                $checks.Add((New-PreflightCheck "Port $($service.Port)" "PASS" `
+                    "in use by this Hermes home (PID $($owner.Pid) $($owner.Name))" ""))
+            } else {
+                $checks.Add((New-PreflightCheck "Port $($service.Port)" "FAIL" `
+                    "occupied by PID $($owner.Pid) $($owner.Name)" `
+                    "Stop the process using TCP $($service.Port) or set another HERMES_HOME."))
+            }
+        } catch {
+            $checks.Add((New-PreflightCheck "Port $($service.Port)" "FAIL" $_.Exception.Message `
+                "TCP listener ownership could not be verified on this host."))
+        }
+    }
+
+    try {
+        $dist = Join-Path $InstallDir "hermes_cli\web_dist\index.html"
+        $nodePath = @(@(
+            (Join-Path $env:ProgramFiles "nodejs\node.exe"),
+            (Join-Path ${env:ProgramFiles(x86)} "nodejs\node.exe")
+        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+        $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+        if ($nodePath.Count -gt 0 -or $nodeCommand -or (Test-Path -LiteralPath $dist)) {
+            $detail = if ($nodePath.Count -gt 0) { $nodePath[0] } elseif ($nodeCommand) { $nodeCommand.Source } else { "Dashboard already built" }
+            $checks.Add((New-PreflightCheck "Dashboard toolchain" "PASS" $detail ""))
+        } else {
+            $checks.Add((New-PreflightCheck "Dashboard toolchain" "WARN" "Node.js not found and no existing build" `
+                "Install Node.js 22 LTS (or let setup install it) so the Dashboard bundle can be built."))
+        }
+    } catch {
+        $checks.Add((New-PreflightCheck "Dashboard toolchain" "WARN" $_.Exception.Message `
+            "Verify Node.js availability for the Dashboard build."))
+    }
+
+    try {
+        $root = [IO.Path]::GetPathRoot($HermesHome)
+        $drive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($root.TrimEnd('\'))'" -ErrorAction Stop
+        $freeGb = [math]::Round($drive.FreeSpace / 1GB, 1)
+        if ($freeGb -ge 5) {
+            $checks.Add((New-PreflightCheck "Free disk space" "PASS" "$freeGb GB on $root" ""))
+        } else {
+            $checks.Add((New-PreflightCheck "Free disk space" "FAIL" "$freeGb GB on $root" `
+                "Free at least 5 GB: Hermes Agent, its virtual environment and the Dashboard build need room."))
+        }
+    } catch {
+        $checks.Add((New-PreflightCheck "Free disk space" "WARN" $_.Exception.Message `
+            "Verify at least 5 GB free on the HERMES_HOME volume."))
+    }
+
+    $hermes = Get-HermesExecutable
+    if ($hermes -and (Test-HermesLauncher $hermes 15)) {
+        try {
+            $version = (& $hermes --version 2>$null | Select-Object -First 1)
+        } catch { $version = "unknown" }
+        $checks.Add((New-PreflightCheck "Existing Hermes Agent" "PASS" "healthy: $version" ""))
+    } elseif ($hermes) {
+        $checks.Add((New-PreflightCheck "Existing Hermes Agent" "FAIL" "launcher present but broken" `
+            "Repair or remove the broken managed Hermes Agent tree before rerunning setup."))
+    } else {
+        $checks.Add((New-PreflightCheck "Existing Hermes Agent" "PASS" "not installed yet (setup will install it)" ""))
+    }
+
+    $failures = @($checks | Where-Object { $_.Status -eq "FAIL" })
+    foreach ($check in $checks) {
+        $suffix = if ($check.Detail) { ": $($check.Detail)" } else { "" }
+        Write-Host ("[{0}] {1}{2}" -f $check.Status, $check.Name, $suffix)
+        if ($check.Remedy -and $check.Status -ne "PASS") {
+            Write-Host ("       -> {0}" -f $check.Remedy)
+        }
+    }
+    $blockingNames = @()
+    foreach ($failure in $failures) { $blockingNames += [string]$failure.Name }
+    [PSCustomObject]@{
+        ok = ($failures.Count -eq 0)
+        blocking = $blockingNames
+        checks = $checks.ToArray()
+    } | ConvertTo-Json -Compress -Depth 4
+    if ($failures.Count -gt 0) {
+        throw "Preflight found $($failures.Count) blocking item(s): $($blockingNames -join ', '). Nothing was changed."
+    }
+}
+
+function Protect-DiagnosticText([string]$Text) {
+    if (-not $Text) { return "" }
+    $safe = Protect-AuditText $Text
+    # Bearer tokens, hermes:// links, basic-auth hashes and long hex secrets.
+    $safe = $safe -replace '(?i)bearer\s+[A-Za-z0-9._~+/=-]{12,}', 'Bearer [REDACTED]'
+    $safe = $safe -replace '(?i)(bride?ge?_?token|api_server_key|password_hash|client_secret)\s*[:=]\s*\S+', '$1=[REDACTED]'
+    $safe = $safe -replace '(?i)"(token|bridge_token|password|api_key)"\s*:\s*"[^"]*"', '"$1":"[REDACTED]"'
+    return $safe
+}
+
+function Add-DiagnoseSection($Lines, [System.Collections.Generic.List[string]]$Out) {
+    foreach ($line in @($Lines)) { $Out.Add((Protect-DiagnosticText ([string]$line))) }
+}
+
+function Invoke-SetupDiagnose {
+    # Redacted support bundle: versions, task/listener/firewall state, log tails
+    # and the audit trail. No tokens, keys or pairing credentials are included.
+    $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+    $report = Join-Path $AuditDir ("hermes-diagnose-$stamp.txt")
+    $lines = New-Object System.Collections.Generic.List[string]
+    $scriptHash = ""
+    try { $scriptHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant() } catch {}
+
+    $lines.Add("Hermes Console setup diagnostic")
+    $lines.Add("generated_utc: $stamp")
+    $lines.Add("setup_script_sha256: $scriptHash")
+    $lines.Add("powershell: $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)")
+    $lines.Add("hermes_home: $HermesHome")
+    $lines.Add("user: $([Environment]::UserDomainName)\$([Environment]::UserName)")
+    $lines.Add("elevated: $((New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))")
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $lines.Add("os: $(([string]$os.Caption).Trim()) build $($os.BuildNumber) $($os.OSArchitecture)")
+    } catch { $lines.Add("os: unavailable") }
+
+    $lines.Add("")
+    $lines.Add("== Inventory ==")
+    # The inventory writes its audit trail, so the directory must exist first.
+    New-Item -ItemType Directory -Force -Path $AuditDir | Out-Null
+    try {
+        $inventory = Invoke-SetupInventory
+        $lines.Add("ready: $($inventory.ready)")
+        foreach ($item in @($inventory.missing)) { $lines.Add("missing: $item") }
+    } catch { $lines.Add("inventory_failed: $($_.Exception.Message)") }
+
+    $lines.Add("")
+    $lines.Add("== Scheduled tasks ==")
+    foreach ($task in @(Get-IntegrationTaskNames)) {
+        try {
+            $info = Get-ScheduledTaskInfo -TaskName $task -ErrorAction Stop
+            $state = (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue).State
+            $lines.Add(("{0}: state={1} lastRun={2} result={3}" -f $task, $state, $info.LastRunTime, $info.LastTaskResult))
+        } catch { $lines.Add("${task}: unavailable") }
+    }
+
+    $lines.Add("")
+    $lines.Add("== Listeners ==")
+    try {
+        foreach ($record in @(Get-ExistingHermesPortRecords)) {
+            $lines.Add(("port {0}: pid {1} {2}" -f $record.Port, $record.Pid, $record.ExecutablePath))
+        }
+    } catch { $lines.Add("listeners_unavailable: $($_.Exception.Message)") }
+
+    $lines.Add("")
+    $lines.Add("== Firewall rules ==")
+    try {
+        foreach ($rule in @(Get-NetFirewallRule -DisplayName "Hermes Console*" -ErrorAction SilentlyContinue)) {
+            $ports = ($rule | Get-NetFirewallPortFilter).LocalPort -join ","
+            $remote = ($rule | Get-NetFirewallAddressFilter).RemoteAddress -join ","
+            $lines.Add(("{0}: enabled={1} profile={2} ports={3} remote={4}" -f $rule.DisplayName, $rule.Enabled, $rule.Profile, $ports, $remote))
+        }
+    } catch { $lines.Add("firewall_unavailable: $($_.Exception.Message)") }
+
+    $lines.Add("")
+    $lines.Add("== Log tails ==")
+    foreach ($log in @("gateway.log", "gui.log", "errors.log")) {
+        $path = Join-Path $LogsDir $log
+        $lines.Add("-- $log --")
+        if (Test-Path -LiteralPath $path) {
+            try { Add-DiagnoseSection (Get-Content -LiteralPath $path -Tail 40) $lines }
+            catch { $lines.Add("unreadable: $($_.Exception.Message)") }
+        } else {
+            $lines.Add("absent")
+        }
+    }
+
+    $lines.Add("")
+    $lines.Add("== Audit trail (last 60 entries) ==")
+    if (Test-Path -LiteralPath $AuditLog) {
+        try { Add-DiagnoseSection (Get-Content -LiteralPath $AuditLog -Tail 60) $lines }
+        catch { $lines.Add("unreadable: $($_.Exception.Message)") }
+    } else {
+        $lines.Add("absent")
+    }
+
+    New-Item -ItemType Directory -Force -Path $AuditDir | Out-Null
+    [IO.File]::WriteAllText($report, (($lines -join [Environment]::NewLine) + [Environment]::NewLine), $Utf8NoBom)
+    Write-Host "Diagnostic written: $report"
+    Write-Host "No tokens, API keys or pairing credentials are included; review it before sharing."
+    return $report
+}
+
+if ($Preflight) {
+    Invoke-SetupPreflight
+    return
+}
+
+if ($Diagnose) {
+    [void](Invoke-SetupDiagnose)
     return
 }
 

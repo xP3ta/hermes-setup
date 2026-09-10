@@ -18,6 +18,36 @@ irm https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-mobile-setu
 
 That's it. When it finishes, it prints a QR code — scan it with the app (or copy the `hermes://pair?...` link) and you're connected.
 
+### Check the environment first (recommended)
+
+Setup is read-only until it starts installing. If you want to see what your
+machine is missing **before** anything happens, run the preflight (Windows):
+
+```powershell
+irm https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-mobile-setup.ps1 -OutFile "$env:TEMP\hermes-setup.ps1"
+& "$env:TEMP\hermes-setup.ps1" -Preflight
+```
+
+It prints one line per condition (Windows edition, PowerShell, elevation,
+HERMES_HOME, outbound network, LAN/Tailscale address, ports, Dashboard
+toolchain, disk space, existing install) and, for anything red, the exact
+command that fixes it. Nothing is downloaded or changed.
+
+### When something goes wrong
+
+```powershell
+& "$env:TEMP\hermes-setup.ps1" -Diagnose
+```
+
+It writes `%LOCALAPPDATA%\hermes\audit\hermes-diagnose-<timestamp>.txt` with
+versions, Scheduled Task/listener/firewall state, log tails and the audit
+trail — no tokens, API keys or pairing credentials. Share that file when asking
+for help: it is the difference between guessing and fixing.
+
+For a reproducible install that cannot change under you, use the newest tag
+instead of `main` (e.g.
+`https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.0.0/hermes-mobile-setup.ps1`).
+
 WSL deliberately uses the Windows path so setup can configure networking,
 Windows Firewall and persistent startup correctly. The Unix installer uses
 `systemd --user` on Linux and `launchd` on macOS. On
