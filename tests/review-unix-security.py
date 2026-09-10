@@ -535,8 +535,11 @@ class DeliverySyntaxTests(unittest.TestCase):
 
     def test_portable_helper_never_uses_command_substring_kills(self) -> None:
         setup = SETUP.read_text(encoding="utf-8")
+        # El helper se escribe como datos (heredoc citado) y se sustituye despues:
+        # un heredoc sin citar con otro dentro y parentesis sin compensar rompe el
+        # parser de bash 3.2 (/bin/sh de macOS).
         helper = re.search(
-            r'^cat > "\$HELPER" <<EOF\n(.*?)\nEOF$',
+            r"""^cat > "\$HELPER" <<'HELPER_EOF'\n(.*?)\nHELPER_EOF$""",
             setup,
             re.MULTILINE | re.DOTALL,
         )
@@ -549,7 +552,7 @@ class DeliverySyntaxTests(unittest.TestCase):
     def test_portable_helper_exact_heredoc_renders_valid_shell(self) -> None:
         setup = SETUP.read_text(encoding="utf-8")
         statement = re.search(
-            r'^cat > "\$HELPER" <<EOF\n.*?^EOF$',
+            r"""^cat > "\$HELPER" <<'HELPER_EOF'\n.*?^PY$""",
             setup,
             re.MULTILINE | re.DOTALL,
         )
@@ -585,6 +588,11 @@ class DeliverySyntaxTests(unittest.TestCase):
                 timeout=10,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
+            # La sustitucion explicita debe dejar el helper real, sin marcadores.
+            rendered = helper.read_text(encoding="utf-8")
+            self.assertNotIn("__VP__", rendered)
+            self.assertNotIn("__SERVICES__", rendered)
+            self.assertIn(str(temp / "services space"), rendered)
 
 
 class SetupLockTests(unittest.TestCase):

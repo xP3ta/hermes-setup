@@ -1323,26 +1323,26 @@ chmod 700 "$GATEWAY_RUNNER" "$DASHBOARD_RUNNER" "$BRIDGE_RUNNER"
 
 # Portable lifecycle helper. It only signals a PID through pidfd after its
 # kernel start time and executable match the identity captured at startup.
-cat > "$HELPER" <<EOF
+cat > "$HELPER" <<'HELPER_EOF'
 #!/bin/sh
 set -eu
-ACTION="\${1:-}"
-NAME="\${2:-}"
-case "\$NAME" in
-  gateway) RUNNER="$GATEWAY_RUNNER"; EXPECTED_ONE="$VP"; EXPECTED_TWO="$HB" ;;
-  dashboard) RUNNER="$DASHBOARD_RUNNER"; EXPECTED_ONE="$VP"; EXPECTED_TWO="$HB" ;;
-  bridge) RUNNER="$BRIDGE_RUNNER"; EXPECTED_ONE="$VP"; EXPECTED_TWO="$VP" ;;
+ACTION="${1:-}"
+NAME="${2:-}"
+case "$NAME" in
+  gateway) RUNNER="__GATEWAY_RUNNER__"; EXPECTED_ONE="__VP__"; EXPECTED_TWO="__HB__" ;;
+  dashboard) RUNNER="__DASHBOARD_RUNNER__"; EXPECTED_ONE="__VP__"; EXPECTED_TWO="__HB__" ;;
+  bridge) RUNNER="__BRIDGE_RUNNER__"; EXPECTED_ONE="__VP__"; EXPECTED_TWO="__VP__" ;;
   *) exit 2 ;;
 esac
-PIDFILE="$SERVICES/\$NAME.pid"
-STARTFILE="$SERVICES/\$NAME.start"
-EXEFILE="$SERVICES/\$NAME.exe"
-LOGFILE="$LOGS/\$NAME.log"
+PIDFILE="__SERVICES__/$NAME.pid"
+STARTFILE="__SERVICES__/$NAME.start"
+EXEFILE="__SERVICES__/$NAME.exe"
+LOGFILE="__LOGS__/$NAME.log"
 remove_identity() {
-  rm -f "\$PIDFILE" "\$STARTFILE" "\$EXEFILE"
+  rm -f "$PIDFILE" "$STARTFILE" "$EXEFILE"
 }
 process_identity() {
-  "$VP" - "\$1" <<'PY'
+  "__VP__" - "$1" <<'PY'
 import os, sys
 pid = int(sys.argv[1])
 with open(f"/proc/{pid}/stat", encoding="ascii") as source:
@@ -1352,7 +1352,7 @@ print(os.path.realpath(f"/proc/{pid}/exe"))
 PY
 }
 signal_owned() {
-  "$VP" - "\$1" "\$2" "\$3" <<'PY'
+  "__VP__" - "$1" "$2" "$3" <<'PY'
 import os, signal, sys
 pid = int(sys.argv[1])
 expected_start, expected_exe = sys.argv[2:]
@@ -1370,91 +1370,112 @@ finally:
 PY
 }
 stop_service() {
-  [ -f "\$PIDFILE" ] || return 0
-  PID="\$(sed -n '1p' "\$PIDFILE" 2>/dev/null || true)"
-  case "\$PID" in *[!0-9]*|'') remove_identity; return 0 ;; esac
-  if ! kill -0 "\$PID" 2>/dev/null; then
+  [ -f "$PIDFILE" ] || return 0
+  PID="$(sed -n '1p' "$PIDFILE" 2>/dev/null || true)"
+  case "$PID" in *[!0-9]*|'') remove_identity; return 0 ;; esac
+  if ! kill -0 "$PID" 2>/dev/null; then
     remove_identity
     return 0
   fi
-  RECORDED_START="\$(sed -n '1p' "\$STARTFILE" 2>/dev/null || true)"
-  RECORDED_EXE="\$(sed -n '1p' "\$EXEFILE" 2>/dev/null || true)"
-  CURRENT="\$(process_identity "\$PID" 2>/dev/null || true)"
-  CURRENT_START="\$(printf '%s\n' "\$CURRENT" | sed -n '1p')"
-  CURRENT_EXE="\$(printf '%s\n' "\$CURRENT" | sed -n '2p')"
-  if [ -z "\$RECORDED_START" ] || [ -z "\$RECORDED_EXE" ] || \
-     [ "\$CURRENT_START" != "\$RECORDED_START" ] || \
-     [ "\$CURRENT_EXE" != "\$RECORDED_EXE" ]; then
-    echo "Refusing to stop PID \$PID: exact Hermes \$NAME ownership is not proven." >&2
+  RECORDED_START="$(sed -n '1p' "$STARTFILE" 2>/dev/null || true)"
+  RECORDED_EXE="$(sed -n '1p' "$EXEFILE" 2>/dev/null || true)"
+  CURRENT="$(process_identity "$PID" 2>/dev/null || true)"
+  CURRENT_START="$(printf '%s\n' "$CURRENT" | sed -n '1p')"
+  CURRENT_EXE="$(printf '%s\n' "$CURRENT" | sed -n '2p')"
+  if [ -z "$RECORDED_START" ] || [ -z "$RECORDED_EXE" ] || \
+     [ "$CURRENT_START" != "$RECORDED_START" ] || \
+     [ "$CURRENT_EXE" != "$RECORDED_EXE" ]; then
+    echo "Refusing to stop PID $PID: exact Hermes $NAME ownership is not proven." >&2
     exit 3
   fi
-  if ! signal_owned "\$PID" "\$RECORDED_START" "\$RECORDED_EXE" 2>/dev/null; then
-    echo "Refusing to stop PID \$PID: atomic process identity verification is unavailable." >&2
+  if ! signal_owned "$PID" "$RECORDED_START" "$RECORDED_EXE" 2>/dev/null; then
+    echo "Refusing to stop PID $PID: atomic process identity verification is unavailable." >&2
     exit 3
   fi
   i=0
-  while kill -0 "\$PID" 2>/dev/null && [ "\$i" -lt 5 ]; do
+  while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 5 ]; do
     sleep 1
-    i=\$((i + 1))
+    i=$((i + 1))
   done
-  if kill -0 "\$PID" 2>/dev/null; then
-    echo "Hermes \$NAME did not stop cleanly; refusing to start a duplicate." >&2
+  if kill -0 "$PID" 2>/dev/null; then
+    echo "Hermes $NAME did not stop cleanly; refusing to start a duplicate." >&2
     return 1
   fi
   remove_identity
 }
 start_service() {
-  if [ -f "\$PIDFILE" ]; then
-    TRACKED="\$(sed -n '1p' "\$PIDFILE" 2>/dev/null || true)"
-    case "\$TRACKED" in
+  if [ -f "$PIDFILE" ]; then
+    TRACKED="$(sed -n '1p' "$PIDFILE" 2>/dev/null || true)"
+    case "$TRACKED" in
       *[!0-9]*|'') remove_identity ;;
       *)
-        if kill -0 "\$TRACKED" 2>/dev/null; then
-          echo "Refusing to overwrite the live Hermes \$NAME process identity." >&2
+        if kill -0 "$TRACKED" 2>/dev/null; then
+          echo "Refusing to overwrite the live Hermes $NAME process identity." >&2
           return 1
         fi
         remove_identity
         ;;
     esac
   fi
-  nohup "\$RUNNER" >> "\$LOGFILE" 2>&1 </dev/null &
-  PID="\$!"
-  SPAWN_IDENTITY="\$(process_identity "\$PID" 2>/dev/null || true)"
-  SPAWN_START="\$(printf '%s\n' "\$SPAWN_IDENTITY" | sed -n '1p')"
-  EXPECTED_ONE_REAL="\$("$VP" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "\$EXPECTED_ONE")"
-  EXPECTED_TWO_REAL="\$("$VP" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "\$EXPECTED_TWO")"
+  nohup "$RUNNER" >> "$LOGFILE" 2>&1 </dev/null &
+  PID="$!"
+  SPAWN_IDENTITY="$(process_identity "$PID" 2>/dev/null || true)"
+  SPAWN_START="$(printf '%s\n' "$SPAWN_IDENTITY" | sed -n '1p')"
+  EXPECTED_ONE_REAL="$("__VP__" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$EXPECTED_ONE")"
+  EXPECTED_TWO_REAL="$("__VP__" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$EXPECTED_TWO")"
   i=0
-  while [ "\$i" -lt 5 ]; do
-    IDENTITY="\$(process_identity "\$PID" 2>/dev/null || true)"
-    START="\$(printf '%s\n' "\$IDENTITY" | sed -n '1p')"
-    EXE="\$(printf '%s\n' "\$IDENTITY" | sed -n '2p')"
-    if [ -n "\$SPAWN_START" ] && [ "\$START" = "\$SPAWN_START" ] && \
-       { [ "\$EXE" = "\$EXPECTED_ONE_REAL" ] || [ "\$EXE" = "\$EXPECTED_TWO_REAL" ]; }; then
-      printf '%s\n' "\$PID" > "\$PIDFILE.new"
-      printf '%s\n' "\$START" > "\$STARTFILE.new"
-      printf '%s\n' "\$EXE" > "\$EXEFILE.new"
-      chmod 600 "\$PIDFILE.new" "\$STARTFILE.new" "\$EXEFILE.new"
-      mv "\$PIDFILE.new" "\$PIDFILE"
-      mv "\$STARTFILE.new" "\$STARTFILE"
-      mv "\$EXEFILE.new" "\$EXEFILE"
+  while [ "$i" -lt 5 ]; do
+    IDENTITY="$(process_identity "$PID" 2>/dev/null || true)"
+    START="$(printf '%s\n' "$IDENTITY" | sed -n '1p')"
+    EXE="$(printf '%s\n' "$IDENTITY" | sed -n '2p')"
+    if [ -n "$SPAWN_START" ] && [ "$START" = "$SPAWN_START" ] && \
+       { [ "$EXE" = "$EXPECTED_ONE_REAL" ] || [ "$EXE" = "$EXPECTED_TWO_REAL" ]; }; then
+      printf '%s\n' "$PID" > "$PIDFILE.new"
+      printf '%s\n' "$START" > "$STARTFILE.new"
+      printf '%s\n' "$EXE" > "$EXEFILE.new"
+      chmod 600 "$PIDFILE.new" "$STARTFILE.new" "$EXEFILE.new"
+      mv "$PIDFILE.new" "$PIDFILE"
+      mv "$STARTFILE.new" "$STARTFILE"
+      mv "$EXEFILE.new" "$EXEFILE"
       return 0
     fi
-    kill -0 "\$PID" 2>/dev/null || break
+    kill -0 "$PID" 2>/dev/null || break
     sleep 1
-    i=\$((i + 1))
+    i=$((i + 1))
   done
-  kill "\$PID" 2>/dev/null || true
-  wait "\$PID" 2>/dev/null || true
-  echo "Hermes \$NAME process identity could not be captured; refusing unmanaged startup." >&2
+  kill "$PID" 2>/dev/null || true
+  wait "$PID" 2>/dev/null || true
+  echo "Hermes $NAME process identity could not be captured; refusing unmanaged startup." >&2
   return 1
 }
-case "\$ACTION" in
+case "$ACTION" in
   start) start_service ;;
   stop) stop_service ;;
   restart) stop_service; start_service ;;
   *) exit 2 ;;
 esac
-EOF
+HELPER_EOF
+# El cuerpo se escribe como datos y se sustituye despues. Un heredoc sin citar que
+# contiene otro heredoc y parentesis sin compensar (el helper portable) rompe el
+# parser de bash 3.2, que es el /bin/sh de macOS: el script ni siquiera parseaba.
+"$VP" - "$HELPER" "$VP" "$HB" "$GATEWAY_RUNNER" "$DASHBOARD_RUNNER" "$BRIDGE_RUNNER" "$SERVICES" "$LOGS" <<'PY'
+import pathlib, sys
+
+path = sys.argv[1]
+pairs = (
+    ("__VP__", sys.argv[2]),
+    ("__HB__", sys.argv[3]),
+    ("__GATEWAY_RUNNER__", sys.argv[4]),
+    ("__DASHBOARD_RUNNER__", sys.argv[5]),
+    ("__BRIDGE_RUNNER__", sys.argv[6]),
+    ("__SERVICES__", sys.argv[7]),
+    ("__LOGS__", sys.argv[8]),
+)
+text = pathlib.Path(path).read_text(encoding="utf-8")
+for token, value in pairs:
+    text = text.replace(token, value)
+pathlib.Path(path).write_text(text, encoding="utf-8")
+PY
 chmod 700 "$HELPER"
 
 install_systemd_unit() {
