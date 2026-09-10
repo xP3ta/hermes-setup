@@ -31,11 +31,388 @@ if [ "$PLATFORM" = "linux" ] && { [ -n "${WSL_INTEROP:-}" ] || grep -qi microsof
   fi
 fi
 
-HH="${HERMES_HOME:-$HOME/.hermes}"
+canonicalize_hermes_home() {
+  candidate="$1"
+  case "$candidate" in
+    /*) ;;
+    *) echo "ERROR: HERMES_HOME must be an absolute path." >&2; return 1 ;;
+  esac
+  # Generated shell runners and systemd executable paths cannot safely carry
+  # these characters. Reject them rather than silently changing the path.
+  if printf '%s' "$candidate" | LC_ALL=C tr '\n' '\001' | LC_ALL=C grep -q '[[:cntrl:]\\$`"]'; then
+    echo "ERROR: HERMES_HOME contains unsupported characters." >&2
+    return 1
+  fi
+  if [ -L "$candidate" ]; then
+    echo "ERROR: HERMES_HOME may not be a symbolic link." >&2
+    return 1
+  fi
+  if [ -d "$candidate" ]; then
+    physical="$(CDPATH='' cd -- "$candidate" && pwd -P && printf '.')" || return 1
+    physical="${physical%.}"
+    physical="${physical%?}"
+  else
+    parent="$(dirname -- "$candidate")"
+    leaf="$(basename -- "$candidate")"
+    if [ ! -d "$parent" ] || [ "$leaf" = "." ] || [ "$leaf" = ".." ]; then
+      echo "ERROR: the parent of HERMES_HOME must already exist." >&2
+      return 1
+    fi
+    physical_parent="$(CDPATH='' cd -- "$parent" && pwd -P && printf '.')" || return 1
+    physical_parent="${physical_parent%.}"
+    physical_parent="${physical_parent%?}"
+    physical="$physical_parent/$leaf"
+  fi
+  if printf '%s' "$physical" | LC_ALL=C tr '\n' '\001' | LC_ALL=C grep -q '[[:cntrl:]\\$`"]'; then
+    echo "ERROR: HERMES_HOME contains unsupported characters." >&2
+    return 1
+  fi
+  printf '%s\n' "$physical"
+}
+
+hermes_home_has_evidence() {
+  candidate="$1"
+  [ -e "$candidate/.env" ] || [ -e "$candidate/hermes-agent" ] || \
+    [ -e "$candidate/console-services" ] || [ -e "$candidate/hermes_bridge.py" ]
+}
+
+case "${HOME:-}" in
+  /*) ;;
+  *) echo "ERROR: HOME must be a non-empty absolute path." >&2; exit 1 ;;
+esac
+if [ "${HERMES_HOME+x}" = x ] && [ -z "$HERMES_HOME" ]; then
+  echo "ERROR: HERMES_HOME may not be empty." >&2
+  exit 1
+fi
+HH="$(canonicalize_hermes_home "${HERMES_HOME:-$HOME/.hermes}")"
+DEFAULT_HH="$(canonicalize_hermes_home "$HOME/.hermes")"
+if [ "${HERMES_HOME+x}" = x ] && [ "$HH" != "$DEFAULT_HH" ] && \
+   hermes_home_has_evidence "$DEFAULT_HH"; then
+  echo "ERROR: another Hermes home exists at $DEFAULT_HH; refusing an ambiguous migration to $HH." >&2
+  exit 1
+fi
+
+SETUP_LOCK_HELD=0
+SETUP_LOCK_DIR=""
+acquire_setup_lock() {
+  lock_root="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+  if [ ! -d "$lock_root" ]; then
+    echo "ERROR: setup lock directory $lock_root does not exist." >&2
+    return 1
+  fi
+  SETUP_LOCK_DIR="$lock_root/hermes-console-setup-$(id -u).lock"
+  old_umask="$(umask)"
+  umask 077
+  if ! mkdir "$SETUP_LOCK_DIR" 2>/dev/null; then
+    umask "$old_umask"
+    echo "ERROR: another Hermes Console setup is already running for this user." >&2
+    return 1
+  fi
+  umask "$old_umask"
+  SETUP_LOCK_HELD=1
+}
+
+release_setup_lock() {
+  [ "$SETUP_LOCK_HELD" -eq 1 ] || return 0
+  rmdir "$SETUP_LOCK_DIR" 2>/dev/null || true
+  SETUP_LOCK_HELD=0
+}
+
+cleanup_setup() {
+  if command -v rollback_transaction >/dev/null 2>&1; then
+    rollback_transaction
+  fi
+  if command -v cleanup_downloads >/dev/null 2>&1; then
+    cleanup_downloads
+  fi
+  release_setup_lock
+}
+trap cleanup_setup EXIT
+trap 'exit 1' HUP INT TERM
+acquire_setup_lock
+
+ownership_python() {
+  command -v python3 2>/dev/null || command -v python 2>/dev/null || true
+}
+
+assert_systemd_unit_owner() {
+  unit="$1"
+  parser="$(ownership_python)"
+  expected_fragment="$HOME/.config/systemd/user/$unit"
+  expected_dropins="$expected_fragment.d"
+  if [ -L "$expected_fragment" ]; then
+    echo "ERROR: $expected_fragment is a symbolic link; refusing to replace it." >&2
+    return 1
+  fi
+  [ -n "$parser" ] || {
+    echo "ERROR: no parser is available to prove ownership of $unit." >&2
+    return 1
+  }
+  state_file="$(mktemp "${TMPDIR:-/tmp}/hermes-systemd-state.XXXXXX")"
+  if ! systemctl --user show "$unit" \
+      --property=LoadState,FragmentPath,DropInPaths,WorkingDirectory,ExecStart,ExecStartPre,ExecStartPost,ExecReload,ExecStop,ExecStopPost \
+      >"$state_file" 2>/dev/null; then
+    rm -f "$state_file"
+    echo "ERROR: effective systemd state for $unit is unavailable; refusing to replace it." >&2
+    return 1
+  fi
+  if "$parser" - "$state_file" "$HH" "$expected_fragment" "$expected_dropins" <<'PY'
+import os, re, sys
+
+state_path, expected_home, expected_fragment, expected_dropins = sys.argv[1:]
+properties = {}
+with open(state_path, encoding="utf-8", errors="strict") as source:
+    for raw in source:
+        key, separator, value = raw.rstrip("\n").partition("=")
+        if separator:
+            properties[key] = value
+
+
+def decode(value):
+    value = re.sub(
+        r"\\x([0-9a-fA-F]{2})", lambda match: chr(int(match.group(1), 16)), value
+    )
+    return value.replace(r"\s", " ").replace(r"\\", "\\")
+
+
+if properties.get("LoadState") == "not-found":
+    raise SystemExit(0 if not os.path.lexists(expected_fragment) else 1)
+required = ("FragmentPath", "WorkingDirectory", "ExecStart")
+if properties.get("LoadState") != "loaded" or not all(properties.get(k) for k in required):
+    raise SystemExit(1)
+home = os.path.realpath(expected_home)
+fragment = os.path.realpath(decode(properties["FragmentPath"]))
+workdir = os.path.realpath(decode(properties["WorkingDirectory"]))
+if fragment != os.path.realpath(expected_fragment) or workdir != home:
+    raise SystemExit(1)
+for encoded in properties.get("DropInPaths", "").split():
+    dropin = os.path.realpath(decode(encoded))
+    try:
+        if os.path.commonpath((dropin, os.path.realpath(expected_dropins))) != os.path.realpath(expected_dropins):
+            raise SystemExit(1)
+    except ValueError:
+        raise SystemExit(1)
+allowed_reload = (
+    os.path.realpath("/bin/kill"),
+    os.path.realpath("/usr/bin/kill"),
+)
+for command in (
+    "ExecStart", "ExecStartPre", "ExecStartPost", "ExecReload", "ExecStop", "ExecStopPost"
+):
+    value = properties.get(command, "")
+    if not value:
+        continue
+    paths = re.findall(r"(?:^|[ {;])path=(.*?)\s+;\s+argv\[\]=", value)
+    if not paths:
+        raise SystemExit(1)
+    for encoded in paths:
+        declared = os.path.abspath(decode(encoded))
+        executable = os.path.realpath(declared)
+        if command == "ExecReload" and executable in allowed_reload:
+            continue
+        try:
+            if os.path.commonpath((declared, home)) != home or declared == home:
+                raise SystemExit(1)
+        except ValueError:
+            raise SystemExit(1)
+PY
+  then
+    rm -f "$state_file"
+    return 0
+  fi
+  rm -f "$state_file"
+  echo "ERROR: effective systemd unit $unit belongs to another home or is ambiguous; refusing to replace it." >&2
+  return 1
+}
+
+assert_launchd_plist_owner() {
+  label="$1"
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  [ ! -L "$plist" ] || {
+    echo "ERROR: $plist is a symbolic link; refusing to replace it." >&2
+    return 1
+  }
+  [ -e "$plist" ] || return 0
+  parser="$(ownership_python)"
+  if [ -n "$parser" ] && "$parser" - "$plist" "$label" "$HH" <<'PY'
+import os, plistlib, sys
+path, label, home = sys.argv[1:]
+try:
+    with open(path, "rb") as source:
+        value = plistlib.load(source)
+    arguments = value.get("ProgramArguments")
+    program = value.get("Program")
+    if program is None and isinstance(arguments, list) and arguments:
+        program = arguments[0]
+    home = os.path.realpath(home)
+    program = os.path.realpath(program) if isinstance(program, str) else ""
+    owned = os.path.commonpath((program, home)) == home and program != home
+    valid = value.get("Label") == label and os.path.realpath(value.get("WorkingDirectory", "")) == home and owned
+except (OSError, TypeError, ValueError, plistlib.InvalidFileException):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+  then
+    return 0
+  fi
+  echo "ERROR: $plist belongs to another home or is ambiguous; refusing to replace it." >&2
+  return 1
+}
+
+assert_loaded_launchd_job_owner() {
+  label="$1"
+  parser="$(ownership_python)"
+  [ -n "$parser" ] || return 1
+  state_file="$(mktemp "${TMPDIR:-/tmp}/hermes-launchd-state.XXXXXX")"
+  if ! launchctl print "gui/$(id -u)/$label" >"$state_file" 2>/dev/null; then
+    if ! launchctl print "gui/$(id -u)" >"$state_file" 2>/dev/null; then
+      rm -f "$state_file"
+      echo "ERROR: launchd state is unavailable; refusing lifecycle changes." >&2
+      return 1
+    fi
+    if "$parser" - "$state_file" "$label" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="strict").read()
+label = re.escape(sys.argv[2])
+raise SystemExit(1 if re.search(r"(^|[\s={])" + label + r"([\s=}]+|$)", text) else 0)
+PY
+    then
+      rm -f "$state_file"
+      return 0
+    fi
+    rm -f "$state_file"
+    echo "ERROR: loaded launchd job $label is ambiguous; refusing to replace it." >&2
+    return 1
+  fi
+  if "$parser" - "$state_file" "$HH" <<'PY'
+import os, re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="strict").read()
+home = os.path.realpath(sys.argv[2])
+def field(name):
+    match = re.search(r"^\s*" + re.escape(name) + r"\s*=\s*(.*?)\s*$", text, re.MULTILINE)
+    return match.group(1) if match else ""
+workdir = os.path.realpath(field("working directory")) if field("working directory") else ""
+program = field("program")
+if not program:
+    block = re.search(r"^\s*arguments\s*=\s*\{(.*?)^\s*\}", text, re.MULTILINE | re.DOTALL)
+    if block:
+        match = re.search(r"^\s*0\s*=\s*(.*?)\s*$", block.group(1), re.MULTILINE)
+        program = match.group(1) if match else ""
+program = os.path.realpath(program) if program else ""
+try:
+    owned = os.path.commonpath((program, home)) == home and program != home
+except ValueError:
+    owned = False
+raise SystemExit(0 if workdir == home and owned else 1)
+PY
+  then
+    rm -f "$state_file"
+    return 0
+  fi
+  rm -f "$state_file"
+  echo "ERROR: loaded launchd job $label belongs to another home or is ambiguous; refusing to replace it." >&2
+  return 1
+}
+
+select_service_manager() {
+  SERVICE_MANAGER="portable"
+  if [ "$PLATFORM" = "linux" ]; then
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if command -v systemctl >/dev/null 2>&1 && \
+       systemctl --user show-environment >/dev/null 2>&1; then
+      SERVICE_MANAGER="systemd"
+    fi
+  elif [ "$PLATFORM" = "macos" ] && command -v launchctl >/dev/null 2>&1 && \
+       launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+    SERVICE_MANAGER="launchd"
+  fi
+}
+
+preflight_service_ownership() {
+  systemd_dir="$HOME/.config/systemd/user"
+  launchd_dir="$HOME/Library/LaunchAgents"
+  case "$SERVICE_MANAGER" in
+    systemd)
+      for unit in hermes-gateway.service hermes-dashboard.service hermes-bridge.service; do
+        assert_systemd_unit_owner "$unit" || return 1
+      done
+      for label in dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard dev.xpetalab.hermes-console.bridge; do
+        [ ! -e "$launchd_dir/$label.plist" ] || {
+          echo "ERROR: stale launchd definition $label conflicts with systemd; refusing migration." >&2
+          return 1
+        }
+      done
+      ;;
+    launchd)
+      for label in dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard dev.xpetalab.hermes-console.bridge; do
+        assert_launchd_plist_owner "$label" || return 1
+        assert_loaded_launchd_job_owner "$label" || return 1
+      done
+      for unit in hermes-gateway.service hermes-dashboard.service hermes-bridge.service; do
+        [ ! -e "$systemd_dir/$unit" ] || {
+          echo "ERROR: stale systemd definition $unit conflicts with launchd; refusing migration." >&2
+          return 1
+        }
+      done
+      ;;
+    portable)
+      for path in \
+        "$systemd_dir/hermes-gateway.service" \
+        "$systemd_dir/hermes-dashboard.service" \
+        "$systemd_dir/hermes-bridge.service" \
+        "$launchd_dir/dev.xpetalab.hermes-console.gateway.plist" \
+        "$launchd_dir/dev.xpetalab.hermes-console.dashboard.plist" \
+        "$launchd_dir/dev.xpetalab.hermes-console.bridge.plist"; do
+        [ ! -e "$path" ] || {
+          echo "ERROR: $path exists but its effective manager state is unavailable; refusing migration." >&2
+          return 1
+        }
+      done
+      for name in gateway dashboard bridge; do
+        pidfile="$HH/console-services/$name.pid"
+        [ -f "$pidfile" ] || continue
+        pid="$(sed -n '1p' "$pidfile" 2>/dev/null || true)"
+        case "$pid" in
+          *[!0-9]*|'')
+            echo "ERROR: portable $name PID record is malformed; refusing ambiguous replacement." >&2
+            return 1
+            ;;
+        esac
+        if kill -0 "$pid" 2>/dev/null; then
+          echo "ERROR: live portable $name PID $pid cannot be migrated transactionally; stop it explicitly before setup." >&2
+          return 1
+        fi
+      done
+      ;;
+  esac
+}
+
+select_service_manager
+preflight_service_ownership
+
 SERVICES="$HH/console-services"
 LOGS="$HH/logs"
 PROBE="$SERVICES/hermes-service-probe.py"
 PAIR_ENV="$SERVICES/pairing.env"
+TARGET="$HH/hermes_bridge.py"
+BACKUP="$TARGET.rollback"
+ENV_FILE="$HH/bridge.env"
+GATEWAY_RUNNER="$SERVICES/hermes-gateway.sh"
+DASHBOARD_RUNNER="$SERVICES/hermes-dashboard.sh"
+BRIDGE_RUNNER="$SERVICES/hermes-bridge.sh"
+HELPER="$SERVICES/service-manager.sh"
+for managed_dir in "$SERVICES" "$LOGS"; do
+  if [ -L "$managed_dir" ]; then
+    echo "ERROR: managed directory $managed_dir is a symbolic link; refusing setup." >&2
+    exit 1
+  fi
+done
+HH_CREATED_BY_SETUP=0
+[ -e "$HH" ] || HH_CREATED_BY_SETUP=1
+SERVICES_CREATED_BY_SETUP=0
+[ -e "$SERVICES" ] || SERVICES_CREATED_BY_SETUP=1
+LOGS_CREATED_BY_SETUP=0
+[ -e "$LOGS" ] || LOGS_CREATED_BY_SETUP=1
 mkdir -p "$HH" "$SERVICES" "$LOGS"
 
 SETUP_STEP=0
@@ -63,7 +440,7 @@ port_listening() {
   elif command -v lsof >/dev/null 2>&1; then
     lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | grep -q .
   else
-    netstat -an 2>/dev/null | grep -E "[.:]$port[[:space:]].*LISTEN" >/dev/null
+    netstat -an 2>/dev/null | grep -E "[.:]${port}[[:space:]].*LISTEN" >/dev/null
   fi
 }
 
@@ -80,7 +457,7 @@ service_failure() {
   name="$1"
   port="$2"
   log_name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
-  echo "ERROR: $name did not pass its authenticated Hermes health checks on TCP $port."
+  echo "ERROR: $name did not pass its required Hermes identity/access checks on TCP $port."
   if port_listening "$port"; then
     echo "TCP $port is occupied, but it is not the expected healthy $name service:"
     show_port_owner "$port"
@@ -92,11 +469,9 @@ service_failure() {
   exit 1
 }
 
-# Resolve the best available per-user service manager. A portable supervisor
-# keeps the current session working on containers, Termux and WSL without
-# systemd; its warning below makes the reboot limitation explicit.
-SERVICE_MANAGER="portable"
-if [ "$PLATFORM" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+# Configure lingering only after the selected home is locked and effective
+# ownership of all fixed service identifiers has been proven.
+if [ "$SERVICE_MANAGER" = "systemd" ]; then
   export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
   if command -v loginctl >/dev/null 2>&1; then
     LINGER_USER="$(id -un)"
@@ -118,40 +493,49 @@ if [ "$PLATFORM" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
       fi
     fi
   fi
-  i=0
-  while [ "$i" -lt 10 ]; do
-    [ -S "$XDG_RUNTIME_DIR/bus" ] && break
-    sleep 1
-    i=$((i + 1))
-  done
-  if systemctl --user show-environment >/dev/null 2>&1; then
-    SERVICE_MANAGER="systemd"
-  fi
-elif [ "$PLATFORM" = "macos" ] && command -v launchctl >/dev/null 2>&1; then
-  if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
-    SERVICE_MANAGER="launchd"
-  fi
 fi
 
 setup_step "Checking Hermes Agent"
 
 # Hermes Agent. A launcher only counts when it responds; stale shims from a
 # half-finished uninstall must not produce three crash-looping services.
-HB="$HH/hermes-agent/venv/bin/hermes"
-if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
-  HB="$(command -v hermes 2>/dev/null || true)"
-  if [ -z "$HB" ] || ! "$HB" --version >/dev/null 2>&1; then
-    echo "Installing Hermes Agent for $PLATFORM..."
-    curl -fsSL https://hermes-agent.nousresearch.com/install.sh | \
-      bash -s -- --skip-setup --non-interactive --skip-browser \
-      --hermes-home "$HH" --dir "$HH/hermes-agent"
-    HB="$HH/hermes-agent/venv/bin/hermes"
-    [ -x "$HB" ] || HB="$(command -v hermes 2>/dev/null || true)"
+AGENT_DIR="$HH/hermes-agent"
+HB="$AGENT_DIR/venv/bin/hermes"
+cleanup_fresh_agent_attempt() {
+  if [ "$HH_CREATED_BY_SETUP" -eq 1 ]; then
+    rm -rf -- "$HH"
+    return
   fi
-fi
-if [ -z "$HB" ] || [ ! -x "$HB" ] || ! "$HB" --version >/dev/null 2>&1; then
-  echo "ERROR: Hermes Agent was not installed correctly."
-  exit 1
+  rm -rf -- "$AGENT_DIR" "$HH/node"
+  rm -f -- "$HH/bin/hermes" "$HH/bin/uv" "$HH/bin/uvx"
+  [ "$LOGS_CREATED_BY_SETUP" -ne 1 ] || rmdir "$LOGS" 2>/dev/null || true
+  [ "$SERVICES_CREATED_BY_SETUP" -ne 1 ] || rmdir "$SERVICES" 2>/dev/null || true
+  rmdir "$HH/bin" 2>/dev/null || true
+}
+if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
+  if [ -e "$AGENT_DIR" ] || [ -L "$AGENT_DIR" ] || \
+     [ -e "$HH/node" ] || [ -L "$HH/node" ] || \
+     [ -e "$HH/bin/hermes" ] || [ -L "$HH/bin/hermes" ] || \
+     [ -e "$HH/bin/uv" ] || [ -L "$HH/bin/uv" ] || \
+     [ -e "$HH/bin/uvx" ] || [ -L "$HH/bin/uvx" ]; then
+    echo "ERROR: an existing Hermes Agent tree or shim is not healthy; refusing to run the installer over it." >&2
+    echo "Repair or remove the broken installation explicitly, then rerun setup." >&2
+    exit 1
+  fi
+  echo "Installing Hermes Agent for $PLATFORM..."
+  if ! curl -fsSL https://hermes-agent.nousresearch.com/install.sh | \
+      UV_NO_CACHE=1 bash -s -- --skip-setup --non-interactive --skip-browser --skip-computer-use \
+      --hermes-home "$HH" --dir "$AGENT_DIR"; then
+    cleanup_fresh_agent_attempt
+    echo "ERROR: Hermes Agent installation failed; fresh attempt artifacts were removed." >&2
+    exit 1
+  fi
+  HB="$AGENT_DIR/venv/bin/hermes"
+  if [ ! -x "$HB" ] || ! "$HB" --version >/dev/null 2>&1; then
+    cleanup_fresh_agent_attempt
+    echo "ERROR: Hermes Agent did not pass its health check; fresh attempt artifacts were removed." >&2
+    exit 1
+  fi
 fi
 
 # Python that owns the Hermes environment (and therefore aiohttp).
@@ -162,7 +546,9 @@ if [ ! -x "$VP" ]; then
   if command -v realpath >/dev/null 2>&1; then
     HB_REAL="$(realpath "$HB" 2>/dev/null || printf '%s' "$HB")"
   fi
-  HB_DIR="$(CDPATH= cd -- "$(dirname -- "$HB_REAL")" 2>/dev/null && pwd -P || dirname -- "$HB_REAL")"
+  if ! HB_DIR="$(CDPATH='' cd -- "$(dirname -- "$HB_REAL")" 2>/dev/null && pwd -P)"; then
+    HB_DIR="$(dirname -- "$HB_REAL")"
+  fi
   VP="$HB_DIR/python3"
   [ -x "$VP" ] || VP="$HB_DIR/python"
 fi
@@ -175,6 +561,235 @@ fi
   echo "ERROR: $VP does not provide aiohttp; repair the Hermes installation first."
   exit 1
 }
+
+TRANSACTION_PENDING=0
+TRANSACTION_DIR=""
+SERVICE_LIFECYCLE_TOUCHED=0
+transaction_path() {
+  case "$1" in
+    env) printf '%s\n' "$HH/.env" ;;
+    probe) printf '%s\n' "$PROBE" ;;
+    bridge) printf '%s\n' "$TARGET" ;;
+    bridge_rollback) printf '%s\n' "$BACKUP" ;;
+    bridge_env) printf '%s\n' "$ENV_FILE" ;;
+    gateway_runner) printf '%s\n' "$GATEWAY_RUNNER" ;;
+    dashboard_runner) printf '%s\n' "$DASHBOARD_RUNNER" ;;
+    bridge_runner) printf '%s\n' "$BRIDGE_RUNNER" ;;
+    helper) printf '%s\n' "$HELPER" ;;
+    pair_env) printf '%s\n' "$PAIR_ENV" ;;
+    systemd_gateway) printf '%s\n' "$HOME/.config/systemd/user/hermes-gateway.service" ;;
+    systemd_dashboard) printf '%s\n' "$HOME/.config/systemd/user/hermes-dashboard.service" ;;
+    systemd_bridge) printf '%s\n' "$HOME/.config/systemd/user/hermes-bridge.service" ;;
+    systemd_dropin) printf '%s\n' "$HOME/.config/systemd/user/hermes-gateway.service.d/10-hermes-console-network.conf" ;;
+    launchd_gateway) printf '%s\n' "$HOME/Library/LaunchAgents/dev.xpetalab.hermes-console.gateway.plist" ;;
+    launchd_dashboard) printf '%s\n' "$HOME/Library/LaunchAgents/dev.xpetalab.hermes-console.dashboard.plist" ;;
+    launchd_bridge) printf '%s\n' "$HOME/Library/LaunchAgents/dev.xpetalab.hermes-console.bridge.plist" ;;
+    *) return 2 ;;
+  esac
+}
+
+snapshot_transaction_file() {
+  key="$1"
+  path="$(transaction_path "$key")"
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+    echo "ERROR: $path is not a regular owned file; refusing transactional replacement." >&2
+    return 1
+  fi
+  if [ -f "$path" ]; then
+    printf '1\n' > "$TRANSACTION_DIR/$key.had"
+    cp -p "$path" "$TRANSACTION_DIR/$key.data"
+  else
+    printf '0\n' > "$TRANSACTION_DIR/$key.had"
+  fi
+}
+
+restore_transaction_file() {
+  key="$1"
+  path="$(transaction_path "$key")"
+  had="$(sed -n '1p' "$TRANSACTION_DIR/$key.had" 2>/dev/null || true)"
+  rm -f "$path.new" "$path.restore.$$"
+  if [ "$had" = "1" ]; then
+    mkdir -p "$(dirname -- "$path")"
+    cp -p "$TRANSACTION_DIR/$key.data" "$path.restore.$$"
+    mv "$path.restore.$$" "$path"
+  elif [ "$had" = "0" ]; then
+    rm -f "$path"
+  else
+    return 1
+  fi
+}
+
+begin_transaction() {
+  TRANSACTION_KEYS="env probe bridge bridge_rollback bridge_env gateway_runner dashboard_runner bridge_runner helper pair_env systemd_gateway systemd_dashboard systemd_bridge systemd_dropin launchd_gateway launchd_dashboard launchd_bridge"
+  TRANSACTION_DIR="$(mktemp -d "$SERVICES/setup-transaction.XXXXXX")"
+  TRANSACTION_PENDING=1
+  for key in $TRANSACTION_KEYS; do
+    snapshot_transaction_file "$key"
+  done
+  if [ "$SERVICE_MANAGER" = "systemd" ]; then
+    for name in gateway dashboard bridge; do
+      if systemctl --user is-active --quiet "hermes-$name"; then
+        printf '1\n' > "$TRANSACTION_DIR/systemd_$name.active"
+      else
+        printf '0\n' > "$TRANSACTION_DIR/systemd_$name.active"
+      fi
+      if systemctl --user is-enabled --quiet "hermes-$name"; then
+        printf '1\n' > "$TRANSACTION_DIR/systemd_$name.enabled"
+      else
+        printf '0\n' > "$TRANSACTION_DIR/systemd_$name.enabled"
+      fi
+    done
+  elif [ "$SERVICE_MANAGER" = "launchd" ]; then
+    for name in gateway dashboard bridge; do
+      label="dev.xpetalab.hermes-console.$name"
+      if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        printf '1\n' > "$TRANSACTION_DIR/launchd_$name.loaded"
+      else
+        printf '0\n' > "$TRANSACTION_DIR/launchd_$name.loaded"
+      fi
+    done
+  fi
+}
+
+restore_systemd_state() {
+  restore_failed=0
+  if ! systemctl --user daemon-reload >/dev/null 2>&1; then restore_failed=1; fi
+  for name in gateway dashboard bridge; do
+    had_unit="$(sed -n '1p' "$TRANSACTION_DIR/systemd_$name.had" 2>/dev/null || true)"
+    if [ "$had_unit" = "0" ]; then continue; fi
+    if [ "$had_unit" != "1" ]; then restore_failed=1; continue; fi
+    enabled="$(sed -n '1p' "$TRANSACTION_DIR/systemd_$name.enabled" 2>/dev/null || true)"
+    active="$(sed -n '1p' "$TRANSACTION_DIR/systemd_$name.active" 2>/dev/null || true)"
+    if [ "$enabled" = "1" ]; then
+      if ! systemctl --user enable "hermes-$name" >/dev/null 2>&1; then restore_failed=1; fi
+    else
+      if ! systemctl --user disable "hermes-$name" >/dev/null 2>&1; then restore_failed=1; fi
+    fi
+    if [ "$active" = "1" ]; then
+      if ! systemctl --user restart "hermes-$name" >/dev/null 2>&1; then restore_failed=1; fi
+    else
+      if ! systemctl --user stop "hermes-$name" >/dev/null 2>&1; then restore_failed=1; fi
+    fi
+  done
+  return "$restore_failed"
+}
+
+cleanup_transaction_backups() {
+  [ -n "$TRANSACTION_DIR" ] || return 0
+  cleanup_failed=0
+  for key in $TRANSACTION_KEYS; do
+    rm -f "$TRANSACTION_DIR/$key.had" "$TRANSACTION_DIR/$key.data" || cleanup_failed=1
+  done
+  for name in gateway dashboard bridge; do
+    rm -f \
+      "$TRANSACTION_DIR/systemd_$name.active" \
+      "$TRANSACTION_DIR/systemd_$name.enabled" \
+      "$TRANSACTION_DIR/launchd_$name.loaded" || cleanup_failed=1
+  done
+  rm -f "$TRANSACTION_DIR/ufw.added" "$TRANSACTION_DIR/firewalld.added" || cleanup_failed=1
+  if ! rmdir "$TRANSACTION_DIR" 2>/dev/null; then cleanup_failed=1; fi
+  if [ "$cleanup_failed" -eq 0 ]; then TRANSACTION_DIR=""; fi
+  return "$cleanup_failed"
+}
+
+rollback_private_firewall() {
+  [ -n "$TRANSACTION_DIR" ] || return 0
+  firewall_rollback_failed=0
+  if [ -f "$TRANSACTION_DIR/ufw.added" ]; then
+    while IFS= read -r port; do
+      [ -n "$port" ] || continue
+      if ! run_privileged ufw --force delete allow from "$FIREWALL_SOURCE" \
+          to any port "$port" proto tcp >/dev/null 2>&1; then
+        firewall_rollback_failed=1
+      fi
+    done < "$TRANSACTION_DIR/ufw.added"
+  fi
+  if [ -f "$TRANSACTION_DIR/firewalld.added" ]; then
+    while IFS= read -r rule; do
+      [ -n "$rule" ] || continue
+      if ! run_privileged firewall-cmd --permanent --remove-rich-rule="$rule" \
+          >/dev/null 2>&1; then
+        firewall_rollback_failed=1
+      fi
+    done < "$TRANSACTION_DIR/firewalld.added"
+    if ! run_privileged firewall-cmd --reload >/dev/null 2>&1; then
+      firewall_rollback_failed=1
+    fi
+  fi
+  return "$firewall_rollback_failed"
+}
+
+rollback_transaction() {
+  [ "$TRANSACTION_PENDING" -eq 1 ] || return 0
+  TRANSACTION_PENDING=0
+  rollback_failed=0
+  if ! rollback_private_firewall; then rollback_failed=1; fi
+  if [ "$SERVICE_LIFECYCLE_TOUCHED" -eq 1 ]; then
+    case "$SERVICE_MANAGER" in
+      systemd)
+        for name in gateway dashboard bridge; do
+          if ! systemctl --user stop "hermes-$name" >/dev/null 2>&1; then rollback_failed=1; fi
+        done
+        ;;
+      launchd)
+        for name in gateway dashboard bridge; do
+          label="dev.xpetalab.hermes-console.$name"
+          if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 && \
+             ! launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1; then
+            rollback_failed=1
+          fi
+        done
+        ;;
+      portable)
+        if [ -x "$HELPER" ]; then
+          for name in gateway dashboard bridge; do
+            if ! "$HELPER" stop "$name" >/dev/null 2>&1; then rollback_failed=1; fi
+          done
+        fi
+        ;;
+    esac
+  fi
+  for key in $TRANSACTION_KEYS; do
+    if ! restore_transaction_file "$key"; then rollback_failed=1; fi
+  done
+  if [ "$SERVICE_LIFECYCLE_TOUCHED" -eq 1 ]; then
+    case "$SERVICE_MANAGER" in
+      systemd)
+        if ! restore_systemd_state; then rollback_failed=1; fi
+        ;;
+      launchd)
+        for name in gateway dashboard bridge; do
+          loaded="$(sed -n '1p' "$TRANSACTION_DIR/launchd_$name.loaded" 2>/dev/null || true)"
+          [ "$loaded" = "1" ] || continue
+          label="dev.xpetalab.hermes-console.$name"
+          plist="$HOME/Library/LaunchAgents/$label.plist"
+          if [ -f "$plist" ] && \
+             ! launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then
+            rollback_failed=1
+          fi
+        done
+        ;;
+    esac
+  fi
+  if [ "$rollback_failed" -eq 0 ]; then
+    if ! cleanup_transaction_backups; then rollback_failed=1; fi
+  fi
+  if [ "$rollback_failed" -ne 0 ]; then
+    echo "CRITICAL: setup rollback was incomplete; recovery data was retained at $TRANSACTION_DIR" >&2
+  fi
+  return 0
+}
+
+commit_transaction() {
+  [ "$TRANSACTION_PENDING" -eq 1 ] || return 0
+  TRANSACTION_PENDING=0
+  if ! cleanup_transaction_backups; then
+    echo "ERROR: setup completed but transaction cleanup failed at $TRANSACTION_DIR" >&2
+    return 1
+  fi
+}
+
+begin_transaction
 
 # Preserve one usable existing API key. Blank, placeholder or too-short legacy
 # values cannot start modern Hermes, so those are repaired atomically.
@@ -271,7 +886,7 @@ if [ -z "$HOST" ]; then
   exit 1
 fi
 case "$HOST" in
-  *[!A-Za-z0-9._:-]*|*/*|*://*)
+  *[!A-Za-z0-9._:-]*|*/*)
     echo "ERROR: HERMES_PAIR_HOST is not a valid host name or IP address."
     exit 1
     ;;
@@ -357,6 +972,7 @@ cat > "$PROBE" <<'PY'
 #!/usr/bin/env python3
 import ipaddress
 import json
+import secrets
 import socket
 import sys
 import urllib.error
@@ -367,6 +983,14 @@ kind, base, token = sys.argv[1:4]
 expected = sys.argv[4] if len(sys.argv) > 4 else ""
 phone_facing = len(sys.argv) > 5 and sys.argv[5] == "phone"
 base = base.rstrip("/")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, url):
+        return None
+
+
+opener = urllib.request.build_opener(NoRedirect)
 
 
 def private_address(value):
@@ -435,21 +1059,28 @@ def assert_phone_url():
     raise RuntimeError("public HTTP is blocked; use LAN/Tailscale or HTTPS")
 
 
-def fetch(path, auth=False):
+def request_json(path, authorization=None):
     headers = {"Accept": "application/json"}
-    if auth:
-        headers["Authorization"] = "Bearer " + token
+    if authorization is not None:
+        headers["Authorization"] = authorization
     request = urllib.request.Request(base + path, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=6) as response:
+        with opener.open(request, timeout=6) as response:
             status = response.status
             raw = response.read(1024 * 1024)
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"{path} returned HTTP {exc.code}") from None
+        status = exc.code
+        raw = exc.read(1024 * 1024)
     except Exception as exc:
         raise RuntimeError(
             f"{path} is unreachable ({type(exc).__name__})"
         ) from None
+    return status, raw
+
+
+def fetch(path, auth=False):
+    authorization = "Bearer " + token if auth else None
+    status, raw = request_json(path, authorization)
     if status != 200:
         raise RuntimeError(f"{path} returned HTTP {status}")
     try:
@@ -459,6 +1090,16 @@ def fetch(path, auth=False):
     if not isinstance(value, dict):
         raise RuntimeError(f"{path} returned the wrong JSON shape")
     return value
+
+
+def assert_auth_required(path):
+    invalid = "Bearer invalid-" + secrets.token_urlsafe(32)
+    for label, authorization in (("missing", None), ("invalid", invalid)):
+        status, _ = request_json(path, authorization)
+        if status not in {401, 403}:
+            raise RuntimeError(
+                f"{path} did not reject {label} authentication (HTTP {status})"
+            )
 
 
 try:
@@ -475,6 +1116,7 @@ try:
             raise RuntimeError(
                 "/api/sessions is not the authenticated Hermes API"
             )
+        assert_auth_required("/api/sessions")
     elif kind == "bridge":
         health = fetch("/bridge/health")
         if health.get("status") != "ok" or not isinstance(
@@ -499,6 +1141,7 @@ try:
             raise RuntimeError(
                 "Bridge auth/config/self-update capability check failed"
             )
+        assert_auth_required("/bridge/capabilities")
     elif kind == "dashboard":
         status = fetch("/api/status")
         if not isinstance(status.get("version"), str) or not isinstance(
@@ -537,9 +1180,7 @@ setup_step "Verifying Mobile Bridge release"
 
 # Verified Bridge release: closed manifest, exact size/hash/version, compile,
 # backup and atomic swap. No bytes execute before every check passes.
-TARGET="$HH/hermes_bridge.py"
 NEW="$TARGET.new"
-BACKUP="$TARGET.rollback"
 MANIFEST="$HH/bridge-release.json.new"
 SYSTEMD_STAGE=""
 SYSTEMD_GATEWAY_PENDING=0
@@ -586,7 +1227,6 @@ cleanup_downloads() {
   rollback_pending_systemd_gateway
   cleanup_systemd_stage
 }
-trap cleanup_downloads EXIT HUP INT TERM
 curl -fsSL "$REPO_RAW/bridge-release.json" -o "$MANIFEST"
 curl -fsSL "$REPO_RAW/hermes_bridge.py" -o "$NEW"
 BRIDGE_VERSION="$("$VP" - "$MANIFEST" "$NEW" <<'PY'
@@ -622,23 +1262,15 @@ PY
 )"
 chmod 600 "$NEW"
 "$VP" -m py_compile "$NEW"
-HAD_BRIDGE_TARGET=0
 if [ -f "$TARGET" ]; then
-  HAD_BRIDGE_TARGET=1
   cp -p "$TARGET" "$BACKUP"
 else
   rm -f "$BACKUP"
 fi
 mv "$NEW" "$TARGET"
 
-ENV_FILE="$HH/bridge.env"
 printf 'BRIDGE_HOST=%s\nBRIDGE_PORT=9131\nBRIDGE_SCOPES=read,memory,soul,skills,cron,config,command\nBRIDGE_READ_ONLY=false\nBRIDGE_TOKEN=%s\n' "$BIND_HOST" "$KEY" > "$ENV_FILE"
 chmod 600 "$ENV_FILE"
-
-GATEWAY_RUNNER="$SERVICES/hermes-gateway.sh"
-DASHBOARD_RUNNER="$SERVICES/hermes-dashboard.sh"
-BRIDGE_RUNNER="$SERVICES/hermes-bridge.sh"
-HELPER="$SERVICES/service-manager.sh"
 
 cat > "$GATEWAY_RUNNER" <<EOF
 #!/bin/sh
@@ -669,42 +1301,132 @@ exec "$VP" "$TARGET" --i-know-what-im-doing
 EOF
 chmod 700 "$GATEWAY_RUNNER" "$DASHBOARD_RUNNER" "$BRIDGE_RUNNER"
 
-# Portable lifecycle helper. It only accepts three allowlisted service names,
-# validates PID ownership against the exact runner path and never uses pkill.
+# Portable lifecycle helper. It only signals a PID through pidfd after its
+# kernel start time and executable match the identity captured at startup.
 cat > "$HELPER" <<EOF
 #!/bin/sh
 set -eu
 ACTION="\${1:-}"
 NAME="\${2:-}"
 case "\$NAME" in
-  gateway) RUNNER="$GATEWAY_RUNNER"; EXPECTED_EXE="$HB"; EXPECTED_ARGS="gateway run --replace" ;;
-  dashboard) RUNNER="$DASHBOARD_RUNNER"; EXPECTED_EXE="$HB"; EXPECTED_ARGS="dashboard --host" ;;
-  bridge) RUNNER="$BRIDGE_RUNNER"; EXPECTED_EXE="$TARGET"; EXPECTED_ARGS="--i-know-what-im-doing" ;;
+  gateway) RUNNER="$GATEWAY_RUNNER"; EXPECTED_ONE="$VP"; EXPECTED_TWO="$HB" ;;
+  dashboard) RUNNER="$DASHBOARD_RUNNER"; EXPECTED_ONE="$VP"; EXPECTED_TWO="$HB" ;;
+  bridge) RUNNER="$BRIDGE_RUNNER"; EXPECTED_ONE="$VP"; EXPECTED_TWO="$VP" ;;
   *) exit 2 ;;
 esac
 PIDFILE="$SERVICES/\$NAME.pid"
+STARTFILE="$SERVICES/\$NAME.start"
+EXEFILE="$SERVICES/\$NAME.exe"
 LOGFILE="$LOGS/\$NAME.log"
+remove_identity() {
+  rm -f "\$PIDFILE" "\$STARTFILE" "\$EXEFILE"
+}
+process_identity() {
+  "$VP" - "\$1" <<'PY'
+import os, sys
+pid = int(sys.argv[1])
+with open(f"/proc/{pid}/stat", encoding="ascii") as source:
+    rest = source.read().rstrip().rsplit(") ", 1)[1].split()
+print(rest[19])
+print(os.path.realpath(f"/proc/{pid}/exe"))
+PY
+}
+signal_owned() {
+  "$VP" - "\$1" "\$2" "\$3" <<'PY'
+import os, signal, sys
+pid = int(sys.argv[1])
+expected_start, expected_exe = sys.argv[2:]
+pidfd = os.pidfd_open(pid)
+try:
+    with open(f"/proc/{pid}/stat", encoding="ascii") as source:
+        rest = source.read().rstrip().rsplit(") ", 1)[1].split()
+    actual_start = rest[19]
+    actual_exe = os.path.realpath(f"/proc/{pid}/exe")
+    if actual_start != expected_start or actual_exe != expected_exe:
+        raise RuntimeError("process identity changed")
+    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+finally:
+    os.close(pidfd)
+PY
+}
 stop_service() {
   [ -f "\$PIDFILE" ] || return 0
   PID="\$(sed -n '1p' "\$PIDFILE" 2>/dev/null || true)"
-  case "\$PID" in *[!0-9]*|'') rm -f "\$PIDFILE"; return 0 ;; esac
-  if kill -0 "\$PID" 2>/dev/null; then
-    CMD="\$(ps -p "\$PID" -o command= 2>/dev/null || true)"
-    case "\$CMD" in
-      *"\$EXPECTED_EXE"*"\$EXPECTED_ARGS"*) kill "\$PID" 2>/dev/null || true ;;
-      *) echo "Refusing to stop PID \$PID: it is not the expected Hermes \$NAME service." >&2; exit 3 ;;
-    esac
-    i=0; while kill -0 "\$PID" 2>/dev/null && [ "\$i" -lt 5 ]; do sleep 1; i=\$((i + 1)); done
-    if kill -0 "\$PID" 2>/dev/null; then
-      echo "Hermes \$NAME did not stop cleanly; refusing to start a duplicate." >&2
-      return 1
-    fi
+  case "\$PID" in *[!0-9]*|'') remove_identity; return 0 ;; esac
+  if ! kill -0 "\$PID" 2>/dev/null; then
+    remove_identity
+    return 0
   fi
-  rm -f "\$PIDFILE"
+  RECORDED_START="\$(sed -n '1p' "\$STARTFILE" 2>/dev/null || true)"
+  RECORDED_EXE="\$(sed -n '1p' "\$EXEFILE" 2>/dev/null || true)"
+  CURRENT="\$(process_identity "\$PID" 2>/dev/null || true)"
+  CURRENT_START="\$(printf '%s\n' "\$CURRENT" | sed -n '1p')"
+  CURRENT_EXE="\$(printf '%s\n' "\$CURRENT" | sed -n '2p')"
+  if [ -z "\$RECORDED_START" ] || [ -z "\$RECORDED_EXE" ] || \
+     [ "\$CURRENT_START" != "\$RECORDED_START" ] || \
+     [ "\$CURRENT_EXE" != "\$RECORDED_EXE" ]; then
+    echo "Refusing to stop PID \$PID: exact Hermes \$NAME ownership is not proven." >&2
+    exit 3
+  fi
+  if ! signal_owned "\$PID" "\$RECORDED_START" "\$RECORDED_EXE" 2>/dev/null; then
+    echo "Refusing to stop PID \$PID: atomic process identity verification is unavailable." >&2
+    exit 3
+  fi
+  i=0
+  while kill -0 "\$PID" 2>/dev/null && [ "\$i" -lt 5 ]; do
+    sleep 1
+    i=\$((i + 1))
+  done
+  if kill -0 "\$PID" 2>/dev/null; then
+    echo "Hermes \$NAME did not stop cleanly; refusing to start a duplicate." >&2
+    return 1
+  fi
+  remove_identity
 }
 start_service() {
+  if [ -f "\$PIDFILE" ]; then
+    TRACKED="\$(sed -n '1p' "\$PIDFILE" 2>/dev/null || true)"
+    case "\$TRACKED" in
+      *[!0-9]*|'') remove_identity ;;
+      *)
+        if kill -0 "\$TRACKED" 2>/dev/null; then
+          echo "Refusing to overwrite the live Hermes \$NAME process identity." >&2
+          return 1
+        fi
+        remove_identity
+        ;;
+    esac
+  fi
   nohup "\$RUNNER" >> "\$LOGFILE" 2>&1 </dev/null &
-  echo "\$!" > "\$PIDFILE"
+  PID="\$!"
+  SPAWN_IDENTITY="\$(process_identity "\$PID" 2>/dev/null || true)"
+  SPAWN_START="\$(printf '%s\n' "\$SPAWN_IDENTITY" | sed -n '1p')"
+  EXPECTED_ONE_REAL="\$("$VP" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "\$EXPECTED_ONE")"
+  EXPECTED_TWO_REAL="\$("$VP" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "\$EXPECTED_TWO")"
+  i=0
+  while [ "\$i" -lt 5 ]; do
+    IDENTITY="\$(process_identity "\$PID" 2>/dev/null || true)"
+    START="\$(printf '%s\n' "\$IDENTITY" | sed -n '1p')"
+    EXE="\$(printf '%s\n' "\$IDENTITY" | sed -n '2p')"
+    if [ -n "\$SPAWN_START" ] && [ "\$START" = "\$SPAWN_START" ] && \
+       { [ "\$EXE" = "\$EXPECTED_ONE_REAL" ] || [ "\$EXE" = "\$EXPECTED_TWO_REAL" ]; }; then
+      printf '%s\n' "\$PID" > "\$PIDFILE.new"
+      printf '%s\n' "\$START" > "\$STARTFILE.new"
+      printf '%s\n' "\$EXE" > "\$EXEFILE.new"
+      chmod 600 "\$PIDFILE.new" "\$STARTFILE.new" "\$EXEFILE.new"
+      mv "\$PIDFILE.new" "\$PIDFILE"
+      mv "\$STARTFILE.new" "\$STARTFILE"
+      mv "\$EXEFILE.new" "\$EXEFILE"
+      return 0
+    fi
+    kill -0 "\$PID" 2>/dev/null || break
+    sleep 1
+    i=\$((i + 1))
+  done
+  kill "\$PID" 2>/dev/null || true
+  wait "\$PID" 2>/dev/null || true
+  echo "Hermes \$NAME process identity could not be captured; refusing unmanaged startup." >&2
+  return 1
 }
 case "\$ACTION" in
   start) start_service ;;
@@ -721,19 +1443,52 @@ install_systemd_unit() {
   unit_dir="$3"
   unit="$unit_dir/hermes-$name.service"
   mkdir -p "$unit_dir"
-  cat > "$unit" <<EOF
-[Unit]
-Description=Hermes Console $name
+  "$VP" - "$unit" "$name" "$runner" "$HH" <<'PY'
+import pathlib, sys
+
+unit, name, runner, workdir = sys.argv[1:]
+
+
+def specifiers(value):
+    return value.replace("%", "%%")
+
+
+def exec_argument(value):
+    escaped = specifiers(value).replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + escaped + '"'
+
+
+def directive_path(value):
+    out = []
+    for character in specifiers(value):
+        codepoint = ord(character)
+        if character == "\\":
+            out.append("\\x5c")
+        elif character == " ":
+            out.append("\\x20")
+        elif character == '"':
+            out.append("\\x22")
+        elif codepoint < 0x20 or codepoint == 0x7f:
+            out.append(f"\\x{codepoint:02x}")
+        else:
+            out.append(character)
+    return "".join(out)
+
+
+payload = f"""[Unit]
+Description=Hermes Console {name}
 After=network-online.target
 Wants=network-online.target
 [Service]
-ExecStart=$runner
-WorkingDirectory=$HH
+ExecStart={exec_argument(runner)}
+WorkingDirectory={directive_path(workdir)}
 Restart=on-failure
 RestartSec=2
 [Install]
 WantedBy=default.target
-EOF
+"""
+pathlib.Path(unit).write_text(payload, encoding="utf-8")
+PY
 }
 
 stage_gateway_systemd_unit() {
@@ -764,6 +1519,7 @@ EOF
 }
 
 install_verified_systemd_units() {
+  preflight_service_ownership
   SYSTEMD_STAGE="$(mktemp -d "$SERVICES/systemd-units.XXXXXX")"
   stage_gateway_systemd_unit
   install_systemd_unit dashboard "$DASHBOARD_RUNNER" "$SYSTEMD_STAGE"
@@ -829,8 +1585,12 @@ install_launchd_job() {
   run_at_load="$4"
   start_now="$5"
   plist="$HOME/Library/LaunchAgents/$label.plist"
+  assert_launchd_plist_owner "$label"
+  assert_loaded_launchd_job_owner "$label"
   mkdir -p "$HOME/Library/LaunchAgents"
-  "$VP" - "$plist" "$label" "$runner" "$HH" "$LOGS/$name.log" "$run_at_load" <<'PY'
+  plist_new="$plist.new"
+  rm -f "$plist_new"
+  "$VP" - "$plist_new" "$label" "$runner" "$HH" "$LOGS/$name.log" "$run_at_load" <<'PY'
 import pathlib, plistlib, sys
 path, label, runner, workdir, log, run_at_load = sys.argv[1:]
 payload = {
@@ -843,18 +1603,34 @@ payload = {
     "StandardOutPath": log,
     "StandardErrorPath": log,
 }
-with pathlib.Path(path).open("wb") as out:
+with pathlib.Path(path).open("xb") as out:
     plistlib.dump(payload, out, sort_keys=True)
 PY
-  chmod 600 "$plist"
+  chmod 600 "$plist_new"
+  assert_loaded_launchd_job_owner "$label"
   launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+  mv "$plist_new" "$plist"
   launchctl bootstrap "gui/$(id -u)" "$plist"
   launchctl enable "gui/$(id -u)/$label" >/dev/null 2>&1 || true
   [ "$start_now" != "yes" ] || launchctl kickstart -k "gui/$(id -u)/$label"
 }
 
+assert_named_service_owner() {
+  name="$1"
+  case "$SERVICE_MANAGER" in
+    systemd) assert_systemd_unit_owner "hermes-$name.service" ;;
+    launchd)
+      label="dev.xpetalab.hermes-console.$name"
+      assert_launchd_plist_owner "$label" && assert_loaded_launchd_job_owner "$label"
+      ;;
+    portable) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 start_named_service() {
   name="$1"
+  assert_named_service_owner "$name"
   case "$SERVICE_MANAGER" in
     systemd) systemctl --user restart "hermes-$name" ;;
     launchd)
@@ -863,14 +1639,37 @@ start_named_service() {
         dashboard) label="dev.xpetalab.hermes-console.dashboard" ;;
         bridge) label="dev.xpetalab.hermes-console.bridge" ;;
       esac
+      if ! launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        plist="$HOME/Library/LaunchAgents/$label.plist"
+        launchctl bootstrap "gui/$(id -u)" "$plist"
+      fi
       launchctl kickstart -k "gui/$(id -u)/$label"
       ;;
     portable) "$HELPER" restart "$name" ;;
   esac
 }
 
+stop_named_service() {
+  name="$1"
+  assert_named_service_owner "$name"
+  case "$SERVICE_MANAGER" in
+    systemd) systemctl --user stop "hermes-$name" ;;
+    launchd)
+      case "$name" in
+        gateway) label="dev.xpetalab.hermes-console.gateway" ;;
+        dashboard) label="dev.xpetalab.hermes-console.dashboard" ;;
+        bridge) label="dev.xpetalab.hermes-console.bridge" ;;
+        *) return 2 ;;
+      esac
+      launchctl bootout "gui/$(id -u)/$label"
+      ;;
+    portable) "$HELPER" stop "$name" ;;
+  esac
+}
+
 setup_step "Installing hidden persistent services"
 
+SERVICE_LIFECYCLE_TOUCHED=1
 case "$SERVICE_MANAGER" in
   systemd)
     install_verified_systemd_units
@@ -895,42 +1694,50 @@ esac
 if ! wait_probe gateway http://127.0.0.1:8642 40; then
   service_failure Gateway 8642
 fi
-echo "Gateway authenticated health OK ($SERVICE_MANAGER)"
+echo "Gateway identity + valid-token + auth-rejection checks OK ($SERVICE_MANAGER)"
 
 if ! wait_probe bridge http://127.0.0.1:9131 40 "$BRIDGE_VERSION"; then
-  if [ -f "$BACKUP" ]; then
-    mv "$BACKUP" "$TARGET"
-    start_named_service bridge >/dev/null 2>&1 || true
-  elif [ "$HAD_BRIDGE_TARGET" = 0 ]; then
-    rm -f "$TARGET"
-  fi
   service_failure Bridge 9131
 fi
-echo "Mobile Bridge $BRIDGE_VERSION auth + self-update OK ($SERVICE_MANAGER)"
+echo "Mobile Bridge $BRIDGE_VERSION valid-token + auth-rejection + capability checks OK ($SERVICE_MANAGER)"
 
 setup_step "Checking Dashboard and credentials"
 
 # Ensure a strong initial Dashboard password through the authenticated Bridge.
 # Existing credentials are preserved on repair/update; setup never prints them.
-"$HB" dashboard --stop >/dev/null 2>&1 || true
+if ! stop_named_service dashboard >/dev/null 2>&1; then
+  echo "ERROR: Dashboard ownership could not be proven before stopping it."
+  exit 1
+fi
 DASH_PASS="$("$VP" -c 'import secrets; print(secrets.token_urlsafe(24))')"
-if ! "$VP" - "http://127.0.0.1:9131" "$KEY" "$DASH_PASS" <<'PY'
+DASHBOARD_CREDENTIAL_RESULT=""
+if ! DASHBOARD_CREDENTIAL_RESULT="$("$VP" - "http://127.0.0.1:9131" "$KEY" "$DASH_PASS" <<'PY'
 import json, sys, urllib.request
 
 base, token, password = sys.argv[1:]
 headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+created = False
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, url):
+        return None
+
+
+opener = urllib.request.build_opener(NoRedirect)
 try:
     request = urllib.request.Request(
         base + "/bridge/dashboard/credentials", headers=headers
     )
-    with urllib.request.urlopen(request, timeout=65) as response:
+    with opener.open(request, timeout=65) as response:
         status = response.status
         value = json.loads(response.read(1024 * 1024).decode())
     if status != 200 or value.get("ok") is not True:
         raise RuntimeError("credential endpoint rejected the read")
+    username = value.get("username") or "admin"
     if value.get("password_set") is not True:
         body = json.dumps(
-            {"username": value.get("username") or "admin", "password": password}
+            {"username": username, "password": password}
         ).encode()
         request = urllib.request.Request(
             base + "/bridge/dashboard/credentials",
@@ -941,27 +1748,110 @@ try:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=65) as response:
+        with opener.open(request, timeout=65) as response:
             status = response.status
             value = json.loads(response.read(1024 * 1024).decode())
         if status != 200 or value.get("ok") is not True:
             raise RuntimeError("credential endpoint rejected the change")
+        username = value.get("username") or username
+        created = True
 except Exception as exc:
     print(
         "Dashboard credential setup failed: " + type(exc).__name__,
         file=sys.stderr,
     )
     raise SystemExit(1)
+print(json.dumps({"created": created, "username": username}))
 PY
-then
+)"; then
   echo "ERROR: Dashboard authentication could not be configured; no pairing QR will be shown."
   exit 1
 fi
-start_named_service dashboard >/dev/null 2>&1 || true
+DASHBOARD_LOGIN_CREATED="$("$VP" -c 'import json,sys; print("1" if json.loads(sys.argv[1])["created"] else "0")' "$DASHBOARD_CREDENTIAL_RESULT")"
+DASHBOARD_LOGIN_USER="$("$VP" -c 'import json,sys; print(json.loads(sys.argv[1])["username"])' "$DASHBOARD_CREDENTIAL_RESULT")"
+if ! start_named_service dashboard >/dev/null 2>&1; then
+  echo "ERROR: Dashboard ownership could not be proven before starting it."
+  exit 1
+fi
 if ! wait_probe dashboard http://127.0.0.1:9119 60; then
   service_failure Dashboard 9119
 fi
-echo "Dashboard health + Gateway state OK ($SERVICE_MANAGER)"
+if ! "$VP" - "http://127.0.0.1:9119" "$DASHBOARD_LOGIN_CREATED" "$DASHBOARD_LOGIN_USER" "$DASH_PASS" <<'PY_DASH_AUTH'
+import json, sys, urllib.error, urllib.request
+
+base, created, username, password = sys.argv[1:]
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, url):
+        return None
+
+
+opener = urllib.request.build_opener(NoRedirect)
+
+
+def request(path, headers=None, data=None):
+    value = urllib.request.Request(base + path, headers=headers or {}, data=data)
+    try:
+        with opener.open(value, timeout=6) as response:
+            return response.status, response.headers, response.read(1024 * 1024)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read(1024 * 1024)
+
+
+protected = "/api/model/options"
+for label, cookie in (
+    ("missing", None),
+    ("invalid", "hermes_session_at=invalid-dashboard-session"),
+):
+    headers = {"Accept": "application/json"}
+    if cookie is not None:
+        headers["Cookie"] = cookie
+    status, _, _ = request(protected, headers=headers)
+    if status not in {401, 403}:
+        raise SystemExit(
+            f"Dashboard protected API did not reject {label} session (HTTP {status})"
+        )
+
+if created == "1":
+    body = json.dumps(
+        {"provider": "basic", "username": username, "password": password}
+    ).encode()
+    status, headers, _ = request(
+        "/auth/password-login",
+        headers={"Content-Type": "application/json"},
+        data=body,
+    )
+    if status != 200:
+        raise SystemExit(f"Dashboard password login returned HTTP {status}")
+    cookies = headers.get_all("Set-Cookie") or []
+    pairs = []
+    for raw in cookies:
+        pairs.append(raw.split(";", 1)[0])
+    if not any(item.split("=", 1)[0].endswith("hermes_session_at") for item in pairs):
+        raise SystemExit("Dashboard password login did not return an access-session cookie")
+    status, _, raw = request(
+        protected,
+        headers={"Accept": "application/json", "Cookie": "; ".join(pairs)},
+    )
+    if status != 200:
+        raise SystemExit(f"Dashboard authenticated protected API returned HTTP {status}")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise SystemExit("Dashboard authenticated protected API did not return JSON") from None
+    if not isinstance(value, dict):
+        raise SystemExit("Dashboard authenticated protected API returned the wrong JSON shape")
+PY_DASH_AUTH
+then
+  echo "ERROR: Dashboard protected-route authentication checks failed; no pairing QR will be shown."
+  exit 1
+fi
+if [ "$DASHBOARD_LOGIN_CREATED" = "1" ]; then
+  echo "Dashboard password login + protected API enforcement OK ($SERVICE_MANAGER)"
+else
+  echo "Dashboard public health + protected API enforcement OK ($SERVICE_MANAGER); existing login was preserved, not replayed"
+fi
 
 SUDO_READY=0
 run_privileged() {
@@ -981,7 +1871,7 @@ run_privileged() {
     # fail closed and receive the exact manual commands below.
     if [ -r /dev/tty ] && [ -w /dev/tty ]; then
       echo "Hermes Console needs administrator approval for a private firewall rule." >/dev/tty
-      if sudo -v </dev/tty; then
+      if sudo -v; then
         SUDO_READY=1
         sudo -n "$@"
         return
@@ -1002,7 +1892,12 @@ ensure_private_firewall() {
       if printf '%s\n' "$UFW_STATUS" | grep -qi '^Status: active'; then UFW_ACTIVE=1; fi
     fi
     if [ -n "$UFW_ACTIVE" ]; then
+      UFW_STATUS="$(run_privileged ufw status 2>/dev/null || true)"
       for port in 8642 9119 9131; do
+        if printf '%s\n' "$UFW_STATUS" | grep -E "^${port}/tcp[[:space:]]" | \
+            grep -F "$FIREWALL_SOURCE" >/dev/null 2>&1; then
+          continue
+        fi
         if ! run_privileged ufw allow from "$FIREWALL_SOURCE" to any port "$port" proto tcp comment 'Hermes Console' >/dev/null; then
           echo "ERROR: UFW is active and a private rule could not be installed."
           echo "Run these commands, then rerun setup:"
@@ -1011,21 +1906,26 @@ ensure_private_firewall() {
           echo "  sudo ufw allow from $FIREWALL_SOURCE to any port 9131 proto tcp"
           return 1
         fi
+        printf '%s\n' "$port" >> "$TRANSACTION_DIR/ufw.added"
       done
-      echo "UFW rules installed for private source $FIREWALL_SOURCE"
+      echo "UFW rules verified for private source $FIREWALL_SOURCE"
     fi
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     for port in 8642 9119 9131; do
       rule="rule family=ipv4 source address=$FIREWALL_SOURCE port port=$port protocol=tcp accept"
+      if run_privileged firewall-cmd --permanent --query-rich-rule="$rule" >/dev/null 2>&1; then
+        continue
+      fi
       if ! run_privileged firewall-cmd --permanent --add-rich-rule="$rule" >/dev/null; then
         echo "ERROR: firewalld is active and a private rule could not be installed."
         echo "Add private TCP rules for 8642, 9119 and 9131 from $FIREWALL_SOURCE, then rerun setup."
         return 1
       fi
+      printf '%s\n' "$rule" >> "$TRANSACTION_DIR/firewalld.added"
     done
     run_privileged firewall-cmd --reload >/dev/null
-    echo "firewalld rules installed for private source $FIREWALL_SOURCE"
+    echo "firewalld rules verified for private source $FIREWALL_SOURCE"
   fi
 }
 
@@ -1053,7 +1953,7 @@ fi
 
 setup_step "Generating pairing QR and summary"
 
-printf 'PAIRING_SCHEMA=1\nPAIR_HOST=%s\nPAIR_SCHEME=%s\nPAIR_PORT=%s\nGATEWAY_BASE=%s\nDASHBOARD_BASE=%s\nBRIDGE_BASE=%s\nNETWORK_KIND=%s\nPYTHON_BIN=%s\n' \
+printf 'PAIRING_SCHEMA=1\nPROBE_SECURITY_SCHEMA=2\nPAIR_HOST=%s\nPAIR_SCHEME=%s\nPAIR_PORT=%s\nGATEWAY_BASE=%s\nDASHBOARD_BASE=%s\nBRIDGE_BASE=%s\nNETWORK_KIND=%s\nPYTHON_BIN=%s\n' \
   "$HOST" "$PAIR_SCHEME" "$PAIR_PORT" "$GATEWAY_BASE" "$DASHBOARD_BASE" "$BRIDGE_BASE" "$NETWORK_KIND" "$VP" > "$PAIR_ENV"
 chmod 600 "$PAIR_ENV"
 
@@ -1083,28 +1983,29 @@ QRPY='import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make
 QR_RENDERED=""
 if command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$LINK"; then
   QR_RENDERED=1
+elif "$VP" -c 'import qrcode' 2>/dev/null && "$VP" -c "$QRPY" "$LINK" 2>/dev/null; then
+  QR_RENDERED=1
 else
   UV="$HH/bin/uv"
   [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
-  if [ -n "$UV" ] && "$UV" run --with qrcode python -c "$QRPY" "$LINK" 2>/dev/null; then
+  if [ -n "$UV" ] && "$UV" run --isolated --no-project --no-cache --with qrcode==8.2 \
+      python -c "$QRPY" "$LINK" 2>/dev/null; then
     QR_RENDERED=1
-  else
-    "$VP" -c 'import qrcode' 2>/dev/null || "$VP" -m pip install -q qrcode >/dev/null 2>&1 || true
-    if "$VP" -c "$QRPY" "$LINK" 2>/dev/null; then QR_RENDERED=1; fi
   fi
 fi
 if [ -z "$QR_RENDERED" ]; then
   echo "A QR renderer could not be prepared. Paste the verified link below into Hermes Console."
 fi
+commit_transaction
 echo ""
 echo "Link: $LINK"
 echo ""
-echo "All three services passed local and phone-address health/auth checks."
+echo "All three services passed their scoped local and phone-address checks."
 echo "Setup summary:"
 echo "  Hermes Agent: ready"
-echo "  Gateway: authenticated and reachable"
-echo "  Dashboard: ready"
-echo "  Mobile Bridge: $BRIDGE_VERSION, authenticated and reachable"
+echo "  Gateway: valid token accepted, missing/invalid tokens rejected, reachable"
+echo "  Dashboard: public health and protected-route enforcement checked"
+echo "  Mobile Bridge: $BRIDGE_VERSION, valid token accepted, missing/invalid tokens rejected, reachable"
 echo "  Service manager: $SERVICE_MANAGER"
 echo "  Pairing address: $HOST ($NETWORK_KIND)"
 echo "To verify them and show this QR again later:"

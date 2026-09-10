@@ -25,7 +25,7 @@ def main() -> None:
         'sh -n "$script"',
         'bash -n "$script"',
         "shellcheck",
-        "tests/hermes-mobile-setup_test.sh",
+        "tests/review-unix-security.py",
         "tests/sync-from-app_test.sh",
         "tests/bridge-release_test.py",
         "tests/bootstrap-unix_test.sh",

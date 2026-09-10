@@ -44,6 +44,12 @@ if [ "$(read_setting PAIRING_SCHEMA)" != "1" ]; then
   echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh"
   exit 1
 fi
+if [ "$(read_setting PROBE_SECURITY_SCHEMA)" != "2" ]; then
+  echo "This pairing record predates redirect-safe negative auth checks."
+  echo "Pairing made no changes. Run setup explicitly if you want to upgrade it:"
+  echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh"
+  exit 1
+fi
 
 HOST="${HERMES_PAIR_HOST:-$(read_setting PAIR_HOST)}"
 PAIR_SCHEME="${HERMES_PAIR_SCHEME:-$(read_setting PAIR_SCHEME)}"
@@ -53,7 +59,7 @@ DASHBOARD_BASE="${HERMES_DASHBOARD_URL:-$(read_setting DASHBOARD_BASE)}"
 BRIDGE_BASE="${HERMES_BRIDGE_URL:-$(read_setting BRIDGE_BASE)}"
 
 case "$HOST" in
-  *[!A-Za-z0-9._:-]*|*/*|*://*|'')
+  *[!A-Za-z0-9._:-]*|*/*|'')
     echo "The stored pairing host is invalid. Run setup again."
     exit 1
     ;;
@@ -101,7 +107,7 @@ verify() {
   kind="$1"
   base="$2"
   if ! "$VP" "$PROBE" "$kind" "$base" "$KEY" "" phone; then
-    echo "ERROR: $kind is not healthy/authenticated through the address used by the phone."
+    echo "ERROR: $kind did not pass its scoped checks through the address used by the phone."
     echo "Run the full repair command before pairing:"
     echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh"
     exit 1
@@ -141,18 +147,16 @@ QR_RENDERED=""
 if command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$LINK"; then
   QR_RENDERED=1
 else
-  UV="$HH/bin/uv"
-  [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
-  if [ -n "$UV" ] && "$UV" run --with qrcode python -c "$QRPY" "$LINK" 2>/dev/null; then
+  if PYTHONDONTWRITEBYTECODE=1 "$VP" -c 'import qrcode' 2>/dev/null && \
+     PYTHONDONTWRITEBYTECODE=1 "$VP" -c "$QRPY" "$LINK" 2>/dev/null; then
     QR_RENDERED=1
-  else
-    "$VP" -c 'import qrcode' 2>/dev/null || "$VP" -m pip install -q qrcode >/dev/null 2>&1 || true
-    if "$VP" -c "$QRPY" "$LINK" 2>/dev/null; then QR_RENDERED=1; fi
   fi
 fi
 if [ -z "$QR_RENDERED" ]; then
-  echo "A QR renderer could not be prepared. Paste the verified link below into Hermes Console."
+  echo "No installed QR renderer is available. Pairing did not install one or change the system."
+  echo "Paste the verified link below into Hermes Console."
 fi
 echo ""
 echo "Link: $LINK"
-echo "Gateway, Dashboard and Mobile Bridge passed their functional checks."
+echo "Gateway and Mobile Bridge accepted the valid token and rejected missing/invalid tokens."
+echo "Dashboard public health passed; this command does not claim that a Dashboard login succeeded."

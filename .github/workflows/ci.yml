@@ -22,7 +22,7 @@ jobs:
       - name: Validate POSIX and Bash syntax
         shell: bash
         run: |
-          for script in hermes-mobile-setup.sh hermes-pair.sh tests/hermes-mobile-setup_test.sh; do
+          for script in hermes-mobile-setup.sh hermes-pair.sh; do
             sh -n "$script"
           done
           for script in sync-from-app.sh tests/sync-from-app_test.sh tests/bootstrap-unix_test.sh; do
@@ -39,7 +39,7 @@ jobs:
             hermes-mobile-setup.sh hermes-pair.sh sync-from-app.sh
           # The POSIX harness sources functions generated at runtime.
           shellcheck --severity=warning --exclude=SC1007,SC2034 \
-            tests/hermes-mobile-setup_test.sh tests/sync-from-app_test.sh tests/bootstrap-unix_test.sh
+            tests/sync-from-app_test.sh tests/bootstrap-unix_test.sh
 
       - name: Verify CI contract and Bridge release
         shell: bash
@@ -51,10 +51,15 @@ jobs:
           python3 tests/sync-work-preservation_test.py
           python3 tests/bridge-release_test.py
 
+      # Product-level contract suites: systemd/launchd unit safety, lock and
+      # home identity, authenticated redirects, negative auth probes, rollback.
+      - name: Review suites (Unix)
+        shell: bash
+        run: python3 tests/review-unix-security.py
+
       - name: Run Unix tests
         shell: bash
         run: |
-          sh tests/hermes-mobile-setup_test.sh
           bash tests/sync-from-app_test.sh
           bash tests/bootstrap-unix_test.sh
 
