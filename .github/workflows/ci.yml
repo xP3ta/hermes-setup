@@ -81,6 +81,18 @@ jobs:
         with:
           persist-credentials: false
 
+      # Diagnostico: si /bin/sh (bash 3.2 en macOS) no parsea, identifica el
+      # bloque culpable en lugar de obligar a adivinar desde el numero de linea.
+      - name: Locate the offending block when /bin/sh refuses to parse
+        shell: bash
+        run: |
+          for script in hermes-mobile-setup.sh hermes-pair.sh; do
+            if ! sh -n "$script"; then
+              echo "::warning::$script does not parse with /bin/sh; bisecting"
+              python3 tests/sh_parse_bisect.py /bin/sh || true
+            fi
+          done
+
       - name: Validate POSIX syntax on BSD userland
         shell: bash
         run: |
