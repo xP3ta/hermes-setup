@@ -608,6 +608,70 @@ class DeliverySyntaxTests(unittest.TestCase):
             self.assertIn(str(temp / "services space"), rendered)
 
 
+
+class DashboardReadinessTests(unittest.TestCase):
+    """El primer arranque compila el Dashboard: la espera debe extenderse mientras
+    haya progreso real (log creciendo) y fallar acotada cuando no lo haya."""
+
+    def _block(self) -> str:
+        source = SETUP.read_text(encoding="utf-8")
+        match = re.search(
+            r"^dashboard_ready=0\n.*?^fi$", source, re.MULTILINE | re.DOTALL
+        )
+        self.assertIsNotNone(match, "no se encontro el bloque de espera del Dashboard")
+        return match.group(0)
+
+    def _run(self, probe_passes_at: int, grow_log: bool) -> tuple[int, str]:
+        with tempfile.TemporaryDirectory(prefix="hermes-dashboard-wait-") as raw:
+            temp = pathlib.Path(raw)
+            (temp / "dashboard.log").write_text("build\n", encoding="utf-8")
+            (temp / "counter").write_text("0", encoding="utf-8")
+            harness = temp / "harness.sh"
+            harness.write_text(
+                "#!/bin/sh\nset -eu\n"
+                f'LOGS="{temp}"\n'
+                "DASHBOARD_PORT=9119\n"
+                "sleep() { :; }\n"
+                "wait_probe() {\n"
+                "  n=$(cat \"$LOGS/counter\")\n"
+                "  n=$((n + 1))\n"
+                "  printf '%s\\n' \"$n\" > \"$LOGS/counter\"\n"
+                f"  [ \"$n\" -ge {probe_passes_at} ] && return 0\n"
+                + (
+                    '  printf "compilando\\n" >> "$LOGS/dashboard.log"\n'
+                    if grow_log
+                    else ""
+                )
+                + "  return 1\n"
+                "}\n"
+                'service_failure() { echo "FAILED:$1"; exit 9; }\n'
+                + self._block()
+                + '\necho READY\n',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                ["sh", str(harness)], capture_output=True, text=True, timeout=60
+            )
+            return completed.returncode, completed.stdout + completed.stderr
+
+    def test_extends_while_the_dashboard_log_keeps_growing(self) -> None:
+        # El sondeo pasa en el intento 30 (mas alla del presupuesto fijo de 60s).
+        code, output = self._run(probe_passes_at=30, grow_log=True)
+        self.assertEqual(code, 0, output)
+        self.assertIn("READY", output)
+        self.assertIn("still starting", output)
+
+    def test_fails_when_nothing_is_making_progress(self) -> None:
+        code, output = self._run(probe_passes_at=10**6, grow_log=False)
+        self.assertEqual(code, 9, output)
+        self.assertIn("FAILED:Dashboard", output)
+
+    def test_the_ceiling_is_documented_and_bounded(self) -> None:
+        block = self._block()
+        self.assertIn("1800", block)
+        self.assertIn("dashboard_last_size", block)
+        self.assertNotIn("wait_probe dashboard \"http://127.0.0.1:$DASHBOARD_PORT\" 60", block)
+
 class SetupLockTests(unittest.TestCase):
     def test_two_real_processes_contend_before_either_home_is_written(self) -> None:
         source = SETUP.read_text(encoding="utf-8")
