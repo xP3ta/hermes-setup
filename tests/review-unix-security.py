@@ -172,6 +172,11 @@ class HomePathSyntaxTests(unittest.TestCase):
                     self.assertIn('unsupported characters', result.stderr)
 
 
+SYSTEMD_AVAILABLE = platform.system() == "Linux" and shutil.which("systemd-analyze") is not None
+# systemd-analyze solo existe en Linux: los casos que lo invocan se saltan con un
+# motivo explicito en otras plataformas (macOS usa launchd: macos-launchd_test.py).
+
+
 class SystemdUnitTests(unittest.TestCase):
     def test_special_paths_use_directive_safe_encoding(self) -> None:
         source = SETUP.read_text(encoding="utf-8")
@@ -219,6 +224,10 @@ class SystemdUnitTests(unittest.TestCase):
             self.assertIn("\\x20", working)
             self.assertIn("%%", working)
 
+    @unittest.skipUnless(
+        SYSTEMD_AVAILABLE,
+        "systemd-analyze is Linux-only; macOS uses launchd (tests/macos-launchd_test.py)",
+    )
     def test_execstart_special_paths_verify(self) -> None:
         source = SETUP.read_text(encoding="utf-8")
         function = (shell_function(source, "canonicalize_hermes_home") + "\n"
@@ -696,10 +705,9 @@ class SetupLockTests(unittest.TestCase):
             self.assertFalse(selected.exists())
 
 
-# La gestion de unidades systemd es Linux-only: en macOS el equivalente es
-# launchd y lo cubre tests/macos-launchd_test.py. Estos casos se saltan (no se
-# dan por buenos) fuera de Linux o cuando systemd-analyze no esta disponible.
 SYSTEMD_AVAILABLE = platform.system() == "Linux" and shutil.which("systemd-analyze") is not None
+# systemd-analyze solo existe en Linux: los casos que lo invocan se saltan con un
+# motivo explicito en otras plataformas (macOS usa launchd: macos-launchd_test.py).
 
 
 @unittest.skipUnless(
