@@ -26,27 +26,42 @@ set -e
 
 # El log del run de CI es publico: nada de tokens ni claves, ni en el exito ni en
 # el diagnostico de fallo.
+# BSD sed (macOS) no acepta todas las extensiones de GNU: se usan reglas simples
+# y explicitas para que la redaccion nunca se coma la salida.
 redact() {
-  sed -E 's/(token|key|secret|password)(=[^& "]*)/\1=REDACTED/Ig' \
-    | sed -E 's/hermes:\/\/pair\?[^ ]*/hermes:\/\/pair?REDACTED/g'
+  sed -e 's/token=[^& ]*/token=REDACTED/g' \
+      -e 's/bridge_token=[^& ]*/bridge_token=REDACTED/g' \
+      -e 's/API_SERVER_KEY=[^ ]*/API_SERVER_KEY=REDACTED/g' \
+      -e 's/BRIDGE_TOKEN=[^ ]*/BRIDGE_TOKEN=REDACTED/g' \
+      -e 's/password=[^ ]*/password=REDACTED/g' \
+      -e 's|hermes://pair?[^ ]*|hermes://pair?REDACTED|g'
 }
 if [ "$RC" -ne 0 ]; then
   echo "== ultimas lineas del instalador =="
   tail -40 "$LOG" | redact
   for svc in gateway dashboard bridge; do
-    if [ -f "$HERMES_HOME/logs/$svc.log" ]; then
-      echo "== $svc.log (ultimas 25) =="
-      tail -25 "$HERMES_HOME/logs/$svc.log" | redact
+    log="$HERMES_HOME/logs/$svc.log"
+    echo "== $svc.log =="
+    if [ -f "$log" ]; then
+      printf 'bytes: '; wc -c < "$log" | tr -d ' '
+      tail -25 "$log" | redact
+    else
+      echo "ausente"
     fi
   done
   echo "== estado de launchd =="
   for label in $LABELS; do
-    launchctl print "gui/$(id -u)/$label" 2>&1 | grep -aE "state|pid|last exit|program|path" | head -8
+    printf -- '-- %s --\n' "$label"
+    launchctl print "gui/$(id -u)/$label" 2>&1 | head -25 | redact
   done
   echo "== bin/ del home =="
-  ls -la "$HERMES_HOME/bin" 2>/dev/null | head -6
+  ls -la "$HERMES_HOME/bin" 2>&1 | head -8
   echo "== runner del Dashboard =="
-  redact < "$HERMES_HOME/console-services/hermes-dashboard.sh" 2>/dev/null | head -12
+  if [ -f "$HERMES_HOME/console-services/hermes-dashboard.sh" ]; then
+    redact < "$HERMES_HOME/console-services/hermes-dashboard.sh" | head -14
+  else
+    echo "ausente"
+  fi
 else
   tail -12 "$LOG" | redact
 fi
