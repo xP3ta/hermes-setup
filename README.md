@@ -95,7 +95,7 @@ answers, instead of failing with an address your phone cannot reach.
 
 For a reproducible install that cannot change under you, use the newest tag
 instead of `main` (e.g.
-`https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.3.0/hermes-mobile-setup.ps1`).
+`https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.4.0/hermes-mobile-setup.ps1`).
 
 WSL deliberately uses the Windows path so setup can configure networking,
 Windows Firewall and persistent startup correctly. The Unix installer uses
