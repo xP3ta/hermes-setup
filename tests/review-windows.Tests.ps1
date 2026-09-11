@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding")]
+    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding", "FirewallAppRules")]
     [string]$Case = "All",
     [string]$SetupScript = "",
     [string]$PairScript = ""
@@ -1507,8 +1507,51 @@ function Test-ProgressBranding {
 }
 
 
+function Test-FirewallAppRules {
+    # Windows pregunta "permitir esta aplicacion?" por PROGRAMA aunque exista una
+    # regla por puerto: sin reglas por programa aparece un dialogo, y quien lo
+    # cancela deja una regla de bloqueo que rompe el emparejamiento.
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+    Assert-True ($setupRaw -match 'function Get-ManagedListenPrograms') "managed listening programs are resolved"
+    Assert-True ($setupRaw -match 'function Ensure-AppFirewallRules') "application rules have their own step"
+    Assert-True ($setupRaw -match '-Program \$program') "the application rule is scoped to the program"
+    Assert-True ($setupRaw -match '\$appRuleName = "\$RuleName-app\$appIndex"') "application rules derive their name from the port rule"
+    Assert-True ($setupRaw -match 'Ensure-AppFirewallRules \$display \$Pairing \$rule\.Name') `
+        "an existing install gets the application rules without touching the port rule"
+    Assert-True ($setupRaw -match 'FirewallRuleNames \+= \$appRuleName') "application rules join the rollback list"
+    Assert-True ($setupRaw -match 'FirewallRuleNames') "the rollback removes them"
+
+    foreach ($name in @("Get-ManagedListenPrograms", "Ensure-AppFirewallRules")) {
+        Import-ProductFunction $setup $name
+    }
+    function global:Test-CurrentProcessAdministrator { return $true }
+    function global:Write-Ok { param($Message) }
+    function global:Get-NetFirewallApplicationFilter { param($Rule, $ErrorAction) return $null }
+    $script:created = New-Object System.Collections.Generic.List[string]
+    function global:Get-NetFirewallRule { param([string]$Name, $DisplayName, $ErrorAction) return $null }
+    function global:New-NetFirewallRule {
+        param([string]$Name, [string]$DisplayName, [string]$Direction, [string]$Action,
+              [string]$Program, [string]$Protocol, $LocalPort, [string]$Profile,
+              [string]$RemoteAddress, $ErrorAction)
+        [void]$script:created.Add("$Name|$Program|$Profile|$RemoteAddress|$($LocalPort -join ',')")
+        return [PSCustomObject]@{ Name = $Name }
+    }
+    $script:HermesPython = "C:\\home\\venv\\Scripts\\python.exe"
+    $global:HB = "C:\\home\\venv\\Scripts\\hermes.exe"
+    function global:Get-HermesPython { return $script:HermesPython }
+    function global:Test-Path { param([string]$LiteralPath, $Path, $PathType) return $true }
+    $script:SetupTransaction = [PSCustomObject]@{ FirewallRuleNames = @() }
+    $created = Ensure-AppFirewallRules "Hermes Console private network" @{ Kind = "lan" } "HermesConsole-abc"
+    Assert-True ($created -eq 2) "one application rule per managed executable (actual: $created)"
+    Assert-True (($script:created -join "`n") -match 'python\.exe') "the venv interpreter is authorised"
+    Assert-True (($script:created -join "`n") -match 'hermes\.exe') "the launcher is authorised"
+    Assert-True (($script:created -join "`n") -match 'Private\|LocalSubnet') "application rules keep the private LAN scope"
+    Assert-True (($script:created -join "`n") -match '8642,9119,9131') "application rules keep the same three ports"
+    Assert-True (@($script:SetupTransaction.FirewallRuleNames).Count -eq 2) "application rules are registered for rollback"
+}
+
 $cases = if ($Case -eq "All") {
-    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding")
+    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding", "FirewallAppRules")
 } else { @($Case) }
 
 foreach ($selected in $cases) {
