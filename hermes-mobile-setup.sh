@@ -1249,7 +1249,11 @@ cleanup_downloads() {
 }
 curl -fsSL "$REPO_RAW/bridge-release.json" -o "$MANIFEST"
 curl -fsSL "$REPO_RAW/hermes_bridge.py" -o "$NEW"
-BRIDGE_VERSION="$("$VP" - "$MANIFEST" "$NEW" <<'PY'
+# bash 3.2 (el /bin/sh de macOS) no salta el cuerpo de un heredoc al buscar el
+# cierre de $( ... ): cualquier ")" del cuerpo lo desincroniza y el parser se
+# pierde. El verificador se escribe a fichero y se invoca sin anidar nada.
+BRIDGE_VERIFY_SCRIPT="$SERVICES/bridge-release-check.py"
+cat > "$BRIDGE_VERIFY_SCRIPT" <<'PY'
 import hashlib, json, pathlib, re, sys
 manifest_path, bridge_path = map(pathlib.Path, sys.argv[1:])
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1279,7 +1283,7 @@ if versions != [version]:
 compile(source, str(bridge_path), "exec")
 print(version)
 PY
-)"
+BRIDGE_VERSION="$("$VP" "$BRIDGE_VERIFY_SCRIPT" "$MANIFEST" "$NEW")"
 chmod 600 "$NEW"
 "$VP" -m py_compile "$NEW"
 if [ -f "$TARGET" ]; then
