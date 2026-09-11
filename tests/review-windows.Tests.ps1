@@ -1563,7 +1563,8 @@ function Test-FirewallAppRules {
     Assert-True ($setupRaw -match 'function Remove-ManagedProgramBlockRules') "dismissed-prompt block rules are handled"
     Assert-True ($setupRaw -match '-Enabled True -Action Block -Direction Inbound') "only enabled inbound block rules are considered"
     Assert-True ($setupRaw -match 'Remove-ManagedProgramBlockRules') "the block cleanup runs while ensuring permissions"
-    $early = $setupRaw.IndexOf("if (-not \$AuditOnly) { Ensure-PrivateFirewallRules \$Pairing }")
+    # Comillas simples: con dobles, PowerShell expandiria $Pairing y StrictMode corta.
+    $early = $setupRaw.IndexOf('if (-not $AuditOnly) { Ensure-PrivateFirewallRules $Pairing }')
     $services = $setupRaw.IndexOf('Write-SetupPhase "Installing hidden persistent services"')
     Assert-True ($early -gt 0 -and $services -gt 0 -and $early -lt $services) `
         "permissions are created before any service starts listening, so Windows has nothing to ask"
