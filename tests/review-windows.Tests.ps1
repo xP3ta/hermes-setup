@@ -1521,7 +1521,7 @@ function Test-FirewallAppRules {
     Assert-True ($setupRaw -match 'FirewallRuleNames \+= \$appRuleName') "application rules join the rollback list"
     Assert-True ($setupRaw -match 'FirewallRuleNames') "the rollback removes them"
 
-    foreach ($name in @("Get-ManagedListenPrograms", "Ensure-AppFirewallRules")) {
+    foreach ($name in @("Get-ManagedListenPrograms", "Ensure-AppFirewallRules", "Remove-ManagedProgramBlockRules")) {
         Import-ProductFunction $setup $name
     }
     function global:Test-CurrentProcessAdministrator { return $true }
@@ -1568,7 +1568,6 @@ function Test-FirewallAppRules {
     Assert-True ($early -gt 0 -and $services -gt 0 -and $early -lt $services) `
         "permissions are created before any service starts listening, so Windows has nothing to ask"
 
-    Import-ProductFunction $setup "Remove-ManagedProgramBlockRules"
     function global:Get-NetFirewallApplicationFilter {
         param($Rule, $ErrorAction)
         return [PSCustomObject]@{ Program = $Rule.Program }
