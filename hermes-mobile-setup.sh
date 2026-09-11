@@ -1301,15 +1301,19 @@ cat > "$GATEWAY_RUNNER" <<EOF
 export HERMES_HOME="$HH"
 export API_SERVER_HOST="$BIND_HOST"
 export API_SERVER_PORT="$GATEWAY_PORT"
+# launchd y systemd no heredan el PATH del usuario: sin esto, el node gestionado
+# o el de Homebrew quedan fuera y el Dashboard no puede construir el frontend.
+export PATH="$HH/node/bin:$HH/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH"
 cd "$HH"
 exec "$HB" gateway run --replace
 EOF
 cat > "$DASHBOARD_RUNNER" <<EOF
 #!/bin/sh
 export HERMES_HOME="$HH"
-# El Dashboard necesita node/npm: el gestionado por Hermes va primero para no
-# depender del PATH de la sesion (launchd y systemd no heredan el del usuario).
-export PATH="$HH/node/bin:$HH/bin:\$PATH"
+# El Dashboard compila su frontend con node/npm. launchd arranca con un PATH
+# minimo (/usr/bin:/bin) y systemd tampoco hereda el del usuario, asi que se
+# anaden el node gestionado por Hermes y las rutas habituales de Homebrew.
+export PATH="$HH/node/bin:$HH/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH"
 cd "$HH"
 exec "$HB" dashboard --host "$BIND_HOST" --port "$DASHBOARD_PORT" --no-open
 EOF
