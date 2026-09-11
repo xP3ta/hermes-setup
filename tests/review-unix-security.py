@@ -705,11 +705,6 @@ class SetupLockTests(unittest.TestCase):
             self.assertFalse(selected.exists())
 
 
-SYSTEMD_AVAILABLE = platform.system() == "Linux" and shutil.which("systemd-analyze") is not None
-# systemd-analyze solo existe en Linux: los casos que lo invocan se saltan con un
-# motivo explicito en otras plataformas (macOS usa launchd: macos-launchd_test.py).
-
-
 @unittest.skipUnless(
     SYSTEMD_AVAILABLE,
     "systemd is Linux-only; launchd is covered by tests/macos-launchd_test.py",
