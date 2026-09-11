@@ -337,6 +337,7 @@ function New-SetupTransaction {
         FileSnapshots = (New-Object Collections.ArrayList)
         TaskSnapshots = (New-Object Collections.ArrayList)
         FirewallRuleName = ""
+        FirewallRuleNames = @()
         Committed = $false
         BaselineServicePids = @()
     }
@@ -668,6 +669,18 @@ function Restore-TransactionTasks {
 function Remove-AttemptFirewallRule {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)]$Transaction)
+    $appNames = @()
+    if ($Transaction.PSObject.Properties["FirewallRuleNames"]) { $appNames = @($Transaction.FirewallRuleNames) }
+    foreach ($name in $appNames) {
+        if (-not $name) { continue }
+        try {
+            if (Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue) {
+                Remove-NetFirewallRule -Name $name -ErrorAction Stop
+            }
+        } catch {
+            $failures += "firewall-rule:$name"
+        }
+    }
     if (-not $Transaction.FirewallRuleName) { return }
     Import-Module NetSecurity -ErrorAction Stop
     $rule = Get-NetFirewallRule -Name $Transaction.FirewallRuleName -ErrorAction SilentlyContinue
@@ -2145,6 +2158,65 @@ function Assert-FirewallPreflight([hashtable]$Pairing) {
     throw "A restricted Windows Firewall rule is required. Re-run setup from an already elevated PowerShell terminal; setup never opens UAC or secondary windows. No changes were made."
 }
 
+function Get-ManagedListenPrograms {
+    # Ejecutables del home gestionado que abren un puerto a la escucha. Windows
+    # pregunta "permitir esta aplicacion?" por PROGRAMA, aunque exista una regla por
+    # puerto, asi que estos son los que hay que autorizar para que no aparezca el
+    # aviso (y para que nadie pueda cancelarlo dejando una regla de bloqueo).
+    $programs = New-Object System.Collections.Generic.List[string]
+    $candidates = @()
+    try { $candidates += (Get-HermesPython) } catch {}
+    if ($HB) { $candidates += $HB }
+    foreach ($candidate in $candidates) {
+        if (-not $candidate) { continue }
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        try {
+            $resolved = [IO.Path]::GetFullPath($candidate)
+        } catch {
+            continue
+        }
+        if (-not $programs.Contains($resolved)) { $programs.Add($resolved) }
+    }
+    return $programs.ToArray()
+}
+
+function Ensure-AppFirewallRules([string]$Display, [hashtable]$Pairing, [string]$RuleName) {
+    # Reglas por programa: sin ellas Windows muestra el aviso "permitir esta
+    # aplicacion" al empezar a escuchar el Python del home gestionado, y quien lo
+    # cancele deja el emparejamiento roto sin saber por que. Idempotente: se crean
+    # las que falten, tambien al reejecutar sobre una instalacion existente.
+    if (-not (Test-CurrentProcessAdministrator)) { return }
+    $profile = if ($Pairing.Kind -eq "mesh") { "Any" } else { "Private" }
+    $remote = if ($Pairing.Kind -eq "mesh") { "100.64.0.0/10" } else { "LocalSubnet" }
+    $appIndex = 0
+    $created = 0
+    foreach ($program in @(Get-ManagedListenPrograms)) {
+        $appRuleName = "$RuleName-app$appIndex"
+        $appIndex++
+        $existing = Get-NetFirewallRule -Name $appRuleName -ErrorAction SilentlyContinue
+        if ($existing) {
+            $filter = $existing | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+            if ($filter -and $filter.Program -eq $program) { continue }
+            Remove-NetFirewallRule -Name $appRuleName -ErrorAction SilentlyContinue
+        }
+        New-NetFirewallRule -Name $appRuleName -DisplayName "$Display (application)" `
+            -Direction Inbound -Action Allow -Program $program `
+            -Protocol TCP -LocalPort @($GatewayPort, $DashboardPort, $BridgePort) `
+            -Profile $profile -RemoteAddress $remote -ErrorAction Stop | Out-Null
+        if ($script:SetupTransaction -and $script:SetupTransaction.PSObject.Properties["FirewallRuleNames"]) {
+            $script:SetupTransaction.FirewallRuleNames += $appRuleName
+        }
+        if (-not (Get-NetFirewallRule -Name $appRuleName -ErrorAction SilentlyContinue)) {
+            throw "Created application firewall rule did not verify."
+        }
+        $created++
+    }
+    if ($created -gt 0) {
+        Write-Ok "Windows Firewall application rules installed so Windows never prompts (and a cancelled prompt cannot break pairing)"
+    }
+    return $created
+}
+
 function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
     if ($Pairing.Scheme -eq "https") { return }
     $display = if ($Pairing.Kind -eq "mesh") {
@@ -2161,6 +2233,11 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
     $state = Get-RestrictedFirewallRuleState $display $Pairing.Kind
     if ($state -eq "Exact") {
         Write-Ok "Existing restricted Windows Firewall rule verified"
+        # Una instalacion anterior puede tener solo la regla por puerto: se
+        # completan las reglas por programa sin tocar la existente.
+        $rule = @(Get-NetFirewallRule -DisplayName $display -ErrorAction SilentlyContinue |
+            Where-Object { $_.Enabled -eq $true }) | Select-Object -First 1
+        if ($rule) { [void](Ensure-AppFirewallRules $display $Pairing $rule.Name) }
         return
     }
     if ($state -ne "Absent") {
@@ -2185,9 +2262,11 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
         }
         $script:SetupTransaction.FirewallRuleName = $ruleName
         $script:FirewallRuleCreatedName = $ruleName
+        $script:SetupTransaction.FirewallRuleNames = @($ruleName)
         if ((Get-RestrictedFirewallRuleState $display $Pairing.Kind) -ne "Exact") {
             throw "Created firewall rule did not verify exactly."
         }
+        Ensure-AppFirewallRules $display $Pairing $ruleName
         Write-TransactionJournal $script:SetupTransaction "firewall-create" "ok"
         Write-Ok $(if ($Pairing.Kind -eq "mesh") {
             "Tailscale-only Windows Firewall rule installed"
