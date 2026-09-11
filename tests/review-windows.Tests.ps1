@@ -1528,12 +1528,22 @@ function Test-FirewallAppRules {
     function global:Write-Ok { param($Message) }
     function global:Get-NetFirewallApplicationFilter { param($Rule, $ErrorAction) return $null }
     $script:created = New-Object System.Collections.Generic.List[string]
-    function global:Get-NetFirewallRule { param([string]$Name, $DisplayName, $ErrorAction) return $null }
+    $script:createdNames = New-Object System.Collections.Generic.List[string]
+    # El stub refleja la realidad: lo creado se puede volver a consultar, que es lo
+    # que el producto verifica antes de dar la regla por buena.
+    function global:Get-NetFirewallRule {
+        param([string]$Name, $DisplayName, $ErrorAction)
+        if ($Name -and ($script:createdNames -contains $Name)) {
+            return [PSCustomObject]@{ Name = $Name; Enabled = $true }
+        }
+        return $null
+    }
     function global:New-NetFirewallRule {
         param([string]$Name, [string]$DisplayName, [string]$Direction, [string]$Action,
               [string]$Program, [string]$Protocol, $LocalPort, [string]$Profile,
               [string]$RemoteAddress, $ErrorAction)
         [void]$script:created.Add("$Name|$Program|$Profile|$RemoteAddress|$($LocalPort -join ',')")
+        [void]$script:createdNames.Add($Name)
         return [PSCustomObject]@{ Name = $Name }
     }
     $script:HermesPython = "C:\\home\\venv\\Scripts\\python.exe"
