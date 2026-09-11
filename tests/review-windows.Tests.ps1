@@ -1467,9 +1467,16 @@ function Test-ProgressBranding {
     Assert-True ($setupRaw -match 'redirect_stdout\(buffer\)') `
         "the ASCII QR never goes to the captured stdout of the render process"
     Assert-True ($setupRaw -match 'Show-PairingResult \$link') "the flow prints the pairing result at the end"
-    $showBody = [regex]::Match($setupRaw, 'function Show-PairingResult.*?\n\}').Value
+    # Extraccion determinista del cuerpo: de la definicion al siguiente 'function'.
+    $showStart = $setupRaw.IndexOf("function Show-PairingResult")
+    $showEnd = if ($showStart -ge 0) { $setupRaw.IndexOf("`nfunction ", $showStart + 10) } else { -1 }
+    $showBody = if ($showStart -ge 0 -and $showEnd -gt $showStart) {
+        $setupRaw.Substring($showStart, $showEnd - $showStart)
+    } else { "" }
+    Assert-True ($showBody.Length -gt 200) "the pairing result body is found"
     Assert-True ($showBody -notmatch 'Write-Audit') "the pairing link and QR are never written to the audit log"
     Assert-True ($showBody -match 'Write-Host') "the pairing result is printed to the console"
+    Assert-True ($showBody -match 'QR image:') "the console names the QR image file too"
 
     # La barra respeta el modo redirigido y el formato de siempre sigue ahi.
     Import-ProductFunction $setup "Write-SetupPhase"
