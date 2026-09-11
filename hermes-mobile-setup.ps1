@@ -2180,11 +2180,38 @@ function Get-ManagedListenPrograms {
     return $programs.ToArray()
 }
 
+function Remove-ManagedProgramBlockRules {
+    # Windows crea reglas de BLOQUEO para el ejecutable cuando alguien descarta el
+    # aviso "permitir esta aplicacion?". Las reglas de bloqueo tienen prioridad
+    # sobre las de permiso, asi que el emparejamiento se rompe en silencio: el
+    # instalador dice que todo pasa y el movil no llega nunca. Se quitan solo las
+    # que cubren los ejecutables del home gestionado.
+    $programs = @(Get-ManagedListenPrograms)
+    if ($programs.Count -eq 0) { return 0 }
+    $removed = 0
+    foreach ($rule in @(Get-NetFirewallRule -Enabled True -Action Block -Direction Inbound -ErrorAction SilentlyContinue)) {
+        $filter = $null
+        try { $filter = $rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue } catch {}
+        if (-not $filter -or -not $filter.Program) { continue }
+        foreach ($program in $programs) {
+            if ($filter.Program -ieq $program) {
+                if (Remove-NetFirewallRule -Name $rule.Name -ErrorAction SilentlyContinue) { $removed++ }
+                break
+            }
+        }
+    }
+    if ($removed -gt 0) {
+        Write-Ok "Removed $removed Windows Firewall block rule(s) that covered the managed executables (a dismissed prompt would have broken pairing silently)"
+    }
+    return $removed
+}
+
 function Ensure-AppFirewallRules([string]$Display, [hashtable]$Pairing, [string]$RuleName) {
     # Reglas por programa: sin ellas Windows muestra el aviso "permitir esta
     # aplicacion" al empezar a escuchar el Python del home gestionado, y quien lo
     # cancele deja el emparejamiento roto sin saber por que. Idempotente: se crean
     # las que falten, tambien al reejecutar sobre una instalacion existente.
+    [void](Remove-ManagedProgramBlockRules)
     if (-not (Test-CurrentProcessAdministrator)) { return }
     $profile = if ($Pairing.Kind -eq "mesh") { "Any" } else { "Private" }
     $remote = if ($Pairing.Kind -eq "mesh") { "100.64.0.0/10" } else { "LocalSubnet" }
@@ -3262,6 +3289,11 @@ if ($AuditOnly) {
 # Snapshot every reversible Windows integration target before its first mutation.
 $script:SetupTransaction = Initialize-SetupTransaction
 New-Item -ItemType Directory -Force -Path $HermesHome, $ServicesDir, $LogsDir, $AuditDir | Out-Null
+# Los permisos de firewall se aseguran ANTES de que ningun servicio empiece a
+# escuchar: el aviso "permitir esta aplicacion" aparece en ese instante, y su
+# respuesta decide si el emparejamiento funcionara (una regla de bloqueo gana a
+# cualquier permiso posterior).
+if (-not $AuditOnly) { Ensure-PrivateFirewallRules $Pairing }
 
 try {
     Write-Audit "Setup" "INFO" "Repair/install mode"
