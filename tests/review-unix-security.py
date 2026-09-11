@@ -645,6 +645,7 @@ class DashboardReadinessTests(unittest.TestCase):
                 + "  return 1\n"
                 "}\n"
                 'service_failure() { echo "FAILED:$1"; exit 9; }\n'
+                + "setup_phase_detail() { :; }\n"
                 + self._block()
                 + '\necho READY\n',
                 encoding="utf-8",

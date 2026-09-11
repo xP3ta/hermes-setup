@@ -1005,11 +1005,93 @@ function Write-Warn([string]$Message) { Write-Audit "Hermes Console" "WARN" $Mes
 
 $script:SetupPhase = 0
 $script:SetupPhaseTotal = 7
+# Pesos por fase (suman 100). El porcentaje es honesto: no avanza por tiempo sino
+# por fases completadas, y las dos fases lentas (instalar Hermes Agent y construir
+# el Dashboard) mueven su tramo con senales reales, no con un reloj.
+$script:SetupPhaseWeights = @(3, 40, 4, 24, 17, 7, 5)
+$script:SetupProgressNote = ""
+$script:SetupStartedAt = Get-Date
+# La barra solo se dibuja en una consola interactiva: redirigido (logs, CI) el
+# formato de siempre no cambia ni un byte.
+$script:SetupLive = $false
+try {
+    $script:SetupLive = -not [Console]::IsOutputRedirected
+} catch {
+    $script:SetupLive = $false
+}
+
+function Get-SetupPercent([int]$CompletedWeight) {
+    if ($CompletedWeight -lt 0) { return 0 }
+    if ($CompletedWeight -gt 100) { return 100 }
+    return $CompletedWeight
+}
+
+function Format-Elapsed([TimeSpan]$Span) {
+    if ($Span.TotalMinutes -ge 1) {
+        return ("{0}m{1:d2}s" -f [int]$Span.TotalMinutes, $Span.Seconds)
+    }
+    return ("{0}s" -f [int]$Span.TotalSeconds)
+}
+
+function Show-SetupBanner {
+    if (-not $script:SetupLive) { return }
+    $line = "=" * 64
+    Write-Host ""
+    Write-Host "  $line" -ForegroundColor DarkGray
+    Write-Host "    xPetaLab  |  HERMES CONSOLE" -ForegroundColor DarkYellow
+    Write-Host "  $line" -ForegroundColor DarkGray
+    Write-Host "    Self-hosted Hermes Agent + Gateway + Dashboard + Mobile Bridge" -ForegroundColor Gray
+    Write-Host "    Windows PowerShell $($PSVersionTable.PSVersion) - no popups, no telemetry" -ForegroundColor DarkGray
+    Write-Host "  $line" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+function Write-SetupProgressBar([int]$Percent, [string]$Label, [string]$Note = "") {
+    if (-not $script:SetupLive) { return }
+    $width = 28
+    $filled = [int][Math]::Floor($width * $Percent / 100)
+    if ($filled -gt $width) { $filled = $width }
+    $bar = ("#" * $filled) + ("-" * ($width - $filled))
+    $elapsed = Format-Elapsed ((Get-Date) - $script:SetupStartedAt)
+    $suffix = if ($Note) { " - $Note" } else { "" }
+    $text = "  [$bar] {0,3}%  {1}/$($script:SetupPhaseTotal) {2}  ({3}){4}" -f `
+        $Percent, $script:SetupPhase, $Label, $elapsed, $suffix
+    try {
+        Write-Host ("`r" + $text.PadRight(118)) -NoNewline -ForegroundColor Gray
+    } catch {
+        Write-Host $text -ForegroundColor Gray
+    }
+}
+
 function Write-SetupPhase([string]$Label) {
     $script:SetupPhase++
+    $weight = 0
+    for ($i = 0; $i -lt ($script:SetupPhase - 1); $i++) {
+        if ($i -lt $script:SetupPhaseWeights.Count) { $weight += $script:SetupPhaseWeights[$i] }
+    }
+    $script:SetupCompletedWeight = $weight
+    $script:SetupProgressNote = ""
+    $script:SetupProgressLabel = $Label
     $filled = "#" * $script:SetupPhase
     $remaining = "." * ($script:SetupPhaseTotal - $script:SetupPhase)
     Write-Audit "Setup progress" "INFO" "[$filled$remaining] $($script:SetupPhase)/$($script:SetupPhaseTotal) $Label"
+    Write-SetupProgressBar (Get-SetupPercent $weight) $Label
+}
+
+function Write-SetupPhaseDetail([string]$Note, [int]$SubPercent = -1) {
+    # Sub-progreso de la fase en curso. [SubPercent] debe venir de una senal real
+    # (tarea viva, log creciendo); -1 significa "trabajando, sin porcentaje".
+    if ($script:SetupPhase -lt 1 -or $script:SetupPhase -gt $script:SetupPhaseTotal) { return }
+    $base = if ($script:SetupCompletedWeight) { $script:SetupCompletedWeight } else { 0 }
+    $weight = $script:SetupPhaseWeights[$script:SetupPhase - 1]
+    $percent = if ($SubPercent -lt 0) { $base } else { $base + [int]($weight * $SubPercent / 100) }
+    $script:SetupProgressNote = $Note
+    Write-SetupProgressBar (Get-SetupPercent $percent) $script:SetupProgressLabel $Note
+}
+
+function Complete-SetupProgress([string]$Note = "") {
+    if ($script:SetupLive) { Write-Host "" }
+    if ($Note) { Write-Info $Note }
 }
 
 function Get-PowerShellExecutable {
@@ -1097,7 +1179,8 @@ function Wait-HermesService(
     [string]$ExpectedVersion = "",
     [switch]$PhoneFacing,
     [string]$ExtendWhileTaskRunning = "",
-    [int]$MaxSeconds = 0
+    [int]$MaxSeconds = 0,
+    [string]$Note = ""
 ) {
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $lastReported = -1
@@ -1112,15 +1195,23 @@ function Wait-HermesService(
             if ($elapsed -ne $lastReported -and $elapsed % 2 -eq 0) {
                 Write-Audit "$Kind readiness" "INFO" "Waiting (${elapsed}s/${Seconds}s)"
                 $lastReported = $elapsed
+                if ($Note) {
+                    Write-SetupPhaseDetail ("$Note ({0} elapsed, still working)" -f (Format-Elapsed $watch.Elapsed))
+                }
             }
         } elseif ($ExtendWhileTaskRunning -and $MaxSeconds -gt $Seconds -and
                   $elapsed -lt $MaxSeconds -and (Test-ProgressHolder $ExtendWhileTaskRunning)) {
             # The task is still working (cold build, first initialisation): keep
             # waiting with an explicit trail instead of reporting a false failure.
-            if ($elapsed - $lastExtension -ge 15) {
+            if ($elapsed - $lastExtension -ge 5) {
                 $lastExtension = $elapsed
-                Write-Audit "$Kind readiness" "INFO" `
-                    "Still starting (${elapsed}s, budget ${Seconds}s extended to ${MaxSeconds}s); the service task is still running"
+                $note = "$Kind is still building"
+                if ($Note) { $note = $Note }
+                Write-SetupPhaseDetail ("{0} ({1} elapsed; the service task is still running)" -f $note, (Format-Elapsed $watch.Elapsed))
+                if ($elapsed % 15 -lt 5) {
+                    Write-Audit "$Kind readiness" "INFO" `
+                        "Still starting (${elapsed}s, budget ${Seconds}s extended to ${MaxSeconds}s); the service task is still running"
+                }
             }
         } else {
             return $false
@@ -2347,6 +2438,8 @@ function Write-PairingQr([string]$Python, [string]$Link) {
     $qrNew = $AttemptPaths.QrNew
     $qrSource = @'
 import binascii
+import contextlib
+import io
 import struct
 import sys
 import zlib
@@ -2377,17 +2470,27 @@ png += chunk(b"IDAT", zlib.compress(b"".join(rows), 9))
 png += chunk(b"IEND", b"")
 with open(sys.argv[1], "wb") as handle:
     handle.write(png)
+
+# El QR en ASCII se escribe a un fichero propio: nunca a stdout, porque la salida
+# de este proceso se guarda en el directorio de auditoria que el usuario comparte.
+if len(sys.argv) > 2:
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        qr.print_ascii(invert=True)
+    with open(sys.argv[2], "w", encoding="utf-8") as handle:
+        handle.write(buffer.getvalue())
 '@
     [IO.File]::WriteAllText($qrScript, $qrSource, $Utf8NoBom)
+    $qrAsciiNew = Join-Path $ServicesDir "pairing-qr.txt.$AttemptId.new"
     $qrProcess = $Python
-    $qrArguments = "`"$qrScript`" `"$qrNew`""
+    $qrArguments = "`"$qrScript`" `"$qrNew`" `"$qrAsciiNew`""
     if (-not (Test-PythonSnippet $Python "import qrcode" @() 10)) {
         $uv = Get-HermesUv
         if (-not $uv) {
             throw "Pairing QR generation requires the verified Hermes uv runtime."
         }
         $qrProcess = $uv
-        $qrArguments = "run --isolated --no-project --python `"$Python`" --with qrcode==8.2 python `"$qrScript`" `"$qrNew`""
+        $qrArguments = "run --isolated --no-project --python `"$Python`" --with qrcode==8.2 python `"$qrScript`" `"$qrNew`" `"$qrAsciiNew`""
     }
     try {
         $qrOut = Join-Path $AuditDir "pairing-qr-$AttemptId.out.log"
@@ -2407,13 +2510,40 @@ with open(sys.argv[1], "wb") as handle:
             throw "Pairing QR generation failed without producing a verified PNG file."
         }
         Write-AtomicBytes -Path $QrFile -Bytes $png
+        # El QR en ASCII se lee ahora, se imprime en la consola y no se persiste
+        # como fichero aparte: el PNG ya es el artefacto del home.
+        $script:PairingQrAscii = ""
+        if (Test-Path -LiteralPath $qrAsciiNew) {
+            $script:PairingQrAscii = [IO.File]::ReadAllText($qrAsciiNew)
+        }
     } finally {
         if ($script:MutationQuiescent) {
-            Remove-Item -LiteralPath $qrScript, $qrNew, $qrOut, $qrErr -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $qrScript, $qrNew, $qrAsciiNew, $qrOut, $qrErr -Force -ErrorAction SilentlyContinue
         }
     }
     Write-Audit "Pairing QR" "OK" $QrFile
     return $QrFile
+}
+
+function Show-PairingResult([string]$Link) {
+    # El usuario necesita ver el QR y el enlace en la consola, no solo una ruta a un
+    # PNG (en Unix ya se imprimen). Nada de esto va a los logs: el enlace lleva el
+    # token y los logs se comparten para soporte.
+    if (-not $Link) { return }
+    $qrAscii = ""
+    if ($script:PairingQrAscii) { $qrAscii = $script:PairingQrAscii }
+    if (-not [string]::IsNullOrWhiteSpace($qrAscii)) {
+            Write-Host ""
+        Write-Host ""
+        Write-Host "  == SCAN THIS QR WITH HERMES CONSOLE (or copy the link below) ==" -ForegroundColor DarkYellow
+        Write-Host $qrAscii -ForegroundColor Gray
+    }
+    Write-Host "  == PAIRING LINK ==" -ForegroundColor DarkYellow
+    Write-Host "  $Link" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  QR image: $QrFile" -ForegroundColor DarkGray
+    Write-Host "  Show it again later: powershell -NoProfile -ExecutionPolicy Bypass -File `"$env:TEMP\hermes-setup.ps1`"" -ForegroundColor DarkGray
+    Write-Host ""
 }
 
 function Test-RunnerContract([string]$Path, [string[]]$RequiredFragments) {
@@ -3022,6 +3152,7 @@ if ($Diagnose) {
 }
 
 Assert-SupportedWindows
+Show-SetupBanner
 $AttemptPaths = New-SetupAttemptPaths -HermesHome $HermesHome
 $BridgeNew = $AttemptPaths.BridgeNew
 $ManifestFile = $AttemptPaths.ManifestFile
@@ -3058,6 +3189,7 @@ try {
     Write-SetupPhase "Inspecting the existing installation"
     Remove-LegacyTasks
     Write-SetupPhase "Checking Hermes Agent and Python"
+    Write-SetupPhaseDetail "Installing Hermes Agent if missing (several minutes on a clean host)" -1
     $HermesExe = Install-HermesIfNeeded
     $PythonExe = Get-HermesPython
     if (-not $PythonExe) { throw "Hermes virtual-environment Python was not found." }
@@ -3243,7 +3375,8 @@ WScript.Quit rc
     # so the wait extends with an explicit trail up to the ceiling and only then
     # fails. The script must stay pure ASCII (enforced by the suite).
     if (-not (Wait-HermesService "dashboard" "http://127.0.0.1:$DashboardPort" $ApiKey 240 "" `
-            -ExtendWhileTaskRunning "HermesConsole-Dashboard" -MaxSeconds 1800)) {
+            -ExtendWhileTaskRunning "HermesConsole-Dashboard" -MaxSeconds 1800 `
+            -Note "Building the Dashboard (first start compiles the web UI)")) {
         throw "Dashboard readiness failed. Check Node.js/PATH, its Scheduled Task and TCP $DashboardPort."
     }
     Write-Ok "Dashboard identity and Gateway state passed on $DashboardPort"
@@ -3331,6 +3464,7 @@ WScript.Quit rc
     $link = "hermes://pair?" + ($query -join "&")
     [void](Write-PairingQr $PythonExe $link)
 
+    Show-PairingResult $link
     Complete-SetupTransaction -Transaction $script:SetupTransaction
 
     Write-Audit "Setup" "OK" "All local and phone-facing checks passed; pairing QR is ready"

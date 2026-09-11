@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint")]
+    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding")]
     [string]$Case = "All",
     [string]$SetupScript = "",
     [string]$PairScript = ""
@@ -1437,8 +1437,71 @@ function Test-Uninstall {
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+function Test-ProgressBranding {
+    # La instalacion debe verse como un instalador con identidad y el QR tiene que
+    # aparecer en la consola. La barra solo se dibuja en una terminal interactiva:
+    # redirigido (logs, CI) la salida es exactamente la de siempre.
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+
+    Assert-True ($setupRaw -match 'xPetaLab' -and $setupRaw -match 'HERMES CONSOLE') `
+        "the installer shows the product banner"
+    Assert-True ($setupRaw -match '\$script:SetupPhaseWeights = @\(([0-9]+, ){6}[0-9]+\)') `
+        "phase weights are declared once"
+    $match = [regex]::Match($setupRaw, '\$script:SetupPhaseWeights = @\(([0-9,\s]+)\)')
+    Assert-True $match.Success "phase weights are parseable"
+    if ($match.Success) {
+        $weights = @($match.Groups[1].Value.Split(',') | ForEach-Object { [int]$_.Trim() })
+        Assert-True ($weights.Count -eq 7) "one weight per phase"
+        Assert-True (($weights | Measure-Object -Sum).Sum -eq 100) "weights add up to one hundred"
+    }
+    Assert-True ($setupRaw -match '\[Console\]::IsOutputRedirected') `
+        "the installer detects whether the output is a terminal"
+    Assert-True ($setupRaw -match 'function Write-SetupPhaseDetail') "long phases report real activity"
+    Assert-True ($setupRaw -match 'ExtendWhileTaskRunning "HermesConsole-Dashboard" -MaxSeconds 1800') `
+        "the slow phase keeps its extended, progress-driven wait"
+
+    # El QR debe llegar a la consola: enlace + ASCII, y sin acabar en los logs.
+    Assert-True ($setupRaw -match 'function Show-PairingResult') "there is a console pairing result"
+    Assert-True ($setupRaw -match 'SCAN THIS QR WITH HERMES CONSOLE') "the console tells the user to scan the QR"
+    Assert-True ($setupRaw -match 'print_ascii\(invert=True\)') "the QR is rendered as ASCII too"
+    Assert-True ($setupRaw -match 'redirect_stdout\(buffer\)') `
+        "the ASCII QR never goes to the captured stdout of the render process"
+    Assert-True ($setupRaw -match 'Show-PairingResult \$link') "the flow prints the pairing result at the end"
+    $showBody = [regex]::Match($setupRaw, 'function Show-PairingResult.*?\n\}').Value
+    Assert-True ($showBody -notmatch 'Write-Audit') "the pairing link and QR are never written to the audit log"
+    Assert-True ($showBody -match 'Write-Host') "the pairing result is printed to the console"
+
+    # La barra respeta el modo redirigido y el formato de siempre sigue ahi.
+    Import-ProductFunction $setup "Write-SetupPhase"
+    foreach ($name in @("Write-Audit", "Show-SetupBanner", "Write-SetupProgressBar", "Get-SetupPercent", "Format-Elapsed")) {
+        Import-ProductFunction $setup $name
+    }
+    $script:auditLines = New-Object System.Collections.Generic.List[string]
+    $script:auditOnlyCapture = $true
+    function global:Write-Audit {
+        param($Step, $State, $Detail)
+        [void]$script:auditLines.Add("$Step|$State|$Detail")
+    }
+    $script:SetupPhase = 0
+    $script:SetupPhaseTotal = 7
+    $script:SetupPhaseWeights = @(3, 40, 4, 24, 17, 7, 5)
+    $script:SetupLive = $false
+    $script:SetupStartedAt = Get-Date
+    $script:SetupProgressLabel = ""
+    $script:SetupCompletedWeight = 0
+    $output = @(& { Write-SetupPhase "First phase" } 6>&1 | ForEach-Object { [string]$_ })
+    $joined = $output -join "`n"
+    Assert-True (($script:auditLines -join "`n") -match '\[#\.{6}\] 1/7 First phase') `
+        "the plain progress line is unchanged for logs and CI"
+    Assert-True ($joined -notmatch '%') "no bar is drawn when the output is not a terminal"
+    Assert-True ($joined -notmatch 'xPetaLab') "no banner is drawn when the output is not a terminal"
+    Assert-True ($script:SetupCompletedWeight -eq 0) "the first phase contributes no completed weight"
+    Assert-True ($script:SetupProgressLabel -eq "First phase") "the current label is tracked for the live line"
+}
+
+
 $cases = if ($Case -eq "All") {
-    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint")
+    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding")
 } else { @($Case) }
 
 foreach ($selected in $cases) {
