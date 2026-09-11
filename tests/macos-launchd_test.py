@@ -96,6 +96,7 @@ def main() -> int:
     harness = work / "launchd_harness.sh"
     harness.write_text(
         "set -eu\n"
+        + extract_function(source, "ownership_python")
         + extract_function(source, "assert_launchd_plist_owner")
         + extract_function(source, "assert_loaded_launchd_job_owner")
         + extract_function(source, "install_launchd_job")

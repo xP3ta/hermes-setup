@@ -1307,6 +1307,9 @@ EOF
 cat > "$DASHBOARD_RUNNER" <<EOF
 #!/bin/sh
 export HERMES_HOME="$HH"
+# El Dashboard necesita node/npm: el gestionado por Hermes va primero para no
+# depender del PATH de la sesion (launchd y systemd no heredan el del usuario).
+export PATH="$HH/node/bin:$HH/bin:\$PATH"
 cd "$HH"
 exec "$HB" dashboard --host "$BIND_HOST" --port "$DASHBOARD_PORT" --no-open
 EOF
