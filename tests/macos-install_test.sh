@@ -99,9 +99,11 @@ if [ -f "$PAIR_ENV" ]; then
       check "authenticated $url$path answers 200 (got $CODE)" 1
     fi
   done
-  # Negative: sin token no debe haber 200.
-  CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "${GATEWAY_BASE}/health" || echo 000)"
-  check "an unauthenticated request is rejected (got $CODE)" "$([ "$CODE" != "200" ] && echo 0 || echo 1)"
+  # Negative: una ruta protegida sin token no puede responder 200. /health es
+  # publico a proposito, asi que se usa la ruta protegida del Dashboard.
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "${DASHBOARD_BASE}/api/model/options" || echo 000)"
+  check "an unauthenticated request to a protected route is rejected (got $CODE)" \
+    "$([ "$CODE" = "401" ] || [ "$CODE" = "403" ] && echo 0 || echo 1)"
 else
   check "the pairing record is written" 1
 fi
@@ -111,7 +113,13 @@ for label in $LABELS; do
   launchctl bootout "gui/$UID_NUM/$label" >/dev/null 2>&1 || true
 done
 rm -f "$HOME/Library/LaunchAgents/dev.xpetalab.hermes-console."*.plist
+# bootout es asincrono: se da un margen corto antes de declarar que sigue cargado.
 for label in $LABELS; do
+  attempts=0
+  while [ "$attempts" -lt 10 ] && launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    sleep 1
+  done
   if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
     check "$label no queda cargado" 1
   else
