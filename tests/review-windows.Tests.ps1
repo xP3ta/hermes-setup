@@ -1558,6 +1558,43 @@ function Test-FirewallAppRules {
     Assert-True (($script:created -join "`n") -match 'Private\|LocalSubnet') "application rules keep the private LAN scope"
     Assert-True (($script:created -join "`n") -match '8642,9119,9131') "application rules keep the same three ports"
     Assert-True (@($script:SetupTransaction.FirewallRuleNames).Count -eq 2) "application rules are registered for rollback"
+
+    # Una regla de BLOQUEO para el mismo ejecutable gana al permiso: hay que quitarla.
+    Assert-True ($setupRaw -match 'function Remove-ManagedProgramBlockRules') "dismissed-prompt block rules are handled"
+    Assert-True ($setupRaw -match '-Enabled True -Action Block -Direction Inbound') "only enabled inbound block rules are considered"
+    Assert-True ($setupRaw -match 'Remove-ManagedProgramBlockRules') "the block cleanup runs while ensuring permissions"
+    $early = $setupRaw.IndexOf("if (-not \$AuditOnly) { Ensure-PrivateFirewallRules \$Pairing }")
+    $services = $setupRaw.IndexOf('Write-SetupPhase "Installing hidden persistent services"')
+    Assert-True ($early -gt 0 -and $services -gt 0 -and $early -lt $services) `
+        "permissions are created before any service starts listening, so Windows has nothing to ask"
+
+    Import-ProductFunction $setup "Remove-ManagedProgramBlockRules"
+    function global:Get-NetFirewallApplicationFilter {
+        param($Rule, $ErrorAction)
+        return [PSCustomObject]@{ Program = $Rule.Program }
+    }
+    $script:removedBuild = New-Object System.Collections.Generic.List[string]
+    function global:Get-NetFirewallRule {
+        param([string]$Name, $DisplayName, $Enabled, $Action, $Direction, $ErrorAction)
+        if ($Action -eq "Block") {
+            return @(
+                [PSCustomObject]@{ Name = "Block-python"; Program = $script:HermesPython },
+                [PSCustomObject]@{ Name = "Block-otra-app"; Program = "C:\otra\app.exe" }
+            )
+        }
+        if ($Name -and ($script:createdNames -contains $Name)) { return [PSCustomObject]@{ Name = $Name; Enabled = $true } }
+        return $null
+    }
+    function global:Remove-NetFirewallRule {
+        param([string]$Name, [string]$DisplayName, $ErrorAction)
+        [void]$script:removedBuild.Add($Name)
+        return $true
+    }
+    function global:Write-Ok { param($Message) }
+    $removed = Remove-ManagedProgramBlockRules
+    Assert-True ($removed -eq 1) "only the managed program's block rule is removed (actual: $removed)"
+    Assert-True ($script:removedBuild -contains "Block-python") "the blocked managed executable is unblocked"
+    Assert-True (-not ($script:removedBuild -contains "Block-otra-app")) "a foreign block rule is left alone"
 }
 
 $cases = if ($Case -eq "All") {
