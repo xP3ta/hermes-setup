@@ -1569,11 +1569,12 @@ function Test-FirewallAppRules {
     Assert-True ($early -gt 0 -and $services -gt 0 -and $early -lt $services) `
         "permissions are created before any service starts listening, so Windows has nothing to ask"
 
-    # El cmdlet real acepta el objeto por la tuberia: el stub tambien, o el filtro
-    # llega vacio y el caso se cree en verde sin comprobar nada.
+    # El producto pide el filtro con el parametro explicito (no por tuberia), asi
+    # que el stub lo recibe siempre y el caso no puede pasar en falso.
     function global:Get-NetFirewallApplicationFilter {
-        param([Parameter(ValueFromPipeline = $true)]$Rule, $ErrorAction)
-        process { return [PSCustomObject]@{ Program = $Rule.Program } }
+        param($AssociatedNetFirewallRule, $Rule, $ErrorAction)
+        $subject = if ($AssociatedNetFirewallRule) { $AssociatedNetFirewallRule } else { $Rule }
+        return [PSCustomObject]@{ Program = $subject.Program }
     }
     $script:removedBuild = New-Object System.Collections.Generic.List[string]
     function global:Get-NetFirewallRule {
