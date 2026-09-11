@@ -2191,7 +2191,7 @@ function Remove-ManagedProgramBlockRules {
     $removed = 0
     foreach ($rule in @(Get-NetFirewallRule -Enabled True -Action Block -Direction Inbound -ErrorAction SilentlyContinue)) {
         $filter = $null
-        try { $filter = $rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue } catch {}
+        try { $filter = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue } catch {}
         if (-not $filter -or -not $filter.Program) { continue }
         foreach ($program in $programs) {
             if ($filter.Program -ieq $program) {
@@ -2222,7 +2222,7 @@ function Ensure-AppFirewallRules([string]$Display, [hashtable]$Pairing, [string]
         $appIndex++
         $existing = Get-NetFirewallRule -Name $appRuleName -ErrorAction SilentlyContinue
         if ($existing) {
-            $filter = $existing | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+            $filter = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $existing -ErrorAction SilentlyContinue
             if ($filter -and $filter.Program -eq $program) { continue }
             Remove-NetFirewallRule -Name $appRuleName -ErrorAction SilentlyContinue
         }
