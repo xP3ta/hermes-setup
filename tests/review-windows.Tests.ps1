@@ -1569,20 +1569,28 @@ function Test-FirewallAppRules {
     Assert-True ($early -gt 0 -and $services -gt 0 -and $early -lt $services) `
         "permissions are created before any service starts listening, so Windows has nothing to ask"
 
-    # El producto pide el filtro con el parametro explicito (no por tuberia), asi
-    # que el stub lo recibe siempre y el caso no puede pasar en falso.
+    Import-ProductFunction $setup "Remove-ManagedProgramBlockRules"
+    $managed = @(Get-ManagedListenPrograms)
+    Assert-True ($managed.Count -eq 2) "the managed programs are resolvable in the fixture (actual: $($managed.Count))"
+    Assert-True ($managed[0] -like "*python.exe") "the interpreter is one of them"
+
+    # Stubs deterministas: el filtro responde por nombre de regla, sin depender del
+    # encadenado interno de cmdlets (que es lo que se esta probando, no como se ata).
     function global:Get-NetFirewallApplicationFilter {
         param($AssociatedNetFirewallRule, $Rule, $ErrorAction)
         $subject = if ($AssociatedNetFirewallRule) { $AssociatedNetFirewallRule } else { $Rule }
-        return [PSCustomObject]@{ Program = $subject.Program }
+        if (-not $subject) { return $null }
+        if ($subject.Name -eq "Block-python") { return [PSCustomObject]@{ Program = $managed[0] } }
+        if ($subject.Name -eq "Block-otra-app") { return [PSCustomObject]@{ Program = "C:\otra\app.exe" } }
+        return $null
     }
     $script:removedBuild = New-Object System.Collections.Generic.List[string]
     function global:Get-NetFirewallRule {
         param([string]$Name, $DisplayName, $Enabled, $Action, $Direction, $ErrorAction)
         if ($Action -eq "Block") {
             return @(
-                [PSCustomObject]@{ Name = "Block-python"; Program = $script:HermesPython },
-                [PSCustomObject]@{ Name = "Block-otra-app"; Program = "C:\otra\app.exe" }
+                [PSCustomObject]@{ Name = "Block-python" },
+                [PSCustomObject]@{ Name = "Block-otra-app" }
             )
         }
         if ($Name -and ($script:createdNames -contains $Name)) { return [PSCustomObject]@{ Name = $Name; Enabled = $true } }
@@ -1595,7 +1603,7 @@ function Test-FirewallAppRules {
     }
     function global:Write-Ok { param($Message) }
     $removed = Remove-ManagedProgramBlockRules
-    Assert-True ($removed -eq 1) "only the managed program's block rule is removed (actual: $removed)"
+    Assert-True ($removed -eq 1) "only the managed program's block rule is removed (actual: $removed; saw: $($script:removedBuild -join ','))"
     Assert-True ($script:removedBuild -contains "Block-python") "the blocked managed executable is unblocked"
     Assert-True (-not ($script:removedBuild -contains "Block-otra-app")) "a foreign block rule is left alone"
 }
