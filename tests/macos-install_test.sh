@@ -39,6 +39,14 @@ if [ "$RC" -ne 0 ]; then
       tail -25 "$HERMES_HOME/logs/$svc.log" | redact
     fi
   done
+  echo "== estado de launchd =="
+  for label in $LABELS; do
+    launchctl print "gui/$(id -u)/$label" 2>&1 | grep -aE "state|pid|last exit|program|path" | head -8
+  done
+  echo "== bin/ del home =="
+  ls -la "$HERMES_HOME/bin" 2>/dev/null | head -6
+  echo "== runner del Dashboard =="
+  redact < "$HERMES_HOME/console-services/hermes-dashboard.sh" 2>/dev/null | head -12
 else
   tail -12 "$LOG" | redact
 fi
