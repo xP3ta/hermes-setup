@@ -135,6 +135,22 @@ again for a fresh install, a repair or a Bridge update.
 For a brand-new Hermes install, the infrastructure is then ready for the app;
 you still choose the AI provider/model from Hermes Console's Dashboard.
 
+## Platforms covered by native evidence
+
+| Platform | How it is validated |
+|---|---|
+| Windows 10/11 | Native VM: full install, rerun, rollback, ports, uninstall, and the reviewer suite (275 checks, zero skips) under Windows PowerShell 5.1 and PowerShell 7 |
+| Windows Server 2022 | CI runner: the same reviewer suite |
+| Debian 13 (systemd 257) | Native host: full install, idempotent rerun, authenticated probes, contract suite |
+| macOS (Apple Silicon) | CI runner: POSIX syntax under BSD `/bin/sh`, the contract suite, a real `launchctl` lifecycle test driven by the installer's own functions, and a full isolated install with authenticated probes |
+| macOS (Intel), Linux ARM64/Termux, Windows ARM64 | **Not validated natively.** Supported by code and unit tests only; treat them as unproven until they run the same gates |
+
+The macOS row exists because "it works on Linux" is not evidence for macOS: it
+uses launchd instead of systemd, a BSD userland, and neither `systemd-analyze`
+nor `ufw`. That gap hid two real defects (a here-document that made the script
+unparseable under bash 3.2, and a Dashboard runner without the managed node on
+its PATH) until the macOS job was added.
+
 ## Security notes
 
 - The services listen on the address needed by the phone. Prefer Tailscale or a
