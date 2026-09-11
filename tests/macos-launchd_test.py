@@ -43,12 +43,26 @@ def check(condition: bool, message: str) -> None:
 
 
 def extract_function(source: str, name: str) -> str:
-    """Extrae `name() { ... }` de nivel superior (cierre en columna 0)."""
+    """Extrae `name() { ... }` de nivel superior, saltando los heredocs 'PY' que
+    contiene: dentro hay lineas `}` en columna 0 que parecen el cierre."""
     match = re.search(rf"^{re.escape(name)}\(\) \{{\n", source, re.MULTILINE)
     if not match:
         raise SystemExit(f"function {name} not found in {SETUP}")
-    end = source.index("\n}\n", match.end())
-    return source[match.start():end + 3]
+    lines = source[match.start():].splitlines(keepends=True)
+    depth_heredoc = None
+    for index, line in enumerate(lines[1:], start=1):
+        stripped = line.rstrip("\n")
+        if depth_heredoc is not None:
+            if stripped.strip() == depth_heredoc:
+                depth_heredoc = None
+            continue
+        marker = re.search(r"<<'?([A-Za-z_][A-Za-z0-9_]*)'?\s*$", stripped)
+        if marker and "<<" in stripped:
+            depth_heredoc = marker.group(1)
+            continue
+        if stripped == "}":
+            return "".join(lines[:index + 1])
+    raise SystemExit(f"function {name} has no top-level closing brace")
 
 
 def launchctl(*args: str) -> subprocess.CompletedProcess:

@@ -23,7 +23,25 @@ set +e
 sh "$SETUP" > "$LOG" 2>&1
 RC=$?
 set -e
-tail -25 "$LOG"
+
+# El log del run de CI es publico: nada de tokens ni claves, ni en el exito ni en
+# el diagnostico de fallo.
+redact() {
+  sed -E 's/(token|key|secret|password)(=[^& "]*)/\1=REDACTED/Ig' \
+    | sed -E 's/hermes:\/\/pair\?[^ ]*/hermes:\/\/pair?REDACTED/g'
+}
+if [ "$RC" -ne 0 ]; then
+  echo "== ultimas lineas del instalador =="
+  tail -40 "$LOG" | redact
+  for svc in gateway dashboard bridge; do
+    if [ -f "$HERMES_HOME/logs/$svc.log" ]; then
+      echo "== $svc.log (ultimas 25) =="
+      tail -25 "$HERMES_HOME/logs/$svc.log" | redact
+    fi
+  done
+else
+  tail -12 "$LOG" | redact
+fi
 check "the installer exits 0 on native macOS" "$RC"
 
 LABELS="dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard dev.xpetalab.hermes-console.bridge"

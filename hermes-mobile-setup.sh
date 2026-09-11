@@ -1818,7 +1818,36 @@ if ! start_named_service dashboard >/dev/null 2>&1; then
   echo "ERROR: Dashboard ownership could not be proven before starting it."
   exit 1
 fi
-if ! wait_probe dashboard "http://127.0.0.1:$DASHBOARD_PORT" 60; then
+# El primer arranque compila el Dashboard (npm/Vite). En un host lento, con el
+# disco ocupado o con antivirus revisando node_modules, una espera fija reporta un
+# fallo falso. Se extiende mientras el log del servicio siga creciendo (progreso
+# real), con techo de 30 minutos y rastro explicito; si deja de crecer, se falla.
+dashboard_ready=0
+dashboard_elapsed=0
+dashboard_last_size=0
+while [ "$dashboard_elapsed" -lt 1800 ]; do
+  if wait_probe dashboard "http://127.0.0.1:$DASHBOARD_PORT" 5; then
+    dashboard_ready=1
+    break
+  fi
+  dashboard_elapsed=$((dashboard_elapsed + 5))
+  if [ "$dashboard_elapsed" -lt 60 ]; then
+    continue
+  fi
+  dashboard_size=0
+  if [ -f "$LOGS/dashboard.log" ]; then
+    dashboard_size=$(wc -c < "$LOGS/dashboard.log" 2>/dev/null | tr -d ' ')
+  fi
+  case "$dashboard_size" in ''|*[!0-9]*) dashboard_size=0 ;; esac
+  if [ "$dashboard_size" -le "$dashboard_last_size" ]; then
+    break
+  fi
+  dashboard_last_size="$dashboard_size"
+  if [ $((dashboard_elapsed % 60)) -eq 0 ]; then
+    echo "Dashboard still starting (${dashboard_elapsed}s): its log keeps growing; waiting up to 1800s"
+  fi
+done
+if [ "$dashboard_ready" -ne 1 ]; then
   service_failure Dashboard "$DASHBOARD_PORT"
 fi
 if ! "$VP" - "http://127.0.0.1:$DASHBOARD_PORT" "$DASHBOARD_LOGIN_CREATED" "$DASHBOARD_LOGIN_USER" "$DASH_PASS" <<'PY_DASH_AUTH'
