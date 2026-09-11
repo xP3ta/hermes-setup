@@ -417,6 +417,66 @@ mkdir -p "$HH" "$SERVICES" "$LOGS"
 
 SETUP_STEP=0
 SETUP_TOTAL=7
+# Pesos por fase (suman 100). El porcentaje sale de fases completadas; las fases
+# lentas muestran actividad real (el log del servicio creciendo) sin inventar
+# porcentaje. La barra solo se dibuja en una terminal interactiva: redirigido
+# (logs, CI) la salida es exactamente la de siempre.
+SETUP_STEP_WEIGHTS="3 40 4 24 17 7 5"
+SETUP_COMPLETED_WEIGHT=0
+SETUP_LIVE=0
+[ -t 1 ] && SETUP_LIVE=1
+SETUP_STARTED_AT=$(date +%s 2>/dev/null || echo 0)
+SETUP_PROGRESS_LABEL=""
+
+setup_banner() {
+  [ "$SETUP_LIVE" -eq 1 ] || return 0
+  printf '\n  ================================================================\n'
+  printf '    xPetaLab  |  HERMES CONSOLE\n'
+  printf '  ================================================================\n'
+  printf '    Self-hosted Hermes Agent + Gateway + Dashboard + Mobile Bridge\n'
+  printf '    %s - no popups, no telemetry\n' "$(uname -s 2>/dev/null || echo Unix)"
+  printf '  ================================================================\n\n'
+}
+
+setup_elapsed() {
+  now=$(date +%s 2>/dev/null || echo 0)
+  case "$SETUP_STARTED_AT" in ''|*[!0-9]*) SETUP_STARTED_AT=0 ;; esac
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  total=$((now - SETUP_STARTED_AT))
+  if [ "$total" -ge 60 ]; then
+    printf '%sm%02ss' "$((total / 60))" "$((total % 60))"
+  else
+    printf '%ss' "$total"
+  fi
+}
+
+setup_progress_bar() {
+  # $1 = porcentaje, $2 = etiqueta, $3 = nota opcional
+  [ "$SETUP_LIVE" -eq 1 ] || return 0
+  width=28
+  filled=$((width * $1 / 100))
+  bar=""
+  i=0
+  while [ "$i" -lt "$width" ]; do
+    if [ "$i" -lt "$filled" ]; then bar="${bar}#"; else bar="${bar}-"; fi
+    i=$((i + 1))
+  done
+  note=""
+  [ -n "${3:-}" ] && note=" - $3"
+  printf '\r  [%s] %3s%%  %s/%s %s  (%s)%s' "$bar" "$1" "$SETUP_STEP" "$SETUP_TOTAL" "$2" "$(setup_elapsed)" "$note"
+}
+
+setup_phase_detail() {
+  # $1 = nota; sin porcentaje: solo dice que sigue trabajando.
+  [ "$SETUP_LIVE" -eq 1 ] || return 0
+  setup_progress_bar "$SETUP_COMPLETED_WEIGHT" "$SETUP_PROGRESS_LABEL" "$1"
+}
+
+setup_finish_progress() {
+  [ "$SETUP_LIVE" -eq 1 ] && printf '\n'
+  return 0
+}
+
 setup_step() {
   SETUP_STEP=$((SETUP_STEP + 1))
   case "$SETUP_STEP" in
@@ -428,9 +488,20 @@ setup_step() {
     6) bar="######." ;;
     *) bar="#######" ;;
   esac
+  # Peso acumulado de las fases ya terminadas.
+  index=1
+  total=0
+  for weight in $SETUP_STEP_WEIGHTS; do
+    if [ "$index" -lt "$SETUP_STEP" ]; then total=$((total + weight)); fi
+    index=$((index + 1))
+  done
+  SETUP_COMPLETED_WEIGHT=$total
+  SETUP_PROGRESS_LABEL="$1"
   printf '\n[%s] %s/%s %s\n' "$bar" "$SETUP_STEP" "$SETUP_TOTAL" "$1"
+  setup_progress_bar "$total" "$1"
 }
 
+setup_banner
 setup_step "Inspecting platform and service manager"
 
 port_listening() {
@@ -1850,6 +1921,7 @@ while [ "$dashboard_elapsed" -lt 1800 ]; do
     break
   fi
   dashboard_last_size="$dashboard_size"
+  setup_phase_detail "Building the Dashboard (first start compiles the web UI; log still growing)"
   if [ $((dashboard_elapsed % 60)) -eq 0 ]; then
     echo "Dashboard still starting (${dashboard_elapsed}s): its log keeps growing; waiting up to 1800s"
   fi
@@ -2083,6 +2155,7 @@ echo "Link: $LINK"
 echo ""
 echo "All three services passed their scoped local and phone-address checks."
 echo "Setup summary:"
+setup_finish_progress
 echo "  Hermes Agent: ready"
 echo "  Gateway: valid token accepted, missing/invalid tokens rejected, reachable"
 echo "  Dashboard: public health and protected-route enforcement checked"
