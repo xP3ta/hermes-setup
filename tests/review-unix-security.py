@@ -9,7 +9,9 @@ service manager. HTTP tests use disposable loopback fixtures only.
 from __future__ import annotations
 
 import pathlib
+import platform
 import re
+import shutil
 import contextlib
 import http.server
 import json
@@ -694,6 +696,16 @@ class SetupLockTests(unittest.TestCase):
             self.assertFalse(selected.exists())
 
 
+# La gestion de unidades systemd es Linux-only: en macOS el equivalente es
+# launchd y lo cubre tests/macos-launchd_test.py. Estos casos se saltan (no se
+# dan por buenos) fuera de Linux o cuando systemd-analyze no esta disponible.
+SYSTEMD_AVAILABLE = platform.system() == "Linux" and shutil.which("systemd-analyze") is not None
+
+
+@unittest.skipUnless(
+    SYSTEMD_AVAILABLE,
+    "systemd is Linux-only; launchd is covered by tests/macos-launchd_test.py",
+)
 class SystemdOwnershipTests(unittest.TestCase):
     def test_effective_exec_and_dropins_must_belong_to_selected_home(self) -> None:
         source = SETUP.read_text(encoding="utf-8")
