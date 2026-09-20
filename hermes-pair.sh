@@ -28,7 +28,7 @@ if [ -z "$KEY" ]; then
   echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh"
   exit 1
 fi
-if [ ! -f "$PAIR_ENV" ] || [ ! -f "$PROBE" ]; then
+if [ ! -f "$PAIR_ENV" ]; then
   echo "This installation predates verified pairing. Run setup once to repair and validate it:"
   echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh"
   exit 1
@@ -44,11 +44,9 @@ if [ "$(read_setting PAIRING_SCHEMA)" != "1" ]; then
   echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh"
   exit 1
 fi
-if [ "$(read_setting PROBE_SECURITY_SCHEMA)" != "2" ]; then
-  echo "This pairing record predates redirect-safe negative auth checks."
-  echo "Pairing made no changes. Run setup explicitly if you want to upgrade it:"
-  echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh"
-  exit 1
+USE_EPHEMERAL_PROBE=""
+if [ "$(read_setting PROBE_SECURITY_SCHEMA)" != "2" ] || [ ! -f "$PROBE" ]; then
+  USE_EPHEMERAL_PROBE=1
 fi
 
 HOST="${HERMES_PAIR_HOST:-$(read_setting PAIR_HOST)}"
@@ -101,6 +99,202 @@ VP="$(read_setting PYTHON_BIN)"
 if [ -z "$VP" ] || [ ! -x "$VP" ]; then
   echo "Hermes Python is missing — run setup to repair the installation."
   exit 1
+fi
+
+if [ -n "$USE_EPHEMERAL_PROBE" ]; then
+  umask 077
+  PROBE="$(mktemp "${TMPDIR:-/tmp}/hermes-console-pair-probe.XXXXXX")"
+  cleanup_probe() { rm -f -- "$PROBE"; }
+  trap cleanup_probe EXIT HUP INT TERM
+  cat > "$PROBE" <<'PY_PROBE'
+#!/usr/bin/env python3
+import ipaddress
+import json
+import secrets
+import socket
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+kind, base, token = sys.argv[1:4]
+expected = sys.argv[4] if len(sys.argv) > 4 else ""
+phone_facing = len(sys.argv) > 5 and sys.argv[5] == "phone"
+base = base.rstrip("/")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, url):
+        return None
+
+
+opener = urllib.request.build_opener(NoRedirect)
+
+
+def private_address(value):
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return False
+    if ip.version == 6:
+        return ip in ipaddress.ip_network("fc00::/7")
+    return any(
+        ip in network
+        for network in (
+            ipaddress.ip_network("10.0.0.0/8"),
+            ipaddress.ip_network("172.16.0.0/12"),
+            ipaddress.ip_network("192.168.0.0/16"),
+            ipaddress.ip_network("100.64.0.0/10"),
+        )
+    )
+
+
+def assert_phone_url():
+    try:
+        parsed = urllib.parse.urlsplit(base)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        raise RuntimeError("invalid phone-facing service URL") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("invalid phone-facing service URL")
+    host = parsed.hostname.lower()
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if host == "localhost" or (literal and literal.is_loopback):
+        raise RuntimeError("loopback is not reachable from the phone")
+    if parsed.scheme == "https":
+        return
+    private_name = host.endswith((".local", ".ts.net")) or "." not in host
+    if literal is not None:
+        addresses = [literal]
+    else:
+        try:
+            addresses = {
+                ipaddress.ip_address(item[4][0])
+                for item in socket.getaddrinfo(
+                    host,
+                    port,
+                    type=socket.SOCK_STREAM,
+                )
+            }
+        except OSError:
+            addresses = set()
+    if addresses and all(private_address(str(address)) for address in addresses):
+        return
+    if not addresses and private_name:
+        return
+    raise RuntimeError("public HTTP is blocked; use LAN/Tailscale or HTTPS")
+
+
+def request_json(path, authorization=None):
+    headers = {"Accept": "application/json"}
+    if authorization is not None:
+        headers["Authorization"] = authorization
+    request = urllib.request.Request(base + path, headers=headers)
+    try:
+        with opener.open(request, timeout=6) as response:
+            status = response.status
+            raw = response.read(1024 * 1024)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        raw = exc.read(1024 * 1024)
+    except Exception as exc:
+        raise RuntimeError(
+            f"{path} is unreachable ({type(exc).__name__})"
+        ) from None
+    return status, raw
+
+
+def fetch(path, auth=False):
+    authorization = "Bearer " + token if auth else None
+    status, raw = request_json(path, authorization)
+    if status != 200:
+        raise RuntimeError(f"{path} returned HTTP {status}")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise RuntimeError(f"{path} did not return JSON") from None
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{path} returned the wrong JSON shape")
+    return value
+
+
+def assert_auth_required(path):
+    invalid = "Bearer invalid-" + secrets.token_urlsafe(32)
+    for label, authorization in (("missing", None), ("invalid", invalid)):
+        status, _ = request_json(path, authorization)
+        if status not in {401, 403}:
+            raise RuntimeError(
+                f"{path} did not reject {label} authentication (HTTP {status})"
+            )
+
+
+try:
+    if phone_facing:
+        assert_phone_url()
+    if kind == "gateway":
+        health = fetch("/health")
+        if health.get("status") != "ok" or health.get("platform") != "hermes-agent":
+            raise RuntimeError("/health is not Hermes Gateway")
+        sessions = fetch("/api/sessions", auth=True)
+        if sessions.get("object") != "list" or not isinstance(
+            sessions.get("data"), list
+        ):
+            raise RuntimeError(
+                "/api/sessions is not the authenticated Hermes API"
+            )
+        assert_auth_required("/api/sessions")
+    elif kind == "bridge":
+        health = fetch("/bridge/health")
+        if health.get("status") != "ok" or not isinstance(
+            health.get("version"), str
+        ):
+            raise RuntimeError("/bridge/health is not Hermes Mobile Bridge")
+        if expected and health.get("version") != expected:
+            raise RuntimeError(
+                f"Bridge version is {health.get('version')}, expected {expected}"
+            )
+        caps = fetch("/bridge/capabilities", auth=True)
+        operations = caps.get("operations")
+        scopes = caps.get("scopes")
+        if (
+            caps.get("object") != "hermes.bridge.capabilities"
+            or not isinstance(operations, dict)
+            or operations.get("self_update") is not True
+            or not isinstance(scopes, list)
+            or "read" not in scopes
+            or "config" not in scopes
+        ):
+            raise RuntimeError(
+                "Bridge auth/config/self-update capability check failed"
+            )
+        assert_auth_required("/bridge/capabilities")
+    elif kind == "dashboard":
+        status = fetch("/api/status")
+        if not isinstance(status.get("version"), str) or not isinstance(
+            status.get("gateway_running"), bool
+        ):
+            raise RuntimeError("/api/status is not Hermes Dashboard")
+        if status.get("gateway_running") is not True:
+            raise RuntimeError("Dashboard reports that Hermes Gateway is stopped")
+    else:
+        raise RuntimeError("unknown service kind")
+except RuntimeError as exc:
+    print(f"{kind}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY_PROBE
+  chmod 700 "$PROBE"
 fi
 
 verify() {

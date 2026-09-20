@@ -483,6 +483,23 @@ class DeliverySyntaxTests(unittest.TestCase):
             with self.subTest(block=index):
                 compile(block, f"<embedded-{index}>", "exec")
 
+    def test_pairing_ephemeral_probe_matches_the_installer_probe(self) -> None:
+        setup = SETUP.read_text(encoding="utf-8")
+        pair = PAIR.read_text(encoding="utf-8")
+        setup_probe = re.search(
+            r'^cat > "\$PROBE" <<\'PY\'\n(.*?)\nPY\nchmod 700 "\$PROBE"$',
+            setup,
+            re.MULTILINE | re.DOTALL,
+        )
+        pair_probe = re.search(
+            r'^  cat > "\$PROBE" <<\'PY_PROBE\'\n(.*?)\nPY_PROBE$',
+            pair,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(setup_probe)
+        self.assertIsNotNone(pair_probe)
+        self.assertEqual(pair_probe.group(1), setup_probe.group(1))
+
     def test_exact_file_and_stdin_bytes_parse_in_sh_dash_and_bash(self) -> None:
         payload = SETUP.read_bytes()
         for shell in ("sh", "dash", "bash"):
@@ -534,7 +551,7 @@ class DeliverySyntaxTests(unittest.TestCase):
                 input="",
                 capture_output=True,
                 timeout=5,
-                env={**os.environ, "HOME": str(home)},
+                env={**os.environ, "HOME": str(home), "HERMES_HOME": str(hermes)},
             )
             after = sorted(
                 (path.relative_to(home), path.read_bytes() if path.is_file() else None)
@@ -543,6 +560,76 @@ class DeliverySyntaxTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertEqual(after, before)
             self.assertNotIn("SYNTHETIC-NOT-A-SECRET", completed.stdout + completed.stderr)
+
+    def test_pairing_legacy_record_uses_current_ephemeral_probe_without_mutating_home(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hermes-pair-legacy-") as raw:
+            temp = pathlib.Path(raw)
+            temp_dir = temp / "tmp"
+            temp_dir.mkdir()
+            home = temp / "home"
+            hermes = home / ".hermes"
+            services = hermes / "console-services"
+            services.mkdir(parents=True)
+            (hermes / ".env").write_text(
+                "API_SERVER_KEY=SYNTHETIC-NOT-A-SECRET\n", encoding="utf-8"
+            )
+            legacy_probe = services / "hermes-service-probe.py"
+            legacy_probe.write_text("legacy verifier must not execute\n", encoding="utf-8")
+            probe_log = temp / "probe.log"
+            fake_python = temp / "python3"
+            fake_python.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = "-" ]; then cat >/dev/null; '
+                'printf "%s\\n" "hermes://pair?host=192.168.10.40&port=8642&token=REDACTED"; exit 0; fi\n'
+                'if [ "$1" = "-c" ]; then exit 1; fi\n'
+                f'[ "$1" != "{legacy_probe}" ] || exit 71\n'
+                f'printf "%s\\n" "$2" >> "{probe_log}"\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o700)
+            (services / "pairing.env").write_text(
+                "PAIRING_SCHEMA=1\n"
+                "PAIR_HOST=192.168.10.40\n"
+                "PAIR_SCHEME=http\n"
+                "PAIR_PORT=8642\n"
+                "GATEWAY_BASE=http://192.168.10.40:8642\n"
+                "DASHBOARD_BASE=http://192.168.10.40:9119\n"
+                "BRIDGE_BASE=http://192.168.10.40:9131\n"
+                "NETWORK_KIND=lan\n"
+                f"PYTHON_BIN={fake_python}\n",
+                encoding="utf-8",
+            )
+            before = sorted(
+                (path.relative_to(home), path.read_bytes() if path.is_file() else None)
+                for path in home.rglob("*")
+            )
+            completed = subprocess.run(
+                ["sh", str(PAIR)],
+                text=True,
+                input="",
+                capture_output=True,
+                timeout=5,
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "HERMES_HOME": str(hermes),
+                    "TMPDIR": str(temp_dir),
+                },
+            )
+            after = sorted(
+                (path.relative_to(home), path.read_bytes() if path.is_file() else None)
+                for path in home.rglob("*")
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertEqual(after, before)
+            self.assertEqual(probe_log.read_text(encoding="utf-8").splitlines(), [
+                "gateway", "bridge", "dashboard"
+            ])
+            self.assertNotIn("predates redirect-safe", completed.stdout + completed.stderr)
+            self.assertIn("Link: hermes://pair?", completed.stdout)
+            self.assertNotIn("SYNTHETIC-NOT-A-SECRET", completed.stdout + completed.stderr)
+            self.assertEqual(list(temp_dir.glob("hermes-console-pair-probe.*")), [])
 
     def test_portable_helper_never_uses_command_substring_kills(self) -> None:
         setup = SETUP.read_text(encoding="utf-8")
