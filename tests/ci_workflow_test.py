@@ -28,12 +28,17 @@ def main() -> None:
         "tests/review-unix-security.py",
         "tests/no-bridge_test.py",
         "tests/no-bridge-install_test.py",
+        "tests/new-hermes-layout_test.py",
         "tests/legacy-bridge-release_test.py",
         "tests/legacy-bridge-security_test.py",
         "tests/legacy-bridge-coexistence_test.py",
         "tests/bootstrap-unix_test.sh",
         "tests/powershell_test.ps1",
         "powershell",
+        "schedule:",
+        "workflow_dispatch:",
+        "tests/linux-real-install_test.sh",
+        "tests/macos-install_test.sh",
         "pwsh",
     )
     for fragment in required:
