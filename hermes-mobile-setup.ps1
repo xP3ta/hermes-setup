@@ -2424,7 +2424,8 @@ function Test-HermesLauncher([string]$Executable, [int]$TimeoutSeconds = 15, [in
     # on the next try. A launcher that does not exist is not asked again.
     if (-not $Executable -or -not (Test-Path -LiteralPath $Executable)) { return $false }
     $pause = 2
-    if ($null -ne $script:HermesProbePauseSeconds) { $pause = [int]$script:HermesProbePauseSeconds }
+    $override = Get-Variable -Name HermesProbePauseSeconds -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $override) { $pause = [int]$override }
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         if (Test-HermesLauncherOnce $Executable $TimeoutSeconds) { return $true }
         if ($attempt -lt $Attempts -and $pause -gt 0) { Start-Sleep -Seconds ($pause * $attempt) }
@@ -3005,6 +3006,9 @@ function Restore-DashboardAccess([string]$Python) {
 
 function Test-DashboardSignIn([string]$BaseUrl, [string]$LoginPath) {
     # True only when the Dashboard accepts the sign-in on record, by signing in.
+    # A refusal (an HTTP answer) is a verdict; a connection that timed out or
+    # was refused is not: a Dashboard that has only just finished starting is
+    # asked again a few times before the sign-in is called wrong.
     try {
         $login = Get-Content -LiteralPath $LoginPath -Raw | ConvertFrom-Json
         if (-not $login.username -or -not $login.password) { return $false }
@@ -3013,12 +3017,24 @@ function Test-DashboardSignIn([string]$BaseUrl, [string]$LoginPath) {
             username = [string]$login.username
             password = [string]$login.password
         } | ConvertTo-Json -Compress
-        [void](Invoke-HermesJsonRequest -Method Post `
-            -Url ($BaseUrl.TrimEnd('/') + "/auth/password-login") -Body $body -TimeoutSeconds 6)
-        return $true
     } catch {
         return $false
     }
+    $pause = 1
+    $override = Get-Variable -Name DashboardRetryPauseSeconds -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $override) { $pause = [int]$override }
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        try {
+            [void](Invoke-HermesJsonRequest -Method Post `
+                -Url ($BaseUrl.TrimEnd('/') + "/auth/password-login") -Body $body -TimeoutSeconds 15)
+            return $true
+        } catch {
+            $transient = ($_.Exception -is [Net.WebException]) -and -not $_.Exception.Response
+            if (-not $transient -or $attempt -eq 4) { return $false }
+            if ($pause -gt 0) { Start-Sleep -Seconds ($pause * $attempt) }
+        }
+    }
+    return $false
 }
 
 # LEGACY: cleanup of the Mobile Bridge that setups before Console 1.2.15 installed

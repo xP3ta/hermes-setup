@@ -46,7 +46,7 @@ _spec.loader.exec_module(units)
 
 FAKE_HERMES = r'''#!__PYTHON__
 """Stand-in for Hermes Agent: --version, gateway, dashboard."""
-import hashlib, hmac, http.server, json, os, pathlib, sys
+import hashlib, hmac, http.server, json, os, pathlib, socket, sys, time
 
 from hermes_cli.config import load_config
 from plugins.dashboard_auth.basic import hash_password
@@ -106,6 +106,11 @@ def gateway():
 
 
 def dashboard(host, port):
+    # A Dashboard that is slow to come up (STANDIN_DASHBOARD_DELAY seconds
+    # before it listens) or that drops its first STANDIN_DASHBOARD_DROPS
+    # connections to a protected route, as a busy machine's does.
+    time.sleep(float(os.environ.get("STANDIN_DASHBOARD_DELAY", "0")))
+    drops = [int(os.environ.get("STANDIN_DASHBOARD_DROPS", "0"))]
     env = env_file()
     basic = (load_config().get("dashboard") or {}).get("basic_auth") or {}
     username = env.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME") or basic.get("username") or ""
@@ -144,6 +149,10 @@ def dashboard(host, port):
                 return 200, {"Set-Cookie": cookie}, {"ok": True}
             return 401, {}, {"error": "invalid_credentials"}
         if request.path == "/api/model/options":
+            if drops[0] > 0:
+                drops[0] -= 1
+                request.connection.shutdown(socket.SHUT_RDWR)
+                return 200, {}, {}
             if request.headers.get("Cookie") == "hermes_session_at=" + session:
                 return 200, {}, {"providers": []}
             return 401, {}, {"error": "unauthorized"}
