@@ -347,6 +347,8 @@ function Test-PairNoRepair {
 
 function Test-Health {
     Import-ProductFunction $setup "Test-HermesLauncher"
+    Import-ProductFunction $setup "Test-HermesLauncherOnce"
+    $script:HermesProbePauseSeconds = 0
     $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-health-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $temp | Out-Null
     $healthyPath = Join-Path $temp "healthy-hermes.exe"
@@ -367,7 +369,21 @@ function Test-Health {
     }
     Assert-True (Test-HermesLauncher $healthyPath 2) "health requires a successful contained launcher invocation"
     Assert-True (-not (Test-HermesLauncher $brokenPath 2)) "a broken launcher is never healthy"
-    Assert-True ($script:ProbeCalls -eq 2) "health verdict comes from the launcher invocation contract"
+    # A healthy launcher costs one call; a broken one is asked three times
+    # before it is called broken (1 + 3).
+    Assert-True ($script:ProbeCalls -eq 4) "health verdict comes from the launcher invocation contract, after three tries"
+
+    # One transient failure is not a verdict.
+    $script:ProbeCalls = 0
+    $global:FlakyFixturePath = $healthyPath
+    function global:Invoke-ContainedProcess {
+        param($File, $Arguments, $TimeoutSeconds, $TerminationTimeoutSeconds, $StdoutPath, $StderrPath, $StandardInput)
+        $script:ProbeCalls++
+        if ($script:ProbeCalls -lt 2) { return [PSCustomObject]@{ ExitCode = 1; TimedOut = $false } }
+        return [PSCustomObject]@{ ExitCode = 0; TimedOut = $false }
+    }
+    Assert-True (Test-HermesLauncher $healthyPath 2) "one failed answer does not make a healthy launcher broken"
+    Assert-True ($script:ProbeCalls -eq 2) "the second try is the one that answered"
 
     foreach ($name in @(
         "Get-FreshHermesInstallArtifacts", "Remove-FreshHermesInstallArtifacts", "Install-HermesIfNeeded"
