@@ -279,7 +279,6 @@ journalctl --user -u hermes-gateway.service
 | `hermes-pair.ps1` | Native Windows pairing QR/link |
 | `hermes_bridge.py` | The retired Mobile Bridge, kept for apps older than 1.2.15 that still update theirs; setup does not install it |
 | `bridge-release.json` | Machine-readable Bridge version, compatible app build, SHA-256 and byte size |
-| `sync-from-app.sh` | Maintainer-only helper from when the app repository was the source of these files |
 
 ## Maintenance
 
@@ -288,10 +287,6 @@ This repository is the source of truth for the four setup scripts
 `hermes-pair.ps1`). The app only shows the commands above; it no longer ships
 its own copies.
 
-`sync-from-app.sh` dates from when the app repository held these files and the
-bridge. From app 1.2.15 on there is nothing left there to copy from; it is kept
-for the history of the bridge release it last produced.
-
 Tests, all against disposable homes (nothing touches a real `~/.hermes`):
 
 ```sh
@@ -299,24 +294,3 @@ python3 tests/review-unix-security.py     # contract suite
 python3 tests/no-bridge_test.py           # sign-in decision, code, --retire-bridge
 python3 tests/no-bridge-install_test.py   # a whole setup against a stand-in Hermes
 ```
-
-Preview a synchronization without modifying the working tree or Git index:
-
-```sh
-./sync-from-app.sh --dry-run
-```
-
-Running `./sync-from-app.sh` without options copies only the five canonical
-sources, regenerates `bridge-release.json`, stages only those release files and
-creates a local commit. It never pushes implicitly. Publishing requires the
-explicit form:
-
-```sh
-./sync-from-app.sh --publish
-```
-
-The generated manifest has schema `1` and records `version`, `min_app_build`,
-`sha256` and `size` for the exact bytes of `hermes_bridge.py` served by this
-repository. `min_app_build` defaults to the app build in `pubspec.yaml` and can
-be deliberately lowered for a backwards-compatible Bridge with
-`BRIDGE_MIN_APP_BUILD=<build>`.

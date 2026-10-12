@@ -25,7 +25,7 @@ jobs:
           for script in hermes-mobile-setup.sh hermes-pair.sh; do
             sh -n "$script"
           done
-          for script in sync-from-app.sh tests/sync-from-app_test.sh tests/bootstrap-unix_test.sh; do
+          for script in tests/bootstrap-unix_test.sh; do
             bash -n "$script"
           done
 
@@ -33,13 +33,13 @@ jobs:
         shell: bash
         run: |
           # These exclusions cover pre-existing parser false positives/intentional
-          # portability idioms in app-synchronized runtime artifacts.
+          # portability idioms in the runtime scripts.
           shellcheck --severity=warning \
             --exclude=SC1007,SC1087,SC2015,SC2221,SC2222 \
-            hermes-mobile-setup.sh hermes-pair.sh sync-from-app.sh
+            hermes-mobile-setup.sh hermes-pair.sh
           # The POSIX harness sources functions generated at runtime.
           shellcheck --severity=warning --exclude=SC1007,SC2034 \
-            tests/sync-from-app_test.sh tests/bootstrap-unix_test.sh
+            tests/bootstrap-unix_test.sh
 
       - name: Verify CI contract and Bridge release
         shell: bash
@@ -48,7 +48,6 @@ jobs:
           python3 tests/ci-parse-closure_test.py
           python3 tests/bootstrap-isolation_test.py
           python3 tests/checkout-integrity_test.py
-          python3 tests/sync-work-preservation_test.py
           python3 tests/bridge-release_test.py
 
       # Product-level contract suites: systemd/launchd unit safety, lock and
@@ -77,7 +76,6 @@ jobs:
       - name: Run Unix tests
         shell: bash
         run: |
-          bash tests/sync-from-app_test.sh
           bash tests/bootstrap-unix_test.sh
 
   macos:

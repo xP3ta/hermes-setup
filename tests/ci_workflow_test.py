@@ -28,7 +28,6 @@ def main() -> None:
         "tests/review-unix-security.py",
         "tests/no-bridge_test.py",
         "tests/no-bridge-install_test.py",
-        "tests/sync-from-app_test.sh",
         "tests/bridge-release_test.py",
         "tests/bootstrap-unix_test.sh",
         "tests/powershell_test.ps1",
