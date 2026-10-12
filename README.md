@@ -16,7 +16,13 @@ Windows and WSL2 (run this in **Windows PowerShell 5.1+**, outside WSL):
 irm https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-mobile-setup.ps1 | iex
 ```
 
-That's it. When it finishes, it shows a code — scan it with the app (or copy the `hermes://pair?...` link) and you're connected: the code carries the address of this computer, its key and the Dashboard sign-in, so the app needs nothing typed by hand.
+Everything happens in the window you pasted the line into: no other window
+opens, and the services it starts keep running in the background with no
+window of their own. On Windows, paste it into a PowerShell opened **as
+administrator** (it adds one firewall rule for your private network and never
+asks for elevation by itself).
+
+When it finishes, it shows a code — scan it with the app (or copy the `hermes://pair?...` link) and you're connected: the code carries the address of this computer, its key and the Dashboard sign-in, so the app needs nothing typed by hand.
 
 It sets up the two services of Hermes itself that the app talks to, the **Gateway** and the **Dashboard**. It installs no companion service: the Mobile Bridge of earlier versions is gone ([removing an old one](#removing-the-old-mobile-bridge)).
 
@@ -146,19 +152,25 @@ you still choose the AI provider/model from Hermes Console's Dashboard.
 
 ## Platforms covered by native evidence
 
-| Platform | How it is validated |
-|---|---|
-| Windows 10/11 | Native VM: full install, rerun, rollback, ports, uninstall, and the reviewer suite (275 checks, zero skips) under Windows PowerShell 5.1 and PowerShell 7 |
-| Windows Server 2022 | CI runner: the same reviewer suite |
-| Debian 13 (systemd 257) | Native host: full install, idempotent rerun, authenticated probes, contract suite |
-| macOS (Apple Silicon) | CI runner: POSIX syntax under BSD `/bin/sh`, the contract suite, a real `launchctl` lifecycle test driven by the installer's own functions, and a full isolated install with authenticated probes |
-| macOS (Intel), Linux ARM64, Windows ARM64 | **Not validated natively.** Supported by code and unit tests only; treat them as unproven until they run the same gates |
+What ran for **this version** (setup without the Mobile Bridge), and what did not:
 
-The macOS row exists because "it works on Linux" is not evidence for macOS: it
-uses launchd instead of systemd, a BSD userland, and neither `systemd-analyze`
-nor `ufw`. That gap hid two real defects (a here-document that made the script
-unparseable under bash 3.2, and a Dashboard runner without the managed node on
-its PATH) until the macOS job was added.
+| Platform | How it was validated |
+|---|---|
+| Windows 11 x64 (25H2, build 26200, Spanish locale) | Native VM, 2026-10-12, with a real Hermes Agent 0.21.1, in an elevated Windows PowerShell 5.1 window on the desktop (one real run under PowerShell 7.4 too). Fresh setup twice, one of them into a home whose path has spaces and in an 80-column window; re-run (same sign-in reused); `hermes-pair.ps1` (nothing on disk changed); `-NewAccess` (old sign-in and old session refused, new one accepted); a password with Spanish characters written in `.env`; `-Uninstall` with and without `-Purge`; and the upgrade from the published bridge-era installer, both ways round (setup over a live bridge, then `-RetireBridge`; `-RetireBridge` first, then setup), with `-RetireBridge` run twice and refused for a bridge that belongs to another Windows user. Each code was read with the app's own parser and used from another machine on the LAN. The reviewer suite (383 checks, zero skips) passed under Windows PowerShell 5.1 and under PowerShell 7.4. |
+| Windows 10, Windows Server 2022, Windows ARM64 | **Not run for this version.** Server 2022 is what the CI runner uses; this branch has not been through CI yet. |
+| Linux x64 (Debian 13) | Contract suites, plus a whole setup driven by the shipped scripts against a stand-in Hermes in a disposable home (fresh, re-run, show again, retire, password changed elsewhere, new sign-in, `.env`-pinned, failed setup rolled back). **A real Hermes install on Linux was not repeated for this version.** |
+| macOS | **Not run for this version.** The CI job (BSD `/bin/sh`, real `launchctl`, a full isolated install) was updated for it and has not run yet. |
+| Linux ARM64, macOS Intel | Not validated natively. |
+
+What a person sees on Windows was checked from inside the desktop session:
+every visible top-level window was logged during each run. Through fresh
+setup, re-run, new sign-in, retiring the bridge, and starting the two services
+the way the sign-in trigger does, the only window was the user's own
+PowerShell. Gateway and Dashboard run from two per-user Scheduled Tasks that
+start at sign-in through a hidden `wscript.exe` runner. Not observed: a real
+sign-out or restart (the logon trigger was exercised by starting its tasks),
+and a setup that fails half-way on real Windows (the rollback is covered by
+the suite only).
 
 ## Security notes
 
