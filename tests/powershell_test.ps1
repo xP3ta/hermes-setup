@@ -56,6 +56,7 @@ function Invoke-SafeBootstrapSmoke([ValidateSet("file", "memory")][string]$Mode)
         'supports Windows 10, Windows 11 and Windows Server|' +
         'could not verify the Windows version|' +
         'does not belong to the selected Hermes home|' +
+        'is not owned by the current Hermes identity|' +
         'owned by another identity'
     $observed = $null
     try {
