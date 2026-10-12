@@ -164,6 +164,7 @@ cleanup_setup() {
   if command -v cleanup_downloads >/dev/null 2>&1; then
     cleanup_downloads
   fi
+  if [ -n "${HP_DIR:-}" ]; then rm -rf -- "$HP_DIR"; fi
   release_setup_lock
 }
 trap cleanup_setup EXIT
@@ -767,6 +768,15 @@ service_failure() {
   else
     echo "Nothing is listening on TCP $port."
   fi
+  if [ "$SERVICE_MANAGER" = "launchd" ]; then
+    launchd_report "dev.xpetalab.hermes-console.$log_name"
+  fi
+  if [ -s "$LOGS/$log_name.log" ]; then
+    echo "Last lines of $LOGS/$log_name.log:"
+    tail -n 15 "$LOGS/$log_name.log" || true
+  else
+    echo "$LOGS/$log_name.log is empty: the service never wrote a line."
+  fi
   echo "Inspect $LOGS/$log_name.log or the platform service logs, then retry."
   exit 1
 }
@@ -802,7 +812,20 @@ setup_step "Checking Hermes"
 # Hermes Agent. A launcher only counts when it responds; stale shims from a
 # half-finished uninstall must not produce crash-looping services.
 AGENT_DIR="$HH/hermes-agent"
-HB="$AGENT_DIR/venv/bin/hermes"
+# Where Hermes keeps its command depends on the version that installed it:
+# current installs publish <install dir>/.hermes/bin/hermes (a launcher that
+# runs the interpreter of Hermes' own package manager), older ones keep
+# <install dir>/venv/bin/hermes. The first candidate that answers wins.
+find_hermes_launcher() {
+  for candidate in "$AGENT_DIR/.hermes/bin/hermes" "$AGENT_DIR/venv/bin/hermes" "$HH/bin/hermes"; do
+    if [ -x "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+HB="$(find_hermes_launcher || true)"
 cleanup_fresh_agent_attempt() {
   if [ "$HH_CREATED_BY_SETUP" -eq 1 ]; then
     rm -rf -- "$HH"
@@ -814,7 +837,7 @@ cleanup_fresh_agent_attempt() {
   [ "$SERVICES_CREATED_BY_SETUP" -ne 1 ] || rmdir "$SERVICES" 2>/dev/null || true
   rmdir "$HH/bin" 2>/dev/null || true
 }
-if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
+if [ -z "$HB" ]; then
   if [ -e "$AGENT_DIR" ] || [ -L "$AGENT_DIR" ] || \
      [ -e "$HH/node" ] || [ -L "$HH/node" ] || \
      [ -e "$HH/bin/hermes" ] || [ -L "$HH/bin/hermes" ] || \
@@ -832,32 +855,85 @@ if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
     echo "ERROR: Hermes Agent installation failed; fresh attempt artifacts were removed." >&2
     exit 1
   fi
-  HB="$AGENT_DIR/venv/bin/hermes"
-  if [ ! -x "$HB" ] || ! "$HB" --version >/dev/null 2>&1; then
+  HB="$(find_hermes_launcher || true)"
+  if [ -z "$HB" ]; then
+    # Say what was found before the attempt is removed: this is the only trace.
+    echo "No Hermes launcher answered '--version'. Found in $AGENT_DIR:" >&2
+    ls -A "$AGENT_DIR" 2>&1 | head -12 >&2 || true
+    ls -A "$AGENT_DIR/.hermes/bin" "$AGENT_DIR/venv/bin" "$HH/bin" 2>&1 | head -16 >&2 || true
     cleanup_fresh_agent_attempt
     echo "ERROR: Hermes Agent did not pass its health check; fresh attempt artifacts were removed." >&2
     exit 1
   fi
 fi
 
-# Python that owns the Hermes environment (its configuration API included).
+# Two interpreters, because Hermes no longer guarantees one that does both.
+# VP does setup's own plain work (links, units, probes) and is recorded for
+# later runs. HP can import Hermes and its configuration API: with an older
+# install that is the same venv interpreter; with a current one it is a
+# wrapper around the command Hermes itself publishes for launching code.
 VP="$HH/hermes-agent/venv/bin/python3"
 [ -x "$VP" ] || VP="$HH/hermes-agent/venv/bin/python"
+STORE_PY=""
 if [ ! -x "$VP" ]; then
-  HB_REAL="$HB"
-  if command -v realpath >/dev/null 2>&1; then
-    HB_REAL="$(realpath "$HB" 2>/dev/null || printf '%s' "$HB")"
-  fi
-  if ! HB_DIR="$(CDPATH='' cd -- "$(dirname -- "$HB_REAL")" 2>/dev/null && pwd -P)"; then
-    HB_DIR="$(dirname -- "$HB_REAL")"
-  fi
-  VP="$HB_DIR/python3"
-  [ -x "$VP" ] || VP="$HB_DIR/python"
+  # The interpreter Hermes' launcher runs, as it reports it.
+  STORE_PY="$("$HB" --print-runtime-command 2>/dev/null | sed -n 's/^\["\([^"]*\)".*/\1/p' | head -1)"
+  [ -x "$STORE_PY" ] || STORE_PY=""
+  VP="$STORE_PY"
 fi
-[ -x "$VP" ] || VP="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$VP" ] || [ ! -x "$VP" ]; then
+  VP="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+fi
 if [ -z "$VP" ] || [ ! -x "$VP" ]; then
   echo "ERROR: Hermes has no usable Python interpreter; repair the Hermes installation first."
   exit 1
+fi
+
+HP="$VP"
+HP_DIR=""
+if [ -n "$STORE_PY" ]; then
+  HP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-python.XXXXXX")" || {
+    echo "ERROR: cannot create a private folder for Hermes' interpreter."
+    exit 1
+  }
+  chmod 700 "$HP_DIR"
+  if "$STORE_PY" -I - "$HP_DIR/python" "$HB" <<'PY_HERMES_PYTHON'
+import json, shlex, subprocess, sys
+
+target, launcher = sys.argv[1:]
+reported = subprocess.run(
+    [launcher, "--print-runtime-command"], capture_output=True, text=True, timeout=120, check=True
+).stdout
+command = json.loads(reported)
+python, code = command[0], command[3]
+# Hermes' launch command ends by running a module; run the caller's code instead,
+# after the same preparation (isolated mode, install on the path, bootstrap).
+head = code[: code.rindex("runpy.run_module(")].rstrip().rstrip(";")
+driver = """
+_a = sys.argv[1:]
+if _a[:1] == ['-']:
+    _src = sys.stdin.read()
+    sys.argv = ['-'] + _a[1:]
+elif _a[:1] == ['-c']:
+    _src = _a[1]
+    sys.argv = ['-c'] + _a[2:]
+else:
+    _src = open(_a[0], encoding='utf-8').read()
+    sys.argv = _a
+exec(compile(_src, sys.argv[0], 'exec'), {'__name__': '__main__'})
+"""
+with open(target, "w", encoding="utf-8") as wrapper:
+    wrapper.write("#!/bin/sh\nexec %s -I -c %s \"$@\"\n" % (shlex.quote(python), shlex.quote(head + "\n" + driver)))
+PY_HERMES_PYTHON
+  then
+    chmod 700 "$HP_DIR/python"
+    HP="$HP_DIR/python"
+  else
+    rm -rf -- "$HP_DIR"
+    HP_DIR=""
+    echo "ERROR: Hermes did not describe how to run code with its libraries; repair the Hermes installation first."
+    exit 1
+  fi
 fi
 
 TRANSACTION_PENDING=0
@@ -1020,7 +1096,7 @@ rollback_private_firewall() {
 rollback_dashboard_access() {
   [ -n "$TRANSACTION_DIR" ] || return 0
   [ -f "$TRANSACTION_DIR/dashboard-access.previous.json" ] || return 0
-  HERMES_HOME="$HH" "$VP" - "$TRANSACTION_DIR/dashboard-access.previous.json" >/dev/null 2>&1 <<'PY_DASH_RESTORE'
+  HERMES_HOME="$HH" "$HP" - "$TRANSACTION_DIR/dashboard-access.previous.json" >/dev/null 2>&1 <<'PY_DASH_RESTORE'
 import json, pathlib, sys
 
 from hermes_cli.config import load_config, save_config
@@ -1769,7 +1845,7 @@ PY
 }
 
 stage_gateway_systemd_unit() {
-  if ! "$VP" - "$SYSTEMD_STAGE/hermes-gateway.service" <<'PY'
+  if ! "$HP" - "$SYSTEMD_STAGE/hermes-gateway.service" <<'PY'
 import pathlib, sys
 
 from hermes_cli.gateway import generate_systemd_unit
@@ -1883,9 +1959,38 @@ PY
   assert_loaded_launchd_job_owner "$label"
   launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
   mv "$plist_new" "$plist"
-  launchctl bootstrap "gui/$(id -u)" "$plist"
+  # bootout is asynchronous: a bootstrap straight after it can find the old job
+  # still going away. Every call is checked; the bootstrap gets a second try.
+  if ! launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
+    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+    sleep 2
+    if ! launchctl bootstrap "gui/$(id -u)" "$plist"; then
+      launchd_report "$label"
+      echo "ERROR: launchd would not load $label." >&2
+      return 1
+    fi
+  fi
   launchctl enable "gui/$(id -u)/$label" >/dev/null 2>&1 || true
-  [ "$start_now" != "yes" ] || launchctl kickstart -k "gui/$(id -u)/$label"
+  if [ "$start_now" = "yes" ]; then
+    # RunAtLoad already started it when the job was loaded. A kickstart with -k
+    # would kill that first start a moment after it began and restart it, which
+    # on a cold machine costs the first start's progress; without -k it starts
+    # the job only if it is not running.
+    if ! launchctl kickstart "gui/$(id -u)/$label" >/dev/null 2>&1 && \
+       ! launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      launchd_report "$label"
+      echo "ERROR: launchd loaded $label but could not start it." >&2
+      return 1
+    fi
+  fi
+}
+
+# launchd's own account of a job, for when a service did not come up.
+launchd_report() {
+  label="$1"
+  echo "launchd state of $label:" >&2
+  launchctl print "gui/$(id -u)/$label" 2>&1 | \
+    grep -E 'state =|last exit code|runs =|pid =|could not|Could not' | sed -n '1,8p' >&2 || true
 }
 
 assert_named_service_owner() {
@@ -1959,7 +2064,11 @@ case "$SERVICE_MANAGER" in
     ;;
 esac
 
-if ! wait_probe gateway "http://127.0.0.1:$GATEWAY_PORT" 40; then
+# The first start of a freshly built Hermes on a cold machine (bytecode
+# compiled, caches filled) can take minutes; a warm restart answers at once, so
+# the generous limit costs nothing when all is well.
+GATEWAY_START_WAIT="${HERMES_SETUP_START_WAIT:-240}"
+if ! wait_probe gateway "http://127.0.0.1:$GATEWAY_PORT" "$GATEWAY_START_WAIT"; then
   service_failure Gateway "$GATEWAY_PORT"
 fi
 echo "Gateway identity + valid-token + auth-rejection checks OK ($SERVICE_MANAGER)"
@@ -1979,7 +2088,7 @@ if ! stop_named_service dashboard >/dev/null 2>&1; then
 fi
 DASH_ACCESS_STATE="$TRANSACTION_DIR/dashboard-access.state"
 DASH_ACCESS_PREVIOUS="$TRANSACTION_DIR/dashboard-access.previous.json"
-if ! HERMES_HOME="$HH" "$VP" - "$ACTION" "$HH" "$DASH_LOGIN_FILE" "$DASH_ACCESS_STATE" "$DASH_ACCESS_PREVIOUS" <<'PY_DASH_ACCESS'
+if ! HERMES_HOME="$HH" "$HP" - "$ACTION" "$HH" "$DASH_LOGIN_FILE" "$DASH_ACCESS_STATE" "$DASH_ACCESS_PREVIOUS" <<'PY_DASH_ACCESS'
 import json, os, pathlib, secrets, sys
 
 action, home, login_path, state_path, previous_path = sys.argv[1:]

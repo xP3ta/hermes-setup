@@ -12,6 +12,7 @@ export HERMES_HOME="$WORK/home"
 mkdir -p "$HERMES_HOME"
 LOG="$WORK/install.log"
 FAILED=0
+LABELS="dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard"
 
 say() { printf '%s\n' "$1"; }
 check() {
@@ -67,9 +68,15 @@ else
 fi
 check "the installer exits 0 on native macOS" "$RC"
 
-LABELS="dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard"
 BRIDGE_LABEL="dev.xpetalab.hermes-console.bridge"
 UID_NUM="$(id -u)"
+# A setup that failed rolls its services back by design, so "loaded", the
+# pairing record and the retire-bridge checks only describe a finished install.
+# After a failed one they would report the rollback as if it were a second bug
+# and hide the real failure above, which already failed the run.
+if [ "$RC" -ne 0 ]; then
+  say "== instalacion fallida: se omiten las comprobaciones posteriores =="
+else
 for label in $LABELS; do
   if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
     check "launchd reports $label as loaded" 0
@@ -137,6 +144,7 @@ for label in $LABELS; do
     check "$label is still loaded after --retire-bridge" 1
   fi
 done
+fi
 
 say "== limpieza: descargando los jobs y quitando los plists =="
 for label in $LABELS; do
