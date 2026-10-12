@@ -1,6 +1,6 @@
 # Hermes Setup
 
-One-command installer that connects a self-hosted [Hermes Agent](https://hermes-agent.nousresearch.com) server to **Hermes Console** (the Android app).
+One-command installer that connects a self-hosted [Hermes Agent](https://hermes-agent.nousresearch.com) server to **Console** (the Android app). Needs Console 1.2.15 or newer on the phone. Help and guide: <https://hermes.xpetalab.dev>.
 
 ## Install
 
@@ -24,7 +24,7 @@ asks for elevation by itself).
 
 When it finishes, it shows a code — scan it with the app (or copy the `hermes://pair?...` link) and you're connected: the code carries the address of this computer, its key and the Dashboard sign-in, so the app needs nothing typed by hand.
 
-It sets up the two services of Hermes itself that the app talks to, the **Gateway** and the **Dashboard**. It installs no companion service: the Mobile Bridge of earlier versions is gone ([removing an old one](#removing-the-old-mobile-bridge)).
+It sets up the two services of Hermes itself that the app talks to, the **Gateway** and the **Dashboard**. It installs no companion service: the Mobile Bridge of earlier versions is gone ([installed before Console 1.2.15? see Legacy](#legacy-bridge-era-installs)).
 
 ### Check the environment first (recommended)
 
@@ -56,7 +56,7 @@ for help: it is the difference between guessing and fixing.
 clean slate, the installer can reverse itself. It stops and deletes only its own
 Scheduled Tasks, its own firewall rules and the pairing artifacts (`-Purge`
 additionally removes the Hermes home, and refuses to do so for a path that is
-not a Hermes Console home):
+not a Console home):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\hermes-setup.ps1" -Uninstall
@@ -148,7 +148,7 @@ safely be run again for a fresh install or a repair.
 A setup that fails puts back what it changed, the Dashboard sign-in included.
 
 For a brand-new Hermes install, the infrastructure is then ready for the app;
-you still choose the AI provider/model from Hermes Console's Dashboard.
+you still choose the AI provider/model from Console's Dashboard.
 
 ## Platforms covered by native evidence
 
@@ -156,7 +156,7 @@ What ran for **this version** (setup without the Mobile Bridge), and what did no
 
 | Platform | How it was validated |
 |---|---|
-| Windows 11 x64 (25H2, build 26200, Spanish locale) | Native VM, 2026-10-12, with a real Hermes Agent 0.21.1, in an elevated Windows PowerShell 5.1 window on the desktop (one real run under PowerShell 7.4 too). Fresh setup twice, one of them into a home whose path has spaces and in an 80-column window; re-run (same sign-in reused); `hermes-pair.ps1` (nothing on disk changed); `-NewAccess` (old sign-in and old session refused, new one accepted); a password with Spanish characters written in `.env`; `-Uninstall` with and without `-Purge`; and the upgrade from the published bridge-era installer, both ways round (setup over a live bridge, then `-RetireBridge`; `-RetireBridge` first, then setup), with `-RetireBridge` run twice and refused for a bridge that belongs to another Windows user. Each code was read with the app's own parser and used from another machine on the LAN. The reviewer suite (383 checks, zero skips) passed under Windows PowerShell 5.1 and under PowerShell 7.4. |
+| Windows 11 x64 (25H2, build 26200, Spanish locale) | Native VM, 2026-10-12, with a real Hermes Agent 0.21.1, in an elevated Windows PowerShell 5.1 window on the desktop (one real run under PowerShell 7.4 too). Fresh setup twice, one of them into a home whose path has spaces and in an 80-column window; re-run (same sign-in reused); `hermes-pair.ps1` (nothing on disk changed); `-NewAccess` (old sign-in and old session refused, new one accepted); a password with Spanish characters written in `.env`; `-Uninstall` with and without `-Purge`; and the upgrade from the published bridge-era installer, both ways round (setup over a live bridge, then `-RetireBridge`; `-RetireBridge` first, then setup), with `-RetireBridge` run twice and refused for a bridge that belongs to another Windows user. Each code was read with the app's own parser and used from another machine on the LAN. The reviewer suite (383 checks, zero skips) passed under Windows PowerShell 5.1 and under PowerShell 7.4; after the later wording and legacy changes it has 392 checks and passed again under Windows PowerShell 5.1 on the same VM (PowerShell 7 was not repeated), and the seal and closing block were printed once in that console to check width and encoding. |
 | Windows 10, Windows Server 2022, Windows ARM64 | **Not run for this version.** Server 2022 is what the CI runner uses; this branch has not been through CI yet. |
 | Linux x64 (Debian 13) | Contract suites, plus a whole setup driven by the shipped scripts against a stand-in Hermes in a disposable home (fresh, re-run, show again, retire, password changed elsewhere, new sign-in, `.env`-pinned, failed setup rolled back). **A real Hermes install on Linux was not repeated for this version.** |
 | macOS | **Not run for this version.** The CI job (BSD `/bin/sh`, real `launchctl`, a full isolated install) was updated for it and has not run yet. |
@@ -231,12 +231,31 @@ file wins inside Hermes and this command does not edit it: it says so and shows
 the code with the sign-in that is there. On a Unix host without systemd or
 launchd, stop the two services first; the message names the two commands.
 
-## Removing the old Mobile Bridge
+## Legacy (bridge-era installs)
 
-Earlier versions installed a third service, the Mobile Bridge. The app no
-longer uses it. This stops and removes it and nothing else — Gateway and
-Dashboard are not touched, so the app stays connected. Running it twice, or on
-a computer that never had one, changes nothing:
+Setups made before Console 1.2.15 installed a third service next to Gateway
+and Dashboard, the Mobile Bridge. A new setup never does: it installs, downloads
+and starts no bridge, and a fresh install ends with none. Console 1.2.15 and
+newer do not use it.
+
+What stays for those older installs, and who needs it:
+
+| Kept | Needed by | Removed with |
+|---|---|---|
+| `hermes_bridge.py` | Console older than 1.2.15, which fetches it from this repository to update a bridge it already has | Console 1.2.17 |
+| `bridge-release.json` | The same apps: the version, SHA-256 and size they check `hermes_bridge.py` against | Console 1.2.17 |
+| `--retire-bridge` / `-RetireBridge` in the setup scripts | Anyone cleaning an old install | Console 1.2.17 |
+
+Nothing breaks for an old install when the setup commands run again (their
+addresses did not change, so they now run this version): Gateway and Dashboard
+are set up, a bridge that is still running is left running and untouched
+so that an app older than 1.2.15 keeps working, and the script prints the
+cleanup line below. Showing the code again works on an old install as well.
+
+To clean an old install once every phone has Console 1.2.15 or newer, this stops
+and removes the bridge and nothing else. Gateway and Dashboard are not touched.
+Running it twice, or on a computer that never had a bridge or has no Hermes,
+says there is nothing to remove and changes nothing:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-mobile-setup.sh | sh -s -- --retire-bridge
@@ -253,9 +272,12 @@ its files (`hermes_bridge.py`, `bridge.env`, its runner). Its backups under
 `backups/bridge` and its logs are yours and stay. A firewall rule that opened
 port 9131 can be deleted; nothing listens there any more.
 
-`hermes_bridge.py` and `bridge-release.json` stay in this repository only for
-apps older than 1.2.15, which still update a bridge they already have. Setup
-does not download or start them.
+The legacy files carry a header saying the same, and their tests run in a CI
+step named "Legacy": `tests/legacy-bridge-release_test.py`,
+`tests/legacy-bridge-security_test.py` and `tests/legacy-bridge-coexistence_test.py`
+(setup, show-the-code and cleanup on a computer with a live bridge, and on one
+with none). `bridge-release.json` cannot carry a comment and is exactly the
+manifest those apps expect.
 
 ## Minimal Debian and systemd troubleshooting
 
@@ -289,8 +311,8 @@ journalctl --user -u hermes-gateway.service
 | `hermes-mobile-setup.ps1` | Native Windows installer |
 | `hermes-pair.sh` | Prints the pairing QR/link on demand (no reinstall) |
 | `hermes-pair.ps1` | Native Windows pairing QR/link |
-| `hermes_bridge.py` | The retired Mobile Bridge, kept for apps older than 1.2.15 that still update theirs; setup does not install it |
-| `bridge-release.json` | Machine-readable Bridge version, compatible app build, SHA-256 and byte size |
+| `hermes_bridge.py` | Legacy: the retired Mobile Bridge, kept for apps older than 1.2.15; setup does not install it (removed with 1.2.17) |
+| `bridge-release.json` | Legacy: Bridge version, compatible app build, SHA-256 and byte size, for the same apps (removed with 1.2.17) |
 
 ## Maintenance
 
@@ -305,4 +327,5 @@ Tests, all against disposable homes (nothing touches a real `~/.hermes`):
 python3 tests/review-unix-security.py     # contract suite
 python3 tests/no-bridge_test.py           # sign-in decision, code, --retire-bridge
 python3 tests/no-bridge-install_test.py   # a whole setup against a stand-in Hermes
+python3 tests/legacy-bridge-coexistence_test.py  # bridge-era installs: setup, show again, cleanup
 ```
