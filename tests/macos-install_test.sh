@@ -12,6 +12,7 @@ export HERMES_HOME="$WORK/home"
 mkdir -p "$HERMES_HOME"
 LOG="$WORK/install.log"
 FAILED=0
+LABELS="dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard"
 
 say() { printf '%s\n' "$1"; }
 check() {
@@ -67,7 +68,6 @@ else
 fi
 check "the installer exits 0 on native macOS" "$RC"
 
-LABELS="dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard"
 BRIDGE_LABEL="dev.xpetalab.hermes-console.bridge"
 UID_NUM="$(id -u)"
 for label in $LABELS; do

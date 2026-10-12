@@ -834,6 +834,16 @@ if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
   fi
   HB="$AGENT_DIR/venv/bin/hermes"
   if [ ! -x "$HB" ] || ! "$HB" --version >/dev/null 2>&1; then
+    # Say what was found before the attempt is removed: this is the only trace.
+    if [ -x "$HB" ]; then
+      echo "Hermes answered '--version' with:" >&2
+      "$HB" --version 2>&1 | head -8 >&2 || true
+    else
+      echo "No launcher at $HB. Found in $AGENT_DIR:" >&2
+      ls -A "$AGENT_DIR" 2>&1 | head -12 >&2 || true
+      ls "$AGENT_DIR/venv/bin" 2>&1 | head -12 >&2 || true
+      ls -A "$HH/bin" 2>&1 | head -8 >&2 || true
+    fi
     cleanup_fresh_agent_attempt
     echo "ERROR: Hermes Agent did not pass its health check; fresh attempt artifacts were removed." >&2
     exit 1
