@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# LEGACY - kept only for installs made before Console 1.2.15.
-# Console 1.2.15 and newer do not use the Mobile Bridge, and a new setup never
-# installs, downloads or starts this file. It stays published because apps older
-# than 1.2.15 still fetch it (with bridge-release.json) to update a bridge they
-# already have. To remove an old bridge from a computer, run setup with
-# --retire-bridge (Unix) or -RetireBridge (Windows). This file will be removed
-# from the repository with Console 1.2.17.
 """Hermes Mobile Bridge — servidor mínimo y seguro (v1).
 
 Expone SOLO acciones allowlisted que el Gateway no cubre por HTTP:

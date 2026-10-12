@@ -254,13 +254,24 @@ class NothingFetchesOrInstallsTheBridgeAnyMore(unittest.TestCase):
                 ):
                     self.assertNotIn(fragment, source)
 
-    def test_the_legacy_files_say_so_and_the_manifest_matches(self) -> None:
-        head = (ROOT / "hermes_bridge.py").read_text(encoding="utf-8").splitlines()[:9]
-        joined = "\n".join(head)
-        self.assertTrue(head[0].startswith("#!"))
-        self.assertIn("LEGACY", joined)
-        self.assertIn("Console 1.2.15", joined)
-        self.assertIn("1.2.17", joined)
+    def test_the_published_bridge_is_untouched_and_the_readme_says_it_is_legacy(self) -> None:
+        # Console <= 1.2.14 checks the bytes it downloads against the
+        # manifest: the file stays exactly as published, not even a comment
+        # is added to it. Its legacy status lives in the README.
+        import hashlib
+        import json
+
+        manifest = json.loads((ROOT / "bridge-release.json").read_text(encoding="utf-8"))
+        payload = (ROOT / "hermes_bridge.py").read_bytes()
+        self.assertEqual(
+            manifest["sha256"],
+            "f61cde2912cd6e35e917e6a994b904aeaa7a82df8cb56b35b7fdff91f17324d5",
+        )
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), manifest["sha256"])
+        self.assertEqual(len(payload), manifest["size"])
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Legacy", readme)
+        self.assertIn("1.2.17", readme)
         self.assertFalse((ROOT / "hermes-mobile-setup.vbs").exists())
 
     def test_what_an_older_pair_script_checks_before_running_this_setup_still_holds(self) -> None:
