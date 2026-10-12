@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding", "FirewallAppRules", "RetireBridge", "DashboardAccess")]
+    [ValidateSet("All", "ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding", "FirewallAppRules", "RetireBridge", "DashboardAccess", "LegacyBridge")]
     [string]$Case = "All",
     [string]$SetupScript = "",
     [string]$PairScript = ""
@@ -96,10 +96,7 @@ function Test-ParserBootstrap {
     foreach ($temporaryName in @("PairingNew", "QrNew", "EnvNew", "Installer", "InstallerOut", "InstallerErr", "QrScript", "AccessScript", "AccessState", "AccessPrevious")) {
         Assert-True ($setupRaw -match "Remove-OwnedSetupFiles[\s\S]+$temporaryName") "cleanup covers $temporaryName"
     }
-    $launcherPath = Join-Path (Split-Path $SetupScript -Parent) "hermes-mobile-setup.vbs"
-    $launcherRaw = Get-Content -LiteralPath $launcherPath -Raw
-    Assert-True ($launcherRaw -notmatch '(?i)MsgBox|explorer\.exe|Invoke-Item|ShellExecute') "VBS launcher never opens status, QR, console, or viewer windows"
-    Assert-True ($launcherRaw -match 'shell\.Run\(command,\s*0,\s*True\)') "VBS launcher keeps its only child hidden and waits for cleanup"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path (Split-Path $SetupScript -Parent) "hermes-mobile-setup.vbs"))) "the unused double-click launcher is gone: nothing fetches or runs it"
     Assert-True ($setupRaw -match 'CREATE_NO_WINDOW') "contained native children use CREATE_NO_WINDOW"
     Assert-True ($setupRaw -match '-SkipComputerUse') "Console bootstrap skips unused Computer Use payloads"
     # Regression (observed natively on Windows 11 25H2, PS 5.1): upstream
@@ -475,7 +472,7 @@ try {
         $contenderRun = Invoke-ChildProcessCapture $hostExe @("-NoLogo", "-NoProfile", "-File", $contenderScript, "-Name", $productLockName)
         $contenderOutput = @($contenderRun.Output)
         Assert-True ($contenderRun.ExitCode -eq 73) "actual cross-process setup-lock contender fails closed"
-        Assert-True (($contenderOutput -join "`n") -match 'Another Hermes Console setup owns the lock') "actual contender reports lock ownership"
+        Assert-True (($contenderOutput -join "`n") -match 'Another Console setup owns the lock') "actual contender reports lock ownership"
         Assert-True (([IO.File]::ReadAllText($winnerPaths.AccessScript) -eq "winner-canary") -and
             ([IO.File]::ReadAllText($winnerPaths.AccessState) -eq "winner-canary") -and
             ([IO.File]::ReadAllText($winnerPaths.PairingNew) -eq "winner-canary")) "actual losing contender leaves winner staging untouched"
@@ -1469,7 +1466,7 @@ function Test-ProgressBranding {
     # redirigido (logs, CI) la salida es exactamente la de siempre.
     $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
 
-    Assert-True ($setupRaw -match 'xPetaLab' -and $setupRaw -match 'HERMES CONSOLE') `
+    Assert-True ($setupRaw -match 'xPetaLab' -and $setupRaw -match 'xPetaLab  \|  CONSOLE' -and $setupRaw -cnotmatch 'HERMES CONSOLE') `
         "the installer shows the product banner"
     Assert-True ($setupRaw -match '\$script:SetupPhaseWeights = @\(([0-9]+, ){6}[0-9]+\)') `
         "phase weights are declared once"
@@ -1488,7 +1485,7 @@ function Test-ProgressBranding {
 
     # El QR debe llegar a la consola: enlace + ASCII, y sin acabar en los logs.
     Assert-True ($setupRaw -match 'function Show-PairingResult') "there is a console pairing result"
-    Assert-True ($setupRaw -match 'SCAN THIS CODE WITH HERMES CONSOLE') "the console tells the user to scan the code"
+    Assert-True ($setupRaw -match 'SCAN THIS CODE WITH CONSOLE') "the console tells the user to scan the code"
     Assert-True ($setupRaw -match 'print_ascii\(invert=True\)') "the QR is rendered as ASCII too"
     Assert-True ($setupRaw -match 'redirect_stdout\(buffer\)') `
         "the ASCII QR never goes to the captured stdout of the render process"
@@ -1554,7 +1551,7 @@ function Test-ProgressBranding {
         "a refusal in a person's window is one readable block, and still an exception for scripts"
     $sealStart = $setupRaw.IndexOf("function Show-SetupSeal")
     $sealBody = $setupRaw.Substring($sealStart, $setupRaw.IndexOf("`nfunction ", $sealStart + 10) - $sealStart)
-    Assert-True ($sealBody -match 'xPetaLab  \|  HERMES CONSOLE' -and $setupRaw -match 'function Show-SetupDone') `
+    Assert-True ($sealBody -match 'xPetaLab  \|  CONSOLE' -and $setupRaw -match 'function Show-SetupDone') `
         "the window closes with the same seal it opened with"
     Assert-True ($setupRaw -match 'startup\.lpDesktop = QuietDesktopName' -and
         $setupRaw -match 'CreateDesktop\(QuietDesktopName') `
@@ -1975,8 +1972,83 @@ exit 0
     }
 }
 
+function Test-LegacyBridge {
+    # LEGACY (removed with Console 1.2.17). A computer that still has a bridge
+    # from a setup made before Console 1.2.15, and one that never had one.
+    foreach ($leftover in @("Test-Path", "Remove-Item", "Get-Content", "New-Item", "Write-Host")) {
+        Remove-Item -LiteralPath "Function:\$leftover" -ErrorAction SilentlyContinue
+    }
+    $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
+    $pairRaw = Get-Content -LiteralPath $PairScript -Raw
+
+    # The bridge-era pairing script, run with -Repair, downloads this setup
+    # from main and only runs it if it starts with this line and has these two.
+    Assert-True ($setupRaw.StartsWith("# Hermes Console - native Windows setup") -and
+        $setupRaw -match '(?m)^function Get-PairingConfiguration' -and
+        $setupRaw -match '(?m)^\$PairingFile = Join-Path \$ServicesDir "pairing\.json"') `
+        "what an older hermes-pair.ps1 -Repair checks before running this setup still holds"
+    # And this pairing script reads the record an older setup wrote.
+    Assert-True ($pairRaw -match 'schema -notin @\(1, 2\)') "showing the code again accepts the pairing record of a bridge-era setup"
+
+    # A fresh setup cannot create a bridge: nothing downloads, registers or runs one.
+    $fetchesBridge = @($setupRaw -split "`r?`n" | Where-Object {
+        $_ -match '(?i)bridge' -and $_.TrimStart() -notmatch '^(Write-Host|#)' -and
+        $_ -match '(?i)Invoke-WebRequest|Invoke-RestMethod|DownloadFile|\birm\b'
+    })
+    Assert-True ($fetchesBridge.Count -eq 0 -and
+        $setupRaw -notmatch 'Register-HermesTask "HermesConsole-(Restart-)?MobileBridge"' -and
+        $setupRaw -notmatch '--i-know-what-im-doing') `
+        "setup contains no way to download, schedule or start a bridge"
+
+    # What a person sees when the bridge of an older setup is still there.
+    foreach ($name in @("Get-LegacyBridgeFiles", "Show-DashboardAccess", "Show-SetupSeal", "Show-SetupDone", "Format-Elapsed")) {
+        Import-ProductFunction $setup $name
+    }
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-legacy-" + [Guid]::NewGuid().ToString("N"))
+    $global:HermesHome = Join-Path $temp "hermes"
+    $global:ServicesDir = Join-Path $global:HermesHome "console-services"
+    [void](New-Item -ItemType Directory -Force -Path $global:ServicesDir)
+    $global:BridgeTarget = Join-Path $global:HermesHome "hermes_bridge.py"
+    $global:BridgeBackup = "$($global:BridgeTarget).rollback"
+    $global:RepoRaw = "https://example.invalid/main"
+    $global:EnvFile = Join-Path $global:HermesHome ".env"
+    $global:DashLoginFile = Join-Path $global:ServicesDir "dashboard-login.json"
+    $global:NewAccess = $false
+    $access = [PSCustomObject]@{ State = "known"; User = "admin"; Pinned = $false }
+    try {
+        $script:SetupLive = $false
+        $clean = (@(& { Show-DashboardAccess $access } 6>&1 | ForEach-Object { [string]$_ })) -join "`n"
+        Assert-True ($clean -notmatch 'RetireBridge' -and $clean -notmatch 'Mobile Bridge') "no bridge on the computer, no word about one"
+        Assert-True ($clean -match 'Needs Console 1\.2\.15 or newer on the phone\.' -and
+            $clean -match 'Help and guide: https://hermes\.xpetalab\.dev') `
+            "without a person watching, the closing facts are two plain lines"
+
+        [IO.File]::WriteAllText($global:BridgeTarget, "the bridge of an older setup")
+        $old = (@(& { Show-DashboardAccess $access } 6>&1 | ForEach-Object { [string]$_ })) -join "`n"
+        Assert-True ($old -match 'was left as it was' -and $old -match 'older\s+than 1\.2\.15 still uses it' -and
+            $old.Contains('& ([scriptblock]::Create((irm https://example.invalid/main/hermes-mobile-setup.ps1))) -RetireBridge')) `
+            "a bridge left by an older setup is left alone, and the exact cleanup line is printed"
+        Assert-True ((Get-Content -LiteralPath $global:BridgeTarget -Raw) -eq "the bridge of an older setup") `
+            "showing the result does not touch the bridge"
+
+        # The window of a person: the closing seal carries the same two facts, within 80 columns.
+        $script:SetupLive = $true
+        $script:SetupStartedAt = Get-Date
+        $closing = @(& { Show-SetupDone } 6>&1 | ForEach-Object { [string]$_ })
+        $text = $closing -join "`n"
+        Assert-True ($text -match 'xPetaLab  \|  CONSOLE' -and $text -cnotmatch 'HERMES CONSOLE') "the closing seal says CONSOLE"
+        Assert-True ($text -match 'Needs Console 1\.2\.15 or newer on the phone\.' -and
+            $text -match 'Help and guide: https://hermes\.xpetalab\.dev') "the closing seal carries the app version it needs and the site"
+        Assert-True (@($closing | Where-Object { $_.Length -gt 79 }).Count -eq 0) "every line of the closing seal fits an 80-column window"
+        $script:SetupLive = $false
+    } finally {
+        $script:SetupLive = $false
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $cases = if ($Case -eq "All") {
-    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding", "FirewallAppRules", "RetireBridge", "DashboardAccess")
+    @("ParserBootstrap", "UrlPolicy", "PairNoRepair", "Health", "ContainmentFailure", "LockOwnership", "TransactionRollback", "FreshInstallCleanup", "UpstreamInstallerPin", "PlatformSupport", "ProcessDiagnostics", "ServiceRunnerEncoding", "NativeJob", "TopLevelTimeouts", "PreflightDiagnose", "ServicePorts", "AdaptiveWait", "AddressCandidates", "Uninstall", "FailureHint", "ProgressBranding", "FirewallAppRules", "RetireBridge", "DashboardAccess", "LegacyBridge")
 } else { @($Case) }
 
 foreach ($selected in $cases) {

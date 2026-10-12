@@ -115,7 +115,7 @@ function Test-WindowsPlatform {
 }
 
 function Assert-SupportedWindows {
-    $support = "Hermes Console Setup supports Windows 10, Windows 11 and Windows Server (x64 or ARM64)."
+    $support = "Console setup supports Windows 10, Windows 11 and Windows Server (x64 or ARM64)."
     if (-not (Test-WindowsPlatform)) {
         throw "$support Detected: non-Windows operating system. This system is not supported. No changes were made."
     }
@@ -131,7 +131,7 @@ function Assert-SupportedWindows {
         $build = [string]$os.BuildNumber
         if ([string]::IsNullOrWhiteSpace($build)) { throw "Operating system build was empty." }
     } catch {
-        throw "Hermes Console Setup could not verify the Windows version. It supports Windows 10, Windows 11 and Windows Server (x64 or ARM64). No changes were made."
+        throw "Console setup could not verify the Windows version. It supports Windows 10, Windows 11 and Windows Server (x64 or ARM64). No changes were made."
     }
 
     $nativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) {
@@ -201,7 +201,7 @@ function Enter-SetupLock {
             $acquired = $true
         }
         if (-not $acquired) {
-            throw "Another Hermes Console setup owns the lock; no changes were made."
+            throw "Another Console setup owns the lock; no changes were made."
         }
         try {
             # Transitional dual lock: excludes the published file-lock version.
@@ -209,7 +209,7 @@ function Enter-SetupLock {
             $legacyHandle = [IO.File]::Open($legacyPath, [IO.FileMode]::OpenOrCreate,
                 [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         } catch [IO.IOException] {
-            throw "Another Hermes Console setup owns the legacy lock; no changes were made."
+            throw "Another Console setup owns the legacy lock; no changes were made."
         }
         return [PSCustomObject]@{
             Mutex = $mutex
@@ -1031,9 +1031,9 @@ function Write-Audit([string]$Step, [string]$State, [string]$Detail = "") {
     Write-Host "[$State] $Step$suffix" -ForegroundColor $color
 }
 
-function Write-Info([string]$Message) { Write-Audit "Hermes Console" "INFO" $Message }
-function Write-Ok([string]$Message) { Write-Audit "Hermes Console" "OK" $Message }
-function Write-Warn([string]$Message) { Write-Audit "Hermes Console" "WARN" $Message }
+function Write-Info([string]$Message) { Write-Audit "Console" "INFO" $Message }
+function Write-Ok([string]$Message) { Write-Audit "Console" "OK" $Message }
+function Write-Warn([string]$Message) { Write-Audit "Console" "WARN" $Message }
 
 $script:SetupPhase = 0
 $script:SetupPhaseTotal = 7
@@ -1111,7 +1111,7 @@ function Complete-SetupPhaseRow([string]$Mark = "ok", [string]$Color = "DarkGree
 function Show-SetupSeal([string]$Line = "") {
     $rule = "=" * 64
     Write-Host "  $rule" -ForegroundColor DarkGray
-    Write-Host "    xPetaLab  |  HERMES CONSOLE" -ForegroundColor DarkYellow
+    Write-Host "    xPetaLab  |  CONSOLE" -ForegroundColor DarkYellow
     Write-Host "  $rule" -ForegroundColor DarkGray
     if ($Line) { Write-Host "    $Line" -ForegroundColor Gray }
 }
@@ -1123,7 +1123,7 @@ function Show-SetupFailure([string]$Message) {
     Complete-SetupPhaseRow "x" "Red"
     $width = (Get-SetupConsoleWidth) - 6
     Write-Host ""
-    Write-Host "  [x] Hermes Console setup did not finish. Nothing was left half done." -ForegroundColor Red
+    Write-Host "  [x] Console setup did not finish. Nothing was left half done." -ForegroundColor Red
     $row = ""
     foreach ($word in ($Message -split '\s+')) {
         if ($row -and ($row.Length + 1 + $word.Length) -gt $width) {
@@ -1132,6 +1132,7 @@ function Show-SetupFailure([string]$Message) {
         } elseif ($row) { $row = "$row $word" } else { $row = $word }
     }
     if ($row) { Write-Host "      $row" -ForegroundColor Gray }
+    Write-Host "      Need help? https://hermes.xpetalab.dev" -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -1141,6 +1142,8 @@ function Show-SetupDone {
     Show-SetupSeal ("Ready in {0}." -f (Format-Elapsed ((Get-Date) - $script:SetupStartedAt)))
     Write-Host "    Hermes keeps running in the background, with no window, and starts" -ForegroundColor Gray
     Write-Host "    by itself when you sign in to Windows. You can close this window." -ForegroundColor Gray
+    Write-Host "    Needs Console 1.2.15 or newer on the phone." -ForegroundColor Gray
+    Write-Host "    Help and guide: https://hermes.xpetalab.dev" -ForegroundColor Gray
     Write-Host "  $("=" * 64)" -ForegroundColor DarkGray
     Write-Host ""
 }
@@ -1150,7 +1153,7 @@ function Show-SetupBanner {
     $line = "=" * 64
     Write-Host ""
     Write-Host "  $line" -ForegroundColor DarkGray
-    Write-Host "    xPetaLab  |  HERMES CONSOLE" -ForegroundColor DarkYellow
+    Write-Host "    xPetaLab  |  CONSOLE" -ForegroundColor DarkYellow
     Write-Host "  $line" -ForegroundColor DarkGray
     Write-Host "    Self-hosted Hermes Agent + Gateway + Dashboard" -ForegroundColor Gray
     Write-Host "    Windows PowerShell $($PSVersionTable.PSVersion) - no popups, no telemetry" -ForegroundColor DarkGray
@@ -2690,7 +2693,7 @@ function Show-PairingResult([string]$Link) {
     if (-not [string]::IsNullOrWhiteSpace($qrAscii)) {
         Write-Host ""
         Write-Host ""
-        Write-Host "  == SCAN THIS CODE WITH HERMES CONSOLE ==" -ForegroundColor DarkYellow
+        Write-Host "  == SCAN THIS CODE WITH CONSOLE ==" -ForegroundColor DarkYellow
         Write-Host $qrAscii -ForegroundColor Gray
     }
     Write-Host "  No camera? Copy this link and paste it in the app (Scan, then Paste link):" -ForegroundColor DarkYellow
@@ -2733,8 +2736,14 @@ function Show-DashboardAccess($Access) {
     Write-Host "  Keep the code and the link private: whoever has them can use your Hermes." -ForegroundColor Gray
     $leftovers = @(Get-LegacyBridgeFiles | Where-Object { Test-Path -LiteralPath $_ })
     if ($leftovers.Count -gt 0) {
-        Write-Host "  An old Mobile Bridge is still installed here. The app no longer uses it. To remove it:" -ForegroundColor Gray
+        Write-Host "  An old Mobile Bridge is still installed here and was left as it was: Console older" -ForegroundColor Gray
+        Write-Host "  than 1.2.15 still uses it. Once every phone has Console 1.2.15 or newer, remove it:" -ForegroundColor Gray
         Write-Host "    & ([scriptblock]::Create((irm $RepoRaw/hermes-mobile-setup.ps1))) -RetireBridge" -ForegroundColor Gray
+    }
+    if (-not $script:SetupLive) {
+        # Without a person watching there is no closing seal: the same two lines, plain.
+        Write-Host "  Needs Console 1.2.15 or newer on the phone." -ForegroundColor Gray
+        Write-Host "  Help and guide: https://hermes.xpetalab.dev" -ForegroundColor Gray
     }
     Write-Host ""
 }
@@ -2991,6 +3000,8 @@ function Test-DashboardSignIn([string]$BaseUrl, [string]$LoginPath) {
     }
 }
 
+# LEGACY: cleanup of the Mobile Bridge that setups before Console 1.2.15 installed
+# (-RetireBridge and what it needs). Removed with Console 1.2.17.
 function Get-LegacyBridgeFiles {
     return @(
         $BridgeTarget,
@@ -3498,7 +3509,7 @@ function Invoke-SetupDiagnose {
     $scriptHash = ""
     try { $scriptHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant() } catch {}
 
-    $lines.Add("Hermes Console setup diagnostic")
+    $lines.Add("Console setup diagnostic")
     $lines.Add("generated_utc: $stamp")
     $lines.Add("setup_script_sha256: $scriptHash")
     $lines.Add("powershell: $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)")
@@ -3644,7 +3655,7 @@ function Invoke-SetupUninstall {
         $looksLikeSystemPath = $parent -in @("", "C:\", "C:\Windows", "C:\Program Files", "C:\Program Files (x86)") -or
             $leaf -in @("Windows", "Program Files", "Program Files (x86)", "Users")
         if (-not $looksLikeConsoleHome -or $looksLikeSystemPath) {
-            throw "Refusing -Purge: $HermesHome is not a recognisable Hermes Console home. Remove it manually if that is really what you want. Services and pairing artifacts were already removed."
+            throw "Refusing -Purge: $HermesHome is not a recognisable Console home. Remove it manually if that is really what you want. Services and pairing artifacts were already removed."
         }
         if (Test-Path -LiteralPath $HermesHome) {
             try {

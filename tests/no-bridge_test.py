@@ -259,7 +259,7 @@ class WindowsParityTests(unittest.TestCase):
         self.assertNotIn(":9119", self.pair_ps1.replace('else { "9119" }', ""))
 
     def test_every_script_opens_with_the_same_seal(self) -> None:
-        seal = "xPetaLab  |  HERMES CONSOLE"
+        seal = "xPetaLab  |  CONSOLE"
         rule = "=" * 64
         for name in (
             "hermes-mobile-setup.sh",
@@ -271,6 +271,25 @@ class WindowsParityTests(unittest.TestCase):
                 source = (ROOT / name).read_text(encoding="utf-8")
                 self.assertIn(seal, source)
                 self.assertTrue(rule in source or '"=" * 64' in source)
+
+    def test_every_script_closes_with_the_site_and_the_app_version_it_needs(self) -> None:
+        needs = "Needs Console 1.2.15 or newer on the phone."
+        site = "https://hermes.xpetalab.dev"
+        for name in (
+            "hermes-mobile-setup.sh",
+            "hermes-pair.sh",
+            "hermes-mobile-setup.ps1",
+            "hermes-pair.ps1",
+        ):
+            with self.subTest(script=name):
+                source = (ROOT / name).read_text(encoding="utf-8")
+                self.assertIn(needs, source)
+                self.assertIn("Help and guide: " + site, source)
+                # The window may be 80 columns wide: nothing printed there wraps.
+                for line in source.splitlines():
+                    if needs in line or "Help and guide:" in line:
+                        text = line.split("'" if "printf" in line else '"')[1]
+                        self.assertLessEqual(len(text.replace("\\n", "")) + 4, 80, line)
 
     def test_the_unix_seal_is_only_drawn_for_a_person(self) -> None:
         # Piped or logged output keeps its plain lines: no seal, no bar.

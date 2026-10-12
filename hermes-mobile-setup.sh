@@ -26,13 +26,14 @@ done
 case "$ACTION" in
   setup|new-access|retire-bridge) ;;
   help)
-    echo "Hermes Console setup"
+    echo "Console setup for Hermes Agent"
     echo ""
     echo "  (no option)       Get this computer ready and show the code to scan."
     echo "  --new-access      Make a new Dashboard sign-in and show a new code."
     echo "                    Browsers and phones signed in before must sign in again."
     echo "  --retire-bridge   Stop and remove the old Mobile Bridge. Nothing else"
-    echo "                    is touched; the app no longer uses it."
+    echo "                    is touched. Console 1.2.15 and newer do not use it;"
+    echo "                    older versions still do."
     exit 0
     ;;
   *)
@@ -143,7 +144,7 @@ acquire_setup_lock() {
   umask 077
   if ! mkdir "$SETUP_LOCK_DIR" 2>/dev/null; then
     umask "$old_umask"
-    echo "ERROR: another Hermes Console setup is already running for this user." >&2
+    echo "ERROR: another Console setup is already running for this user." >&2
     return 1
   fi
   umask "$old_umask"
@@ -428,6 +429,8 @@ preflight_service_ownership() {
 
 select_service_manager
 
+# LEGACY: cleanup of the Mobile Bridge that setups before Console 1.2.15 installed
+# (--retire-bridge and what it needs). Removed with Console 1.2.17.
 # What an earlier setup may have left of the Mobile Bridge. Setup itself no
 # longer creates, starts or checks any of it; only --retire-bridge touches it.
 # Its backups ($HH/backups/bridge) and logs are the user's and stay.
@@ -546,7 +549,7 @@ PY_RETIRE
 setup_seal() {
   [ -t 1 ] || return 0
   printf '\n  ================================================================\n'
-  printf '    xPetaLab  |  HERMES CONSOLE\n'
+  printf '    xPetaLab  |  CONSOLE\n'
   printf '  ================================================================\n'
 }
 
@@ -608,7 +611,7 @@ retire_bridge() {
     return 1
   fi
   echo "Done. The old Mobile Bridge is stopped and removed."
-  echo "Hermes, its Gateway and its Dashboard were not touched: the app keeps working."
+  echo "Hermes, its Gateway and its Dashboard were not touched: Console 1.2.15 or newer keeps working."
   if command -v ufw >/dev/null 2>&1 || command -v firewall-cmd >/dev/null 2>&1; then
     echo "Port ${HERMES_BRIDGE_PORT:-9131} is no longer used. A firewall rule that opened it can be deleted; nothing listens there now."
   fi
@@ -2295,7 +2298,7 @@ run_privileged() {
     # can finish firewall setup in one run. Agents/non-interactive shells still
     # fail closed and receive the exact manual commands below.
     if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-      echo "Hermes Console needs administrator approval for a private firewall rule." >/dev/tty
+      echo "Console needs administrator approval for a private firewall rule." >/dev/tty
       if sudo -v; then
         SUDO_READY=1
         sudo -n "$@"
@@ -2400,7 +2403,7 @@ print("hermes://pair?" + urllib.parse.urlencode(query))
 PY
 )"
 echo ""
-echo "== SCAN THIS CODE WITH HERMES CONSOLE =="
+echo "== SCAN THIS CODE WITH CONSOLE =="
 echo ""
 QRPY='import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)'
 QR_RENDERED=""
@@ -2471,12 +2474,18 @@ echo "  Address your phone uses: $HOST ($NETWORK_KIND)"
 echo "To check everything and see the code again later:"
 echo "  curl -fsSL $REPO_RAW/hermes-pair.sh | sh"
 if [ -n "$(bridge_leftovers)" ]; then
-  echo "An old Mobile Bridge is still installed here. The app no longer uses it. To remove it:"
+  echo "An old Mobile Bridge is still installed here and was left as it was: Console older"
+  echo "than 1.2.15 still uses it. Once every phone has Console 1.2.15 or newer, remove it:"
   echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh -s -- --retire-bridge"
 fi
 echo "If chat has no model yet, open Dashboard from the app and configure your AI provider/model."
 if [ "$SETUP_LIVE" -eq 1 ]; then
   setup_seal
   printf '    Hermes keeps running in the background and starts by itself.\n'
+  printf '    Needs Console 1.2.15 or newer on the phone.\n'
+  printf '    Help and guide: https://hermes.xpetalab.dev\n'
   printf '  ================================================================\n\n'
+else
+  echo "Needs Console 1.2.15 or newer on the phone."
+  echo "Help and guide: https://hermes.xpetalab.dev"
 fi

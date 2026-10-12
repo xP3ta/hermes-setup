@@ -21,7 +21,7 @@ fi
 
 if [ -t 1 ]; then
   printf '\n  ================================================================\n'
-  printf '    xPetaLab  |  HERMES CONSOLE\n'
+  printf '    xPetaLab  |  CONSOLE\n'
   printf '  ================================================================\n'
 fi
 
@@ -368,7 +368,7 @@ PY
 )"
 
 echo ""
-echo "== SCAN THIS CODE WITH HERMES CONSOLE =="
+echo "== SCAN THIS CODE WITH CONSOLE =="
 echo ""
 QRPY='import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)'
 QR_RENDERED=""
@@ -397,3 +397,5 @@ else
   echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh -s -- --new-access"
 fi
 echo "Keep the code and the link private: whoever has them can use your Hermes."
+echo "Needs Console 1.2.15 or newer on the phone."
+echo "Help and guide: https://hermes.xpetalab.dev"

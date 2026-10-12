@@ -239,9 +239,9 @@ function Render-Qr([string]$Link) {
 function Invoke-VerifiedSetupRepair([string]$Reason) {
     $setupUrl = "$RepoRaw/hermes-mobile-setup.ps1"
     Write-Host ""
-    Write-Host "Explicit repair was requested for Hermes Console." -ForegroundColor Yellow
+    Write-Host "Explicit repair was requested for Console." -ForegroundColor Yellow
     Write-Host "Reason: $Reason"
-    Write-Host "Running the requested Hermes Console setup now..." -ForegroundColor Cyan
+    Write-Host "Running the requested Console setup now..." -ForegroundColor Cyan
 
     try {
         $setupSource = [string](Invoke-RestMethod -Method Get -Uri $setupUrl -TimeoutSec 30)
@@ -251,7 +251,7 @@ function Invoke-VerifiedSetupRepair([string]$Reason) {
     if (-not $setupSource.StartsWith("# Hermes Console - native Windows setup") -or
         $setupSource -notmatch '(?m)^function Get-PairingConfiguration' -or
         $setupSource -notmatch '(?m)^\$PairingFile = Join-Path \$ServicesDir "pairing\.json"') {
-        throw "The downloaded setup file did not match the expected Hermes Console installer. Nothing was executed."
+        throw "The downloaded setup file did not match the expected Console installer. Nothing was executed."
     }
 
     try {
@@ -262,7 +262,7 @@ function Invoke-VerifiedSetupRepair([string]$Reason) {
     if (-not (Test-Path -LiteralPath $PairingFile)) {
         throw "Setup finished without a verified pairing record. Review the setup error above before retrying."
     }
-    Write-Host "Setup/repair completed. Use the QR printed above to connect Hermes Console." -ForegroundColor Green
+    Write-Host "Setup/repair completed. Use the QR printed above to connect Console." -ForegroundColor Green
 }
 
 function Require-ExplicitRepair([string]$Reason) {
@@ -287,7 +287,7 @@ if ($PairLive) {
     $rule = "=" * 64
     Write-Host ""
     Write-Host "  $rule" -ForegroundColor DarkGray
-    Write-Host "    xPetaLab  |  HERMES CONSOLE" -ForegroundColor DarkYellow
+    Write-Host "    xPetaLab  |  CONSOLE" -ForegroundColor DarkYellow
     Write-Host "  $rule" -ForegroundColor DarkGray
 }
 
@@ -378,7 +378,7 @@ if ($scheme -eq "https") { $query += "https=1" }
 $link = "hermes://pair?" + ($query -join "&")
 
 Write-Host ""
-Write-Host "== SCAN THIS CODE WITH HERMES CONSOLE ==" -ForegroundColor Yellow
+Write-Host "== SCAN THIS CODE WITH CONSOLE ==" -ForegroundColor Yellow
 Write-Host ""
 if (-not (Render-Qr $link)) {
     Write-Warning "The code could not be drawn here. Copy the link below and paste it in the app instead."
@@ -396,10 +396,13 @@ if ($carriesSignIn) {
     Write-Host "  & ([scriptblock]::Create((irm $RepoRaw/hermes-mobile-setup.ps1))) -NewAccess"
 }
 Write-Host "Keep the code and the link private: whoever has them can use your Hermes."
+Write-Host "Needs Console 1.2.15 or newer on the phone."
+Write-Host "Help and guide: https://hermes.xpetalab.dev"
 } catch {
     if (-not $PairLive) { throw }
     Write-Host ""
     Write-Host "  [x] The code cannot be shown yet. Nothing was changed." -ForegroundColor Red
     Write-Host "      $($_.Exception.Message)" -ForegroundColor Gray
+    Write-Host "      Need help? https://hermes.xpetalab.dev" -ForegroundColor DarkGray
     Write-Host ""
 }
