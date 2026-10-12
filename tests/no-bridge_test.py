@@ -476,7 +476,7 @@ class DashboardAccessTests(unittest.TestCase):
         harness.write_text(
             "#!/bin/sh\nset -eu\n"
             + function
-            + '\nHH=$1\nVP=$2\nTRANSACTION_DIR=$3\nrollback_dashboard_access\n',
+            + '\nHH=$1\nVP=$2\nHP=$2\nTRANSACTION_DIR=$3\nrollback_dashboard_access\n',
             encoding="utf-8",
         )
         transaction = self.temp / "transaction"

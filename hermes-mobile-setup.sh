@@ -164,6 +164,7 @@ cleanup_setup() {
   if command -v cleanup_downloads >/dev/null 2>&1; then
     cleanup_downloads
   fi
+  if [ -n "${HP_DIR:-}" ]; then rm -rf -- "$HP_DIR"; fi
   release_setup_lock
 }
 trap cleanup_setup EXIT
@@ -802,7 +803,20 @@ setup_step "Checking Hermes"
 # Hermes Agent. A launcher only counts when it responds; stale shims from a
 # half-finished uninstall must not produce crash-looping services.
 AGENT_DIR="$HH/hermes-agent"
-HB="$AGENT_DIR/venv/bin/hermes"
+# Where Hermes keeps its command depends on the version that installed it:
+# current installs publish <install dir>/.hermes/bin/hermes (a launcher that
+# runs the interpreter of Hermes' own package manager), older ones keep
+# <install dir>/venv/bin/hermes. The first candidate that answers wins.
+find_hermes_launcher() {
+  for candidate in "$AGENT_DIR/.hermes/bin/hermes" "$AGENT_DIR/venv/bin/hermes" "$HH/bin/hermes"; do
+    if [ -x "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+HB="$(find_hermes_launcher || true)"
 cleanup_fresh_agent_attempt() {
   if [ "$HH_CREATED_BY_SETUP" -eq 1 ]; then
     rm -rf -- "$HH"
@@ -814,7 +828,7 @@ cleanup_fresh_agent_attempt() {
   [ "$SERVICES_CREATED_BY_SETUP" -ne 1 ] || rmdir "$SERVICES" 2>/dev/null || true
   rmdir "$HH/bin" 2>/dev/null || true
 }
-if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
+if [ -z "$HB" ]; then
   if [ -e "$AGENT_DIR" ] || [ -L "$AGENT_DIR" ] || \
      [ -e "$HH/node" ] || [ -L "$HH/node" ] || \
      [ -e "$HH/bin/hermes" ] || [ -L "$HH/bin/hermes" ] || \
@@ -832,42 +846,85 @@ if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
     echo "ERROR: Hermes Agent installation failed; fresh attempt artifacts were removed." >&2
     exit 1
   fi
-  HB="$AGENT_DIR/venv/bin/hermes"
-  if [ ! -x "$HB" ] || ! "$HB" --version >/dev/null 2>&1; then
+  HB="$(find_hermes_launcher || true)"
+  if [ -z "$HB" ]; then
     # Say what was found before the attempt is removed: this is the only trace.
-    if [ -x "$HB" ]; then
-      echo "Hermes answered '--version' with:" >&2
-      "$HB" --version 2>&1 | head -8 >&2 || true
-    else
-      echo "No launcher at $HB. Found in $AGENT_DIR:" >&2
-      ls -A "$AGENT_DIR" 2>&1 | head -12 >&2 || true
-      ls "$AGENT_DIR/venv/bin" 2>&1 | head -12 >&2 || true
-      ls -A "$HH/bin" 2>&1 | head -8 >&2 || true
-    fi
+    echo "No Hermes launcher answered '--version'. Found in $AGENT_DIR:" >&2
+    ls -A "$AGENT_DIR" 2>&1 | head -12 >&2 || true
+    ls -A "$AGENT_DIR/.hermes/bin" "$AGENT_DIR/venv/bin" "$HH/bin" 2>&1 | head -16 >&2 || true
     cleanup_fresh_agent_attempt
     echo "ERROR: Hermes Agent did not pass its health check; fresh attempt artifacts were removed." >&2
     exit 1
   fi
 fi
 
-# Python that owns the Hermes environment (its configuration API included).
+# Two interpreters, because Hermes no longer guarantees one that does both.
+# VP does setup's own plain work (links, units, probes) and is recorded for
+# later runs. HP can import Hermes and its configuration API: with an older
+# install that is the same venv interpreter; with a current one it is a
+# wrapper around the command Hermes itself publishes for launching code.
 VP="$HH/hermes-agent/venv/bin/python3"
 [ -x "$VP" ] || VP="$HH/hermes-agent/venv/bin/python"
+STORE_PY=""
 if [ ! -x "$VP" ]; then
-  HB_REAL="$HB"
-  if command -v realpath >/dev/null 2>&1; then
-    HB_REAL="$(realpath "$HB" 2>/dev/null || printf '%s' "$HB")"
-  fi
-  if ! HB_DIR="$(CDPATH='' cd -- "$(dirname -- "$HB_REAL")" 2>/dev/null && pwd -P)"; then
-    HB_DIR="$(dirname -- "$HB_REAL")"
-  fi
-  VP="$HB_DIR/python3"
-  [ -x "$VP" ] || VP="$HB_DIR/python"
+  # The interpreter Hermes' launcher runs, as it reports it.
+  STORE_PY="$("$HB" --print-runtime-command 2>/dev/null | sed -n 's/^\["\([^"]*\)".*/\1/p' | head -1)"
+  [ -x "$STORE_PY" ] || STORE_PY=""
+  VP="$STORE_PY"
 fi
-[ -x "$VP" ] || VP="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$VP" ] || [ ! -x "$VP" ]; then
+  VP="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+fi
 if [ -z "$VP" ] || [ ! -x "$VP" ]; then
   echo "ERROR: Hermes has no usable Python interpreter; repair the Hermes installation first."
   exit 1
+fi
+
+HP="$VP"
+HP_DIR=""
+if [ -n "$STORE_PY" ]; then
+  HP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-python.XXXXXX")" || {
+    echo "ERROR: cannot create a private folder for Hermes' interpreter."
+    exit 1
+  }
+  chmod 700 "$HP_DIR"
+  if "$STORE_PY" -I - "$HP_DIR/python" "$HB" <<'PY_HERMES_PYTHON'
+import json, shlex, subprocess, sys
+
+target, launcher = sys.argv[1:]
+reported = subprocess.run(
+    [launcher, "--print-runtime-command"], capture_output=True, text=True, timeout=120, check=True
+).stdout
+command = json.loads(reported)
+python, code = command[0], command[3]
+# Hermes' launch command ends by running a module; run the caller's code instead,
+# after the same preparation (isolated mode, install on the path, bootstrap).
+head = code[: code.rindex("runpy.run_module(")].rstrip().rstrip(";")
+driver = """
+_a = sys.argv[1:]
+if _a[:1] == ['-']:
+    _src = sys.stdin.read()
+    sys.argv = ['-'] + _a[1:]
+elif _a[:1] == ['-c']:
+    _src = _a[1]
+    sys.argv = ['-c'] + _a[2:]
+else:
+    _src = open(_a[0], encoding='utf-8').read()
+    sys.argv = _a
+exec(compile(_src, sys.argv[0], 'exec'), {'__name__': '__main__'})
+"""
+with open(target, "w", encoding="utf-8") as wrapper:
+    wrapper.write("#!/bin/sh\nexec %s -I -c %s \"$@\"\n" % (shlex.quote(python), shlex.quote(head + "\n" + driver)))
+PY_HERMES_PYTHON
+  then
+    chmod 700 "$HP_DIR/python"
+    HP="$HP_DIR/python"
+  else
+    rm -rf -- "$HP_DIR"
+    HP_DIR=""
+    echo "ERROR: Hermes did not describe how to run code with its libraries; repair the Hermes installation first."
+    exit 1
+  fi
 fi
 
 TRANSACTION_PENDING=0
@@ -1030,7 +1087,7 @@ rollback_private_firewall() {
 rollback_dashboard_access() {
   [ -n "$TRANSACTION_DIR" ] || return 0
   [ -f "$TRANSACTION_DIR/dashboard-access.previous.json" ] || return 0
-  HERMES_HOME="$HH" "$VP" - "$TRANSACTION_DIR/dashboard-access.previous.json" >/dev/null 2>&1 <<'PY_DASH_RESTORE'
+  HERMES_HOME="$HH" "$HP" - "$TRANSACTION_DIR/dashboard-access.previous.json" >/dev/null 2>&1 <<'PY_DASH_RESTORE'
 import json, pathlib, sys
 
 from hermes_cli.config import load_config, save_config
@@ -1779,7 +1836,7 @@ PY
 }
 
 stage_gateway_systemd_unit() {
-  if ! "$VP" - "$SYSTEMD_STAGE/hermes-gateway.service" <<'PY'
+  if ! "$HP" - "$SYSTEMD_STAGE/hermes-gateway.service" <<'PY'
 import pathlib, sys
 
 from hermes_cli.gateway import generate_systemd_unit
@@ -1989,7 +2046,7 @@ if ! stop_named_service dashboard >/dev/null 2>&1; then
 fi
 DASH_ACCESS_STATE="$TRANSACTION_DIR/dashboard-access.state"
 DASH_ACCESS_PREVIOUS="$TRANSACTION_DIR/dashboard-access.previous.json"
-if ! HERMES_HOME="$HH" "$VP" - "$ACTION" "$HH" "$DASH_LOGIN_FILE" "$DASH_ACCESS_STATE" "$DASH_ACCESS_PREVIOUS" <<'PY_DASH_ACCESS'
+if ! HERMES_HOME="$HH" "$HP" - "$ACTION" "$HH" "$DASH_LOGIN_FILE" "$DASH_ACCESS_STATE" "$DASH_ACCESS_PREVIOUS" <<'PY_DASH_ACCESS'
 import json, os, pathlib, secrets, sys
 
 action, home, login_path, state_path, previous_path = sys.argv[1:]

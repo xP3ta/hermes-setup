@@ -63,6 +63,7 @@ jobs:
         run: |
           python3 tests/no-bridge_test.py
           python3 tests/no-bridge-install_test.py
+          python3 tests/new-hermes-layout_test.py
 
       # LEGACY, removed with Console 1.2.17. The Mobile Bridge is no longer
       # installed, but its file and manifest stay published for apps older than
