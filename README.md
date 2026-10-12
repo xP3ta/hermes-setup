@@ -4,7 +4,7 @@ One-command installer that connects a self-hosted [Hermes Agent](https://hermes-
 
 ## Install
 
-Linux, macOS, Termux and other Unix hosts:
+Linux, macOS and other Unix hosts:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-mobile-setup.sh | sh
@@ -152,7 +152,7 @@ you still choose the AI provider/model from Hermes Console's Dashboard.
 | Windows Server 2022 | CI runner: the same reviewer suite |
 | Debian 13 (systemd 257) | Native host: full install, idempotent rerun, authenticated probes, contract suite |
 | macOS (Apple Silicon) | CI runner: POSIX syntax under BSD `/bin/sh`, the contract suite, a real `launchctl` lifecycle test driven by the installer's own functions, and a full isolated install with authenticated probes |
-| macOS (Intel), Linux ARM64/Termux, Windows ARM64 | **Not validated natively.** Supported by code and unit tests only; treat them as unproven until they run the same gates |
+| macOS (Intel), Linux ARM64, Windows ARM64 | **Not validated natively.** Supported by code and unit tests only; treat them as unproven until they run the same gates |
 
 The macOS row exists because "it works on Linux" is not evidence for macOS: it
 uses launchd instead of systemd, a BSD userland, and neither `systemd-analyze`

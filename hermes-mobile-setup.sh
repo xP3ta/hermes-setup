@@ -1,5 +1,5 @@
 #!/bin/sh
-# Hermes Console — verified Unix setup (Linux, macOS, Termux and explicit WSL).
+# Hermes Console — verified Unix setup (Linux, macOS and explicit WSL).
 # Native Windows uses hermes-mobile-setup.ps1 from the same public repository.
 #
 # It prepares the two services of Hermes itself that the app talks to, the
