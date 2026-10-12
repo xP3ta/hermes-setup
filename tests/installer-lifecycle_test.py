@@ -169,5 +169,117 @@ class LockTests(unittest.TestCase):
                 holder.wait()
 
 
+class SystemdUnitTests(unittest.TestCase):
+    """Hermes' own gateway unit, in the form current Hermes writes and the old one."""
+
+    NEW = (
+        "[Unit]\nDescription=Hermes\n[Service]\nType=simple\n"
+        'ExecStart="{agent}/.hermes/bin/hermes" "gateway" "run"\n'
+        "WorkingDirectory={home}\n"
+        'Environment="HERMES_HOME={home}"\n'
+        'ExecStop=-"{agent}/.hermes/bin/hermes" "--run-module" "gateway.systemd_stop_mark"\n'
+        "[Install]\nWantedBy=default.target\n"
+    )
+    OLD = NEW.replace(
+        '"{agent}/.hermes/bin/hermes" "gateway" "run"',
+        '"{agent}/venv/bin/python" "-m" "hermes_cli.main" "gateway" "run"',
+        1,
+    )
+
+    def _stage(self, unit_text: str):
+        source = SETUP.read_text(encoding="utf-8")
+        match = re.search(r"^stage_gateway_systemd_unit\(\) \{\n.*?^\}\n", source, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory(prefix="hermes-unit-") as raw:
+            temp = pathlib.Path(raw)
+            home = temp / "home"
+            agent = home / "hermes-agent"
+            package = temp / "py" / "hermes_cli"
+            package.mkdir(parents=True)
+            home.mkdir()
+            (package / "__init__.py").write_text("")
+            (package / "gateway.py").write_text(
+                "def generate_systemd_unit(system=False):\n    return %r\n"
+                % unit_text.format(agent=agent, home=home, foreign="/opt/other")
+            )
+            stage = temp / "stage"
+            stage.mkdir()
+            script = (
+                "set -u\n" + match.group(0)
+                + f'HP=python3\nSYSTEMD_STAGE={stage}\nHH={home}\nAGENT_DIR={agent}\n'
+                + "BIND_HOST=127.0.0.1\nGATEWAY_PORT=1\nstage_gateway_systemd_unit\n"
+            )
+            done = subprocess.run(
+                ["sh", "-c", script], text=True, capture_output=True, timeout=30,
+                env={**os.environ, "PYTHONPATH": str(temp / "py")},
+            )
+            return done, (stage / "hermes-gateway.service").exists()
+
+    def test_current_and_old_forms_are_accepted(self) -> None:
+        for name, text in (("current", self.NEW), ("old", self.OLD)):
+            done, staged = self._stage(text)
+            self.assertEqual(done.returncode, 0, (name, done.stdout, done.stderr))
+            self.assertTrue(staged, name)
+
+    def test_what_matters_for_safety_is_still_refused(self) -> None:
+        cases = {
+            "program outside the install": self.NEW.replace('"{agent}/.hermes/bin/hermes"', '"{foreign}/hermes"', 1),
+            "not the gateway": self.NEW.replace('"gateway" "run"', '"dashboard"', 1),
+            "another home": self.NEW.replace('HERMES_HOME={home}', 'HERMES_HOME={foreign}', 1),
+            "a system unit": self.NEW.replace("[Service]\n", "[Service]\nUser=root\n", 1),
+            "an inline interpreter": self.NEW.replace('"gateway" "run"', '"-c" "x" "gateway" "run"', 1),
+        }
+        for name, text in cases.items():
+            done, staged = self._stage(text)
+            self.assertNotEqual(done.returncode, 0, name)
+            self.assertFalse(staged, name)
+            self.assertIn("invalid gateway user unit", done.stderr + done.stdout, name)
+
+    def test_rollback_does_not_count_a_unit_that_was_never_installed(self) -> None:
+        source = SETUP.read_text(encoding="utf-8")
+        match = re.search(r"^rollback_transaction\(\) \{\n.*?^\}\n", source, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory(prefix="hermes-rollback-") as raw:
+            temp = pathlib.Path(raw)
+            bin_dir = temp / "bin"
+            bin_dir.mkdir()
+            # systemd that has never heard of the units: show says not-found, stop fails with 5.
+            (bin_dir / "systemctl").write_text(
+                '#!/bin/sh\ncase "$*" in *show*) echo not-found ;; *stop*) exit 5 ;; esac\nexit 0\n'
+            )
+            (bin_dir / "systemctl").chmod(0o700)
+            script = (
+                "TRANSACTION_PENDING=1\nSERVICE_LIFECYCLE_TOUCHED=1\nSERVICE_MANAGER=systemd\n"
+                "TRANSACTION_DIR=x\nTRANSACTION_KEYS=\n"
+                + "rollback_private_firewall() { return 0; }\nrollback_dashboard_access() { return 0; }\n"
+                + "restore_systemd_state() { return 0; }\ncleanup_transaction_backups() { return 0; }\n"
+                + match.group(0) + "rollback_transaction\n"
+            )
+            done = subprocess.run(
+                ["sh", "-c", script], text=True, capture_output=True, timeout=30,
+                env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertNotIn("incomplete", done.stderr)
+
+    def test_no_exit_is_silent(self) -> None:
+        source = SETUP.read_text(encoding="utf-8")
+        parts = []
+        for name in ("systemd_diagnostics", "cleanup_setup"):
+            match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", source, re.MULTILINE | re.DOTALL)
+            self.assertIsNotNone(match, name)
+            parts.append(match.group(0))
+        script = (
+            "set -eu\nSETUP_PROGRESS_LABEL='Starting Hermes in the background'\n"
+            "SERVICE_LIFECYCLE_TOUCHED=0\nSERVICE_MANAGER=systemd\n" + "".join(parts)
+            + "trap cleanup_setup EXIT\nfalse\n"
+        )
+        done = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=30)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("Setup stopped during", done.stderr)
+        self.assertIn("Starting Hermes in the background", done.stderr)
+        self.assertIn("exit code 1", done.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

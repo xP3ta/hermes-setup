@@ -192,7 +192,29 @@ release_setup_lock() {
   SETUP_LOCK_HELD=0
 }
 
+# What systemd itself says about the two services, for when one did not come up.
+systemd_diagnostics() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  for diag_unit in hermes-gateway hermes-dashboard; do
+    echo "--- systemctl --user status $diag_unit" >&2
+    systemctl --user status "$diag_unit" --no-pager 2>&1 | sed -n '1,14p' >&2 || true
+    if command -v journalctl >/dev/null 2>&1; then
+      echo "--- journalctl --user -u $diag_unit (last 40 lines)" >&2
+      journalctl --user -u "$diag_unit" -n 40 --no-pager 2>&1 | tail -n 40 >&2 || true
+    fi
+  done
+}
+
 cleanup_setup() {
+  setup_exit_status=$?
+  # No exit is silent: whatever stopped the run, the step it stopped in and the
+  # exit code are said before anything is rolled back.
+  if [ "$setup_exit_status" -ne 0 ]; then
+    echo "Setup stopped during \"${SETUP_PROGRESS_LABEL:-startup}\" (exit code $setup_exit_status); changes made so far are being rolled back." >&2
+    if [ "${SERVICE_LIFECYCLE_TOUCHED:-0}" -eq 1 ] && [ "${SERVICE_MANAGER:-}" = "systemd" ]; then
+      systemd_diagnostics
+    fi
+  fi
   if command -v rollback_transaction >/dev/null 2>&1; then
     rollback_transaction
   fi
@@ -1260,6 +1282,11 @@ rollback_transaction() {
     case "$SERVICE_MANAGER" in
       systemd)
         for name in gateway dashboard; do
+          # A unit this attempt never got to install is already stopped: asking
+          # systemd to stop what it does not know fails, and must not count as
+          # a rollback that could not be completed.
+          unit_state="$(systemctl --user show -p LoadState --value "hermes-$name" 2>/dev/null || true)"
+          [ "$unit_state" != "not-found" ] || continue
           if ! systemctl --user stop "hermes-$name" >/dev/null 2>&1; then rollback_failed=1; fi
         done
         ;;
@@ -1977,16 +2004,63 @@ pathlib.Path(unit).write_text(payload, encoding="utf-8")
 PY
 }
 
+# The unit is Hermes' own, so its form follows Hermes: current installs start
+# "<install dir>/.hermes/bin/hermes" gateway run, older ones "<venv python>" -m
+# hermes_cli.main gateway run. What is checked is what keeps this safe, not one
+# layout: it is a user unit, its program lives in this install or in this home,
+# it runs the gateway, and it is bound to this Hermes home.
 stage_gateway_systemd_unit() {
-  if ! "$HP" - "$SYSTEMD_STAGE/hermes-gateway.service" <<'PY'
-import pathlib, sys
+  if ! "$HP" - "$SYSTEMD_STAGE/hermes-gateway.service" "$HH" "$AGENT_DIR" <<'PY'
+import os, pathlib, shlex, sys
+
+path = pathlib.Path(sys.argv[1])
+home = os.path.abspath(sys.argv[2])
+agent = os.path.abspath(sys.argv[3])
 
 from hermes_cli.gateway import generate_systemd_unit
 
-path = pathlib.Path(sys.argv[1])
 unit = generate_systemd_unit(system=False)
-if not unit.startswith("[Unit]\n") or "hermes_cli.main" not in unit:
-    raise SystemExit("Hermes generated an invalid gateway user unit")
+
+
+def refuse(reason):
+    raise SystemExit("Hermes generated an invalid gateway user unit: " + reason)
+
+
+if not unit.startswith("[Unit]\n"):
+    refuse("it is not a unit file")
+exec_lines = [l[len("ExecStart="):] for l in unit.splitlines() if l.startswith("ExecStart=")]
+if len(exec_lines) != 1:
+    refuse("it has %d ExecStart lines" % len(exec_lines))
+# systemd quoting: "..." with \\ and \" escapes, %% and $$ for specifiers.
+try:
+    argv = shlex.split(exec_lines[0].replace("%%", "%").replace("$$", "$"))
+except ValueError:
+    refuse("ExecStart cannot be read")
+if not argv or not os.path.isabs(argv[0]):
+    refuse("ExecStart does not name an absolute program")
+
+
+def inside(candidate, root):
+    candidate = os.path.abspath(candidate)
+    for base in {root, os.path.realpath(root)}:
+        if candidate == base or candidate.startswith(base + os.sep):
+            return True
+    return False
+
+
+if not (inside(argv[0], agent) or inside(argv[0], home)):
+    refuse("its program is outside this Hermes install and home")
+rest = argv[1:]
+old_form = rest[:2] == ["-m", "hermes_cli.main"] and "gateway" in rest and rest[-1] == "run"
+new_form = rest[-2:] == ["gateway", "run"] and "-m" not in rest and "-c" not in rest
+if not (old_form or new_form):
+    refuse("it does not run the gateway")
+bound = [l for l in unit.splitlines() if l.startswith('Environment="HERMES_HOME=')]
+for line in bound:
+    if os.path.realpath(line[len('Environment="HERMES_HOME='):-1]) != os.path.realpath(home):
+        refuse("it is bound to another Hermes home")
+if any(l.startswith(("User=", "Group=")) for l in unit.splitlines()):
+    refuse("it is not a user unit")
 path.write_text(unit, encoding="utf-8")
 PY
   then
@@ -2182,9 +2256,18 @@ SERVICE_LIFECYCLE_TOUCHED=1
 case "$SERVICE_MANAGER" in
   systemd)
     install_verified_systemd_units
-    systemctl --user daemon-reload
-    systemctl --user enable hermes-gateway hermes-dashboard >/dev/null 2>&1
-    systemctl --user restart hermes-gateway
+    if ! systemctl --user daemon-reload; then
+      echo "ERROR: systemd did not reload its user units."
+      exit 1
+    fi
+    if ! systemctl --user enable hermes-gateway hermes-dashboard; then
+      echo "ERROR: systemd would not enable the Hermes services (its answer is above)."
+      exit 1
+    fi
+    if ! systemctl --user restart hermes-gateway; then
+      echo "ERROR: systemd could not start the Hermes Gateway."
+      exit 1
+    fi
     ;;
   launchd)
     install_launchd_job gateway dev.xpetalab.hermes-console.gateway "$GATEWAY_RUNNER" yes yes
