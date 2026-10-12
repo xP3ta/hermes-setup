@@ -30,16 +30,16 @@ set -e
 # y explicitas para que la redaccion nunca se coma la salida.
 redact() {
   sed -e 's/token=[^& ]*/token=REDACTED/g' \
-      -e 's/bridge_token=[^& ]*/bridge_token=REDACTED/g' \
+      -e 's/dash_pass=[^& ]*/dash_pass=REDACTED/g' \
+      -e 's/password: .*/password: REDACTED/' \
       -e 's/API_SERVER_KEY=[^ ]*/API_SERVER_KEY=REDACTED/g' \
-      -e 's/BRIDGE_TOKEN=[^ ]*/BRIDGE_TOKEN=REDACTED/g' \
       -e 's/password=[^ ]*/password=REDACTED/g' \
       -e 's|hermes://pair?[^ ]*|hermes://pair?REDACTED|g'
 }
 if [ "$RC" -ne 0 ]; then
   echo "== ultimas lineas del instalador =="
   tail -40 "$LOG" | redact
-  for svc in gateway dashboard bridge; do
+  for svc in gateway dashboard; do
     log="$HERMES_HOME/logs/$svc.log"
     echo "== $svc.log =="
     if [ -f "$log" ]; then
@@ -67,7 +67,8 @@ else
 fi
 check "the installer exits 0 on native macOS" "$RC"
 
-LABELS="dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard dev.xpetalab.hermes-console.bridge"
+LABELS="dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard"
+BRIDGE_LABEL="dev.xpetalab.hermes-console.bridge"
 UID_NUM="$(id -u)"
 for label in $LABELS; do
   if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
@@ -81,15 +82,13 @@ PAIR_ENV="$HERMES_HOME/console-services/pairing.env"
 if [ -f "$PAIR_ENV" ]; then
   check "the pairing record is written" 0
   GATEWAY_BASE="$(sed -n 's/^GATEWAY_BASE=//p' "$PAIR_ENV" | head -1)"
-  BRIDGE_BASE="$(sed -n 's/^BRIDGE_BASE=//p' "$PAIR_ENV" | head -1)"
   DASHBOARD_BASE="$(sed -n 's/^DASHBOARD_BASE=//p' "$PAIR_ENV" | head -1)"
   KEY="$(sed -n 's/^API_SERVER_KEY=//p' "$HERMES_HOME/.env" | head -1)"
   check "the pairing record is mode 600" "$([ "$(stat -f '%Lp' "$PAIR_ENV")" = "600" ] && echo 0 || echo 1)"
-  # El probe real del producto contra los tres servicios, con token.
-  for url in "$GATEWAY_BASE" "$BRIDGE_BASE" "$DASHBOARD_BASE"; do
+  # El probe real del producto contra los dos servicios, con token.
+  for url in "$GATEWAY_BASE" "$DASHBOARD_BASE"; do
     case "$url" in
       "$GATEWAY_BASE") path="/health" ;;
-      "$BRIDGE_BASE") path="/bridge/health" ;;
       *) path="/api/status" ;;
     esac
     CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H "Authorization: Bearer $KEY" "${url}${path}" || echo 000)"
@@ -104,9 +103,40 @@ if [ -f "$PAIR_ENV" ]; then
   CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "${DASHBOARD_BASE}/api/model/options" || echo 000)"
   check "an unauthenticated request to a protected route is rejected (got $CODE)" \
     "$([ "$CODE" = "401" ] || [ "$CODE" = "403" ] && echo 0 || echo 1)"
+  # The sign-in that went into the code is the one the Dashboard accepts.
+  LOGIN_FILE="$HERMES_HOME/console-services/dashboard-login.json"
+  if [ -f "$LOGIN_FILE" ]; then
+    check "the Dashboard sign-in record is mode 600" "$([ "$(stat -f '%Lp' "$LOGIN_FILE")" = "600" ] && echo 0 || echo 1)"
+    BODY="$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(json.dumps({"provider":"basic","username":v["username"],"password":v["password"]}))' "$LOGIN_FILE")"
+    CODE="$(printf '%s' "$BODY" | curl -s -o /dev/null -w '%{http_code}' -m 10 -H 'Content-Type: application/json' --data-binary @- "${DASHBOARD_BASE}/auth/password-login" || echo 000)"
+    check "the Dashboard accepts the sign-in carried by the code (got $CODE)" "$([ "$CODE" = "200" ] && echo 0 || echo 1)"
+  else
+    check "the Dashboard sign-in record is written" 1
+  fi
+  check "the code carries the Dashboard sign-in" "$(grep -q 'dash_user=' "$LOG" && grep -q 'dash_pass=' "$LOG" && echo 0 || echo 1)"
 else
   check "the pairing record is written" 1
 fi
+
+# Setup installs no Mobile Bridge, and retiring one that is not there is a no-op.
+if launchctl print "gui/$UID_NUM/$BRIDGE_LABEL" >/dev/null 2>&1 || \
+   [ -e "$HOME/Library/LaunchAgents/$BRIDGE_LABEL.plist" ] || [ -e "$HERMES_HOME/hermes_bridge.py" ]; then
+  check "no Mobile Bridge is installed" 1
+else
+  check "no Mobile Bridge is installed" 0
+fi
+set +e
+sh "$SETUP" --retire-bridge > "$WORK/retire.log" 2>&1
+RETIRE_RC=$?
+set -e
+check "--retire-bridge succeeds with nothing to remove" "$RETIRE_RC"
+for label in $LABELS; do
+  if launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+    check "$label is still loaded after --retire-bridge" 0
+  else
+    check "$label is still loaded after --retire-bridge" 1
+  fi
+done
 
 say "== limpieza: descargando los jobs y quitando los plists =="
 for label in $LABELS; do

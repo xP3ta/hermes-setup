@@ -1,4 +1,5 @@
-# Hermes Console - verify all native Windows services, then reprint pairing QR.
+# Hermes Console - check the native Windows services, then show the code again.
+# It reads; without -Repair it never installs, repairs or changes anything.
 param([switch]$Repair)
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +17,7 @@ $HermesHome = if ($env:HERMES_HOME) {
 }
 $EnvFile = Join-Path $HermesHome ".env"
 $PairingFile = Join-Path $HermesHome "console-services\pairing.json"
+$DashLoginFile = Join-Path $HermesHome "console-services\dashboard-login.json"
 $Python = Join-Path $HermesHome "hermes-agent\venv\Scripts\python.exe"
 
 function Get-ApiKey {
@@ -154,8 +156,26 @@ function Invoke-HermesJsonRequest {
     }
 }
 
+function Test-DashboardSignIn([string]$BaseUrl, [string]$LoginPath) {
+    # True only when the Dashboard accepts the sign-in on record, by signing in.
+    try {
+        $login = Get-Content -LiteralPath $LoginPath -Raw | ConvertFrom-Json
+        if (-not $login.username -or -not $login.password) { return $false }
+        $body = [ordered]@{
+            provider = "basic"
+            username = [string]$login.username
+            password = [string]$login.password
+        } | ConvertTo-Json -Compress
+        [void](Invoke-HermesJsonRequest -Method Post `
+            -Url ($BaseUrl.TrimEnd('/') + "/auth/password-login") -Body $body -TimeoutSeconds 6)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Test-HermesService(
-    [ValidateSet("gateway", "bridge", "dashboard")][string]$Kind,
+    [ValidateSet("gateway", "dashboard")][string]$Kind,
     [string]$BaseUrl,
     [string]$Token
 ) {
@@ -168,15 +188,6 @@ function Test-HermesService(
             }
             $sessions = Invoke-HermesJsonRequest -Method Get -Url "$base/api/sessions" -Token $Token -TimeoutSeconds 6
             return $sessions.object -eq "list" -and $null -ne $sessions.data
-        }
-        if ($Kind -eq "bridge") {
-            $health = Invoke-HermesJsonRequest -Method Get -Url "$base/bridge/health" -TimeoutSeconds 6
-            if ($health.status -ne "ok" -or -not $health.version) { return $false }
-            $caps = Invoke-HermesJsonRequest -Method Get -Url "$base/bridge/capabilities" -Token $Token -TimeoutSeconds 6
-            return ($caps.object -eq "hermes.bridge.capabilities") -and
-                ($caps.operations.self_update -eq $true) -and
-                (@($caps.scopes) -contains "read") -and
-                (@($caps.scopes) -contains "config")
         }
         $status = Invoke-HermesJsonRequest -Method Get -Url "$base/api/status" -TimeoutSeconds 6
         return [bool]$status.version -and $status.gateway_running -eq $true
@@ -276,7 +287,9 @@ try {
     Require-ExplicitRepair "The saved pairing record is unreadable."
     return
 }
-if ($pairing.schema -ne 1) {
+# Schema 1 was written by a setup that also installed the Mobile Bridge. Its
+# Gateway and Dashboard addresses are the same ones, so it is still good.
+if ($pairing.schema -notin @(1, 2)) {
     Require-ExplicitRepair "The saved pairing record is outdated."
     return
 }
@@ -299,18 +312,16 @@ $gateway = if ($env:HERMES_PAIR_HOST -or $env:HERMES_PAIR_SCHEME -or $env:HERMES
 } else { [string]$pairing.gateway }
 # Los defaults respetan los overrides de puerto del setup, o el enlace mostraria
 # puertos que no son los que escucha esta maquina.
-$dashboardPort = if ($env:HERMES_DASHBOARD_PORT) { $env:HERMES_DASHBOARD_PORT } else { "9119" }
-$bridgePort = if ($env:HERMES_BRIDGE_PORT) { $env:HERMES_BRIDGE_PORT } else { "9131" }
+$dashboardPort = if ($env:HERMES_DASHBOARD_PORT) {
+    $env:HERMES_DASHBOARD_PORT
+} elseif ($pairing.PSObject.Properties["dashboard_port"] -and $pairing.dashboard_port) {
+    [string]$pairing.dashboard_port
+} else { "9119" }
 $dashboard = if ($env:HERMES_DASHBOARD_URL) {
     $env:HERMES_DASHBOARD_URL.TrimEnd('/')
 } elseif ($env:HERMES_PAIR_HOST -or $env:HERMES_PAIR_SCHEME -or $env:HERMES_PAIR_PORT) {
     if ($scheme -eq "https") { $gateway } else { "http://$($baseHost):$dashboardPort" }
 } else { [string]$pairing.dashboard }
-$bridge = if ($env:HERMES_BRIDGE_URL) {
-    $env:HERMES_BRIDGE_URL.TrimEnd('/')
-} elseif ($env:HERMES_PAIR_HOST -or $env:HERMES_PAIR_SCHEME -or $env:HERMES_PAIR_PORT) {
-    if ($scheme -eq "https") { $gateway } else { "http://$($baseHost):$bridgePort" }
-} else { [string]$pairing.bridge }
 
 $expectedGateway = "$($scheme)://$($baseHost):$port"
 if ($gateway -ne $expectedGateway) {
@@ -318,11 +329,9 @@ if ($gateway -ne $expectedGateway) {
 }
 Assert-AllowedServiceUrl $gateway
 Assert-AllowedServiceUrl $dashboard
-Assert-AllowedServiceUrl $bridge
 
 foreach ($service in @(
     @{ Kind = "gateway"; Url = $gateway },
-    @{ Kind = "bridge"; Url = $bridge },
     @{ Kind = "dashboard"; Url = $dashboard }
 )) {
     if (-not (Test-HermesService $service.Kind $service.Url $ApiKey)) {
@@ -335,18 +344,35 @@ $query = @(
     "port=$port"
     "token=$([Uri]::EscapeDataString($ApiKey))"
     "dashboard=$([Uri]::EscapeDataString($dashboard))"
-    "bridge=$([Uri]::EscapeDataString($bridge))"
-    "bridge_token=$([Uri]::EscapeDataString($ApiKey))"
 )
+# The Dashboard sign-in that setup left on record goes into the code only while
+# the Dashboard still accepts it, checked by signing in for real.
+$carriesSignIn = (Test-Path -LiteralPath $DashLoginFile) -and (Test-DashboardSignIn $dashboard $DashLoginFile)
+if ($carriesSignIn) {
+    $dashboardLogin = Get-Content -LiteralPath $DashLoginFile -Raw | ConvertFrom-Json
+    $query += "dash_user=$([Uri]::EscapeDataString([string]$dashboardLogin.username))"
+    $query += "dash_pass=$([Uri]::EscapeDataString([string]$dashboardLogin.password))"
+    $dashboardLogin = $null
+}
 if ($scheme -eq "https") { $query += "https=1" }
 $link = "hermes://pair?" + ($query -join "&")
 
 Write-Host ""
-Write-Host "== SCAN THIS QR WITH HERMES CONSOLE (or copy the link) ==" -ForegroundColor Yellow
+Write-Host "== SCAN THIS CODE WITH HERMES CONSOLE ==" -ForegroundColor Yellow
 Write-Host ""
 if (-not (Render-Qr $link)) {
-    Write-Warning "A QR renderer could not be prepared. Paste the verified link below."
+    Write-Warning "The code could not be drawn here. Copy the link below and paste it in the app instead."
 }
 Write-Host ""
+Write-Host "No camera? Copy this link and paste it in the app (Scan, then Paste link):"
 Write-Host "Link: $link"
-Write-Host "Gateway, Dashboard and Mobile Bridge passed their functional checks."
+Write-Host ""
+Write-Host "Gateway (chat) took your key. Dashboard answered."
+if ($carriesSignIn) {
+    Write-Host "The code carries your Dashboard sign-in: the app connects in one step."
+} else {
+    Write-Host "The code does not carry a Dashboard password: the app will ask you for it once."
+    Write-Host "Forgot it? This makes a new sign-in and shows a new code:"
+    Write-Host "  & ([scriptblock]::Create((irm $RepoRaw/hermes-mobile-setup.ps1))) -NewAccess"
+}
+Write-Host "Keep the code and the link private: whoever has them can use your Hermes."

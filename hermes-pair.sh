@@ -1,5 +1,6 @@
 #!/bin/sh
-# Hermes Console — verify the installed services, then reprint pairing QR.
+# Hermes Console — check the installed services, then show the code again.
+# It reads; it never installs, repairs or changes anything.
 set -eu
 
 REPO_RAW="${HERMES_REPO_RAW:-https://raw.githubusercontent.com/xP3ta/hermes-setup/main}"
@@ -22,6 +23,7 @@ HH="${HERMES_HOME:-$HOME/.hermes}"
 SERVICES="$HH/console-services"
 PAIR_ENV="$SERVICES/pairing.env"
 PROBE="$SERVICES/hermes-service-probe.py"
+DASH_LOGIN_FILE="$SERVICES/dashboard-login.json"
 KEY="$(sed -n 's/^API_SERVER_KEY=//p' "$HH/.env" 2>/dev/null | head -1 | tr -d '[:space:]' | sed 's/^["'\'']//;s/["'\'']$//')"
 if [ -z "$KEY" ]; then
   echo "No API token found in $HH/.env — run setup first:"
@@ -39,11 +41,16 @@ read_setting() {
   sed -n "s/^$name=//p" "$PAIR_ENV" | head -1
 }
 
-if [ "$(read_setting PAIRING_SCHEMA)" != "1" ]; then
-  echo "This pairing record is not from the verified installer. Run setup once to repair it:"
-  echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh"
-  exit 1
-fi
+# Schema 1 was written by a setup that also installed the Mobile Bridge. Its
+# Gateway and Dashboard addresses are the same ones, so it is still good.
+case "$(read_setting PAIRING_SCHEMA)" in
+  1|2) ;;
+  *)
+    echo "This pairing record is not from the verified installer. Run setup once to repair it:"
+    echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh"
+    exit 1
+    ;;
+esac
 USE_EPHEMERAL_PROBE=""
 if [ "$(read_setting PROBE_SECURITY_SCHEMA)" != "2" ] || [ ! -f "$PROBE" ]; then
   USE_EPHEMERAL_PROBE=1
@@ -54,7 +61,11 @@ PAIR_SCHEME="${HERMES_PAIR_SCHEME:-$(read_setting PAIR_SCHEME)}"
 PAIR_PORT="${HERMES_PAIR_PORT:-$(read_setting PAIR_PORT)}"
 GATEWAY_BASE="$(read_setting GATEWAY_BASE)"
 DASHBOARD_BASE="${HERMES_DASHBOARD_URL:-$(read_setting DASHBOARD_BASE)}"
-BRIDGE_BASE="${HERMES_BRIDGE_URL:-$(read_setting BRIDGE_BASE)}"
+# The Dashboard port setup used; records written before it was stored mean 9119.
+DASHBOARD_PORT="$(read_setting DASHBOARD_PORT)"
+case "$DASHBOARD_PORT" in
+  *[!0-9]*|'') DASHBOARD_PORT=9119 ;;
+esac
 
 case "$HOST" in
   *[!A-Za-z0-9._:-]*|*/*|'')
@@ -79,11 +90,9 @@ case "$BASE_HOST" in *:*) BASE_HOST="[$BASE_HOST]" ;; esac
 if [ -n "${HERMES_PAIR_HOST:-}" ] || [ -n "${HERMES_PAIR_SCHEME:-}" ] || [ -n "${HERMES_PAIR_PORT:-}" ]; then
   GATEWAY_BASE="$PAIR_SCHEME://$BASE_HOST:$PAIR_PORT"
   if [ "$PAIR_SCHEME" = "http" ]; then
-    [ -n "${HERMES_DASHBOARD_URL:-}" ] || DASHBOARD_BASE="http://$BASE_HOST:9119"
-    [ -n "${HERMES_BRIDGE_URL:-}" ] || BRIDGE_BASE="http://$BASE_HOST:9131"
+    [ -n "${HERMES_DASHBOARD_URL:-}" ] || DASHBOARD_BASE="http://$BASE_HOST:$DASHBOARD_PORT"
   else
     [ -n "${HERMES_DASHBOARD_URL:-}" ] || DASHBOARD_BASE="$GATEWAY_BASE"
-    [ -n "${HERMES_BRIDGE_URL:-}" ] || BRIDGE_BASE="$GATEWAY_BASE"
   fi
 fi
 
@@ -255,31 +264,6 @@ try:
                 "/api/sessions is not the authenticated Hermes API"
             )
         assert_auth_required("/api/sessions")
-    elif kind == "bridge":
-        health = fetch("/bridge/health")
-        if health.get("status") != "ok" or not isinstance(
-            health.get("version"), str
-        ):
-            raise RuntimeError("/bridge/health is not Hermes Mobile Bridge")
-        if expected and health.get("version") != expected:
-            raise RuntimeError(
-                f"Bridge version is {health.get('version')}, expected {expected}"
-            )
-        caps = fetch("/bridge/capabilities", auth=True)
-        operations = caps.get("operations")
-        scopes = caps.get("scopes")
-        if (
-            caps.get("object") != "hermes.bridge.capabilities"
-            or not isinstance(operations, dict)
-            or operations.get("self_update") is not True
-            or not isinstance(scopes, list)
-            or "read" not in scopes
-            or "config" not in scopes
-        ):
-            raise RuntimeError(
-                "Bridge auth/config/self-update capability check failed"
-            )
-        assert_auth_required("/bridge/capabilities")
     elif kind == "dashboard":
         status = fetch("/api/status")
         if not isinstance(status.get("version"), str) or not isinstance(
@@ -310,23 +294,67 @@ verify() {
 
 # Do not display credentials for a dead, wrong or loopback-only service.
 verify gateway "$GATEWAY_BASE"
-verify bridge "$BRIDGE_BASE"
 verify dashboard "$DASHBOARD_BASE"
+
+# The Dashboard sign-in that setup left on record goes into the code only
+# while the Dashboard still accepts it, checked by signing in for real.
+LINK_LOGIN_FILE=""
+if [ -f "$DASH_LOGIN_FILE" ] && [ ! -L "$DASH_LOGIN_FILE" ]; then
+  if "$VP" - "$DASHBOARD_BASE" "$DASH_LOGIN_FILE" >/dev/null 2>&1 <<'PY_DASH_LOGIN'
+import json, pathlib, sys, urllib.error, urllib.request
+
+base, login_path = sys.argv[1:]
+login = json.loads(pathlib.Path(login_path).read_text(encoding="utf-8"))
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, url):
+        return None
+
+
+body = json.dumps(
+    {
+        "provider": "basic",
+        "username": login["username"],
+        "password": login["password"],
+    }
+).encode()
+request = urllib.request.Request(
+    base.rstrip("/") + "/auth/password-login",
+    headers={"Content-Type": "application/json"},
+    data=body,
+)
+try:
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=6) as response:
+        cookies = response.headers.get_all("Set-Cookie") or []
+        accepted = response.status == 200
+except urllib.error.HTTPError:
+    raise SystemExit(1)
+names = [item.split(";", 1)[0].split("=", 1)[0] for item in cookies]
+if not accepted or not any(name.endswith("hermes_session_at") for name in names):
+    raise SystemExit(1)
+PY_DASH_LOGIN
+  then
+    LINK_LOGIN_FILE="$DASH_LOGIN_FILE"
+  fi
+fi
 
 HTTPS_FLAG=""
 [ "$PAIR_SCHEME" != "https" ] || HTTPS_FLAG="1"
-LINK="$("$VP" - "$HOST" "$PAIR_PORT" "$KEY" "$HTTPS_FLAG" "$DASHBOARD_BASE" "$BRIDGE_BASE" <<'PY'
-import sys, urllib.parse
+LINK="$("$VP" - "$HOST" "$PAIR_PORT" "$KEY" "$HTTPS_FLAG" "$DASHBOARD_BASE" "$LINK_LOGIN_FILE" <<'PY'
+import json, pathlib, sys, urllib.parse
 
-host, port, token, https, dashboard, bridge = sys.argv[1:]
+host, port, token, https, dashboard, login_path = sys.argv[1:]
 query = {
     "host": host,
     "port": port,
     "token": token,
     "dashboard": dashboard,
-    "bridge": bridge,
-    "bridge_token": token,
 }
+if login_path:
+    login = json.loads(pathlib.Path(login_path).read_text(encoding="utf-8"))
+    query["dash_user"] = login["username"]
+    query["dash_pass"] = login["password"]
 if https:
     query["https"] = "1"
 print("hermes://pair?" + urllib.parse.urlencode(query))
@@ -334,7 +362,7 @@ PY
 )"
 
 echo ""
-echo "== SCAN THIS QR WITH HERMES CONSOLE (or copy the link) =="
+echo "== SCAN THIS CODE WITH HERMES CONSOLE =="
 echo ""
 QRPY='import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)'
 QR_RENDERED=""
@@ -347,10 +375,19 @@ else
   fi
 fi
 if [ -z "$QR_RENDERED" ]; then
-  echo "No installed QR renderer is available. Pairing did not install one or change the system."
-  echo "Paste the verified link below into Hermes Console."
+  echo "The code could not be drawn here, and this command installs nothing to draw it."
+  echo "Copy the link below and paste it in the app instead."
 fi
 echo ""
+echo "No camera? Copy this link and paste it in the app (Scan, then Paste link):"
 echo "Link: $LINK"
-echo "Gateway and Mobile Bridge accepted the valid token and rejected missing/invalid tokens."
-echo "Dashboard public health passed; this command does not claim that a Dashboard login succeeded."
+echo ""
+echo "Gateway (chat) took your key and refused a wrong one. Dashboard answered."
+if [ -n "$LINK_LOGIN_FILE" ]; then
+  echo "The code carries your Dashboard sign-in: the app connects in one step."
+else
+  echo "The code does not carry a Dashboard password: the app will ask you for it once."
+  echo "Forgot it? This makes a new sign-in and shows a new code:"
+  echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh -s -- --new-access"
+fi
+echo "Keep the code and the link private: whoever has them can use your Hermes."

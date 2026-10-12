@@ -57,8 +57,17 @@ jobs:
         shell: bash
         run: python3 tests/review-unix-security.py
 
-      # Mobile Bridge handlers in-process against a disposable home: path
-      # confinement, structured redaction, destination scopes, unique backups.
+      # Setup without the Mobile Bridge: the Dashboard sign-in decision, the
+      # code that carries it, --retire-bridge, and a whole setup against a
+      # stand-in Hermes in a disposable home (nothing is installed or fetched).
+      - name: Setup without the Mobile Bridge
+        shell: bash
+        run: |
+          python3 tests/no-bridge_test.py
+          python3 tests/no-bridge-install_test.py
+
+      # The Mobile Bridge is no longer installed, but its file stays published
+      # for apps that still update it: its handlers keep their own suite.
       - name: Review suite (Mobile Bridge)
         shell: bash
         run: |
@@ -102,7 +111,9 @@ jobs:
 
       - name: Run the contract suite on macOS
         shell: bash
-        run: python3 tests/review-unix-security.py
+        run: |
+          python3 tests/review-unix-security.py
+          python3 tests/no-bridge_test.py
 
       # launchd es otro gestor de servicios: se valida con `launchctl` real,
       # usando las propias funciones del instalador (plist, guardas de propiedad
@@ -111,7 +122,7 @@ jobs:
         shell: bash
         run: python3 tests/macos-launchd_test.py
 
-      # Instalacion completa y aislada con probes autenticados contra los tres
+      # Instalacion completa y aislada con probes autenticados contra los dos
       # servicios, para que macOS deje de ser codigo sin evidencia nativa.
       - name: Native isolated install and authenticated probes
         shell: bash
