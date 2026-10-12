@@ -197,11 +197,18 @@ function Test-HermesService(
 }
 
 function Render-Qr([string]$Link) {
+    # Draws the code in the window and answers one thing: was it drawn.
+    # The renderer writes the picture to a throwaway file that is read back as
+    # UTF-8 and printed here. Two reasons, both seen on a real Windows console:
+    # what a native program prints inside a function becomes part of the
+    # function's answer (the code was computed and never shown), and its block
+    # characters do not survive the console code page (850, 1252).
     if (-not (Test-Path -LiteralPath $Python)) { return $false }
-    $code = "import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)"
+    $code = "import io,qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();f=io.open(sys.argv[2],'w',encoding='utf-8');q.print_ascii(out=f,invert=True);f.close()"
+    $drawing = Join-Path ([IO.Path]::GetTempPath()) ("hermes-pair-code-" + [Guid]::NewGuid().ToString("N") + ".txt")
     $uv = Join-Path $HermesHome "bin\uv.exe"
     $qrProcess = $Python
-    $qrArguments = @("-c", $code, $Link)
+    $qrArguments = @("-c", $code, $Link, $drawing)
     if (Test-Path -LiteralPath $uv) {
         # Never probe or mutate the Hermes venv: reuse the pinned, isolated
         # uv QR runtime that the setup uses. Native stderr must not escape as
@@ -210,23 +217,22 @@ function Render-Qr([string]$Link) {
         # with 2>$null, aborting the script before the link prints).
         $qrProcess = $uv
         $qrArguments = @("run", "--isolated", "--no-project", "--python", $Python,
-            "--with", "qrcode==8.2", "python", "-c", $code, $Link)
+            "--with", "qrcode==8.2", "python", "-c", $code, $Link, $drawing)
     }
     $previousPreference = $ErrorActionPreference
-    $previousIoEncoding = $env:PYTHONIOENCODING
     try {
         $ErrorActionPreference = "Continue"
-        # print_ascii emits U+2588 block characters; the legacy Windows console
-        # codepage (e.g. cp1252) cannot encode them and python would die with
-        # UnicodeEncodeError instead of printing the QR.
-        $env:PYTHONIOENCODING = "utf-8"
-        & $qrProcess @qrArguments 2>$null
-        return $LASTEXITCODE -eq 0
+        & $qrProcess @qrArguments 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $drawing)) { return $false }
+        $picture = [IO.File]::ReadAllText($drawing, [Text.Encoding]::UTF8)
+        if ([string]::IsNullOrWhiteSpace($picture)) { return $false }
+        Write-Host $picture.TrimEnd()
+        return $true
     } catch {
         return $false
     } finally {
         $ErrorActionPreference = $previousPreference
-        $env:PYTHONIOENCODING = $previousIoEncoding
+        Remove-Item -LiteralPath $drawing -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -272,6 +278,20 @@ if ($env:HERMES_SETUP_REVIEW_MODE -eq "synthetic-canary") {
     return
 }
 
+# In the window a person is looking at: the seal first, and a refusal as one
+# readable block instead of PowerShell's error record. Scripts and CI (output
+# redirected) get the plain lines and the exception, as before.
+$PairLive = $false
+try { $PairLive = -not [Console]::IsOutputRedirected } catch { $PairLive = $false }
+if ($PairLive) {
+    $rule = "=" * 64
+    Write-Host ""
+    Write-Host "  $rule" -ForegroundColor DarkGray
+    Write-Host "    xPetaLab  |  HERMES CONSOLE" -ForegroundColor DarkYellow
+    Write-Host "  $rule" -ForegroundColor DarkGray
+}
+
+try {
 $ApiKey = Get-ApiKey
 if (-not $ApiKey) {
     Require-ExplicitRepair "No valid API token was found."
@@ -376,3 +396,10 @@ if ($carriesSignIn) {
     Write-Host "  & ([scriptblock]::Create((irm $RepoRaw/hermes-mobile-setup.ps1))) -NewAccess"
 }
 Write-Host "Keep the code and the link private: whoever has them can use your Hermes."
+} catch {
+    if (-not $PairLive) { throw }
+    Write-Host ""
+    Write-Host "  [x] The code cannot be shown yet. Nothing was changed." -ForegroundColor Red
+    Write-Host "      $($_.Exception.Message)" -ForegroundColor Gray
+    Write-Host ""
+}

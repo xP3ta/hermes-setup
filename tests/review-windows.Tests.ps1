@@ -336,7 +336,9 @@ function Test-PairNoRepair {
         Assert-True ($pairRaw -notmatch '&\s+\$Python\s+-c\s+"import qrcode"') "pair QR never probes the venv interpreter directly under ErrorActionPreference Stop"
         Assert-True ($pairRaw -match 'qrcode==8\.2' -and $pairRaw -match '"--isolated"') "pair QR reuses the pinned isolated uv runtime"
         Assert-True ($pairRaw -match '\$ErrorActionPreference\s*=\s*"Continue"') "pair QR call site isolates native stderr from the Stop preference"
-        Assert-True ($pairRaw -match 'PYTHONIOENCODING\s*=\s*"utf-8"') "pair QR forces UTF-8 for the U+2588 block glyphs the legacy console codepage cannot encode"
+        Assert-True ($pairRaw -match "io\.open\(sys\.argv\[2\],'w',encoding='utf-8'\)" -and
+            $pairRaw -match 'ReadAllText\(\$drawing, \[Text\.Encoding\]::UTF8\)') `
+            "pair QR travels as a UTF-8 file, so the U+2588 block glyphs never depend on the legacy console codepage"
     } finally {
         $env:HERMES_HOME = $oldHome
         $env:LOCALAPPDATA = $oldLocal
@@ -719,11 +721,15 @@ function Test-TransactionRollback {
     Assert-True ($setupRaw -match 'Remove-EmptyAttemptDirectories' -and
         $setupRaw -match 'SetupDirectoryExistedAtStart') `
         "rollback removes only empty setup directories created by this attempt"
-    # Credential provisioning precedes the Dashboard start (upstream refuses a
-    # non-loopback bind without auth), so it cannot be post-commit; the product
-    # must instead document the non-transactional residual explicitly.
-    Assert-True ($setupRaw -match 'survives rollback|does not remove the credential') `
-        "non-reversible credential provisioning is documented as surviving rollback"
+    # The sign-in is written before the Dashboard starts (upstream refuses a
+    # non-loopback bind without auth), so it cannot be post-commit. It used to
+    # survive a rollback; now what was there before is kept and given back.
+    Assert-True ($setupRaw -notmatch 'survives rollback|does not remove the credential') `
+        "the Dashboard sign-in is no longer documented as surviving a rollback"
+    Assert-True ($setupRaw -match 'Restore-DashboardAccess \$PythonExe' -and
+        $setupRaw -match 'AccessPrevious' -and
+        $setupRaw -match '(?m)^\s*dashboard_login\s*=') `
+        "a failed setup gives back the sign-in in Hermes and the one on record"
 }
 
 function Test-FreshInstallCleanup {
@@ -785,7 +791,7 @@ function Test-FreshInstallCleanup {
         foreach ($name in @(
             "Get-HermesExecutable", "Test-HermesLauncher", "Write-Audit", "Write-Info",
             "Get-PowerShellExecutable", "Save-VerifiedHermesAgentInstaller", "Invoke-WebRequest", "Invoke-HiddenProcess"
-        )) { Remove-Item -LiteralPath "Function:\global:$name" -Force -ErrorAction SilentlyContinue }
+        )) { Remove-Item -LiteralPath "Function:\$name" -Force -ErrorAction SilentlyContinue }
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -911,8 +917,10 @@ function Test-PlatformSupport {
             "unverifiable Windows fails closed clearly")
 
         $raw = [IO.File]::ReadAllText($SetupScript)
-        $preflight = $raw.LastIndexOf("`nAssert-SupportedWindows")
-        $lock = $raw.LastIndexOf("`n`$SetupLockHandle = Enter-SetupLock")
+        # Both sit inside the block that turns a refusal into one readable
+        # message in a person's window.
+        $preflight = $raw.LastIndexOf("`n    Assert-SupportedWindows")
+        $lock = $raw.LastIndexOf("`n    `$SetupLockHandle = Enter-SetupLock")
         Assert-True ($preflight -ge 0 -and $lock -gt $preflight) "Windows support preflight runs before setup lock or mutation"
     } finally {
         $env:OS = $oldOs
@@ -1393,6 +1401,17 @@ function Test-Uninstall {
         )
     }
     function global:Remove-NetFirewallRule { param([string]$Name, $ErrorAction) $script:removedRules.Add($Name) }
+    # Gateway still listens after its task is gone; nothing listens for the Dashboard.
+    $script:stoppedListeners = New-Object System.Collections.Generic.List[string]
+    $script:listening = @([PSCustomObject]@{ Port = 8642; Pid = 4242 })
+    $global:GatewayPort = 8642
+    $global:DashboardPort = 9119
+    function global:Get-ExistingHermesPortRecords { return @($script:listening) }
+    function global:Stop-OwnedHermesListener {
+        param([int]$Port, [string]$TaskName)
+        [void]$script:stoppedListeners.Add("$Port|$TaskName")
+        $script:listening = @($script:listening | Where-Object { $_.Port -ne $Port })
+    }
 
     $global:AuditDir = $temp
     $global:HermesHome = Join-Path $temp "Hermes Console"
@@ -1412,6 +1431,8 @@ function Test-Uninstall {
     Assert-True ($script:removedRules -contains "HermesConsole-abc123") "the installer's firewall rule is removed"
     Assert-True (-not ($script:removedRules -contains "OtraAplicacion-xyz")) "a foreign firewall rule is never removed"
     Assert-True (-not (Test-Path -LiteralPath $global:PairingFile)) "the pairing record is removed"
+    Assert-True (($script:stoppedListeners -join ",") -eq "8642|HermesConsole-Gateway") `
+        "a service of this home that still listens after its task is gone is stopped, through the ownership-checked path (actual: $($script:stoppedListeners -join ','))"
     Assert-True (Test-Path -LiteralPath $global:HermesHome) "the home survives without -Purge"
 
     function global:Get-ScheduledTask { param([string]$TaskName, $ErrorAction) if ($TaskName) { return $null } return @() }
@@ -1485,9 +1506,12 @@ function Test-ProgressBranding {
 
     # La barra respeta el modo redirigido y el formato de siempre sigue ahi.
     Import-ProductFunction $setup "Write-SetupPhase"
-    foreach ($name in @("Write-Audit", "Show-SetupBanner", "Write-SetupProgressBar", "Get-SetupPercent", "Format-Elapsed")) {
+    foreach ($name in @("Write-Audit", "Show-SetupBanner", "Write-SetupProgressBar", "Get-SetupPercent", "Format-Elapsed",
+            "Complete-SetupPhaseRow", "Write-SetupLiveRow", "Get-SetupConsoleWidth")) {
         Import-ProductFunction $setup $name
     }
+    $script:SetupPhaseStartedAt = Get-Date
+    $script:SetupQuietRows = $false
     $script:auditLines = New-Object System.Collections.Generic.List[string]
     $script:auditOnlyCapture = $true
     function global:Write-Audit {
@@ -1509,6 +1533,46 @@ function Test-ProgressBranding {
     Assert-True ($joined -notmatch 'xPetaLab') "no banner is drawn when the output is not a terminal"
     Assert-True ($script:SetupCompletedWeight -eq 0) "the first phase contributes no completed weight"
     Assert-True ($script:SetupProgressLabel -eq "First phase") "the current label is tracked for the live line"
+
+    # One clean window: found on a real Windows 11 console, pinned here.
+    Assert-True ((Format-Elapsed ([TimeSpan]::FromSeconds(89.9))) -eq "1m29s" -and
+        (Format-Elapsed ([TimeSpan]::FromSeconds(779.6))) -eq "12m59s" -and
+        (Format-Elapsed ([TimeSpan]::FromSeconds(59.9))) -eq "59s") `
+        "elapsed time is floored: the minutes never jump ahead at the half minute"
+    Assert-True ($setupRaw -match '\[void\]\(Ensure-AppFirewallRules \$display \$Pairing \$ruleName\)') `
+        "creating the firewall rules prints no stray count"
+    Assert-True ($setupRaw -notmatch 'PadRight\(118\)' -and $setupRaw -match '\[Console\]::WindowWidth') `
+        "the live row fits the window instead of wrapping at a fixed 118 columns"
+    $auditStart = $setupRaw.IndexOf("function Write-Audit(")
+    $auditBody = $setupRaw.Substring($auditStart, $setupRaw.IndexOf("`nfunction ", $auditStart + 10) - $auditStart)
+    Assert-True ($auditBody -match '(?s)AppendAllText.*\$script:SetupLive -and \$script:SetupQuietRows.*return') `
+        "in a person's window every audit row is logged first and only then kept off the screen"
+    Assert-True ($auditBody -match "State -eq 'WARN'") "a warning is still shown in the window"
+    Assert-True ($setupRaw -match '(?s)Show-SetupDone\s+# The result object is for scripts[^\r\n]*\s+if \(-not \$script:SetupLive\) \{\s+\[PSCustomObject\]@\{\s+ok = \$true') `
+        "the raw result object is printed for scripts only, never in a person's window"
+    Assert-True ($setupRaw -match '(?s)if \(-not \$script:SetupLive\) \{ throw \}\s+Show-SetupFailure \$_\.Exception\.Message') `
+        "a refusal in a person's window is one readable block, and still an exception for scripts"
+    $sealStart = $setupRaw.IndexOf("function Show-SetupSeal")
+    $sealBody = $setupRaw.Substring($sealStart, $setupRaw.IndexOf("`nfunction ", $sealStart + 10) - $sealStart)
+    Assert-True ($sealBody -match 'xPetaLab  \|  HERMES CONSOLE' -and $setupRaw -match 'function Show-SetupDone') `
+        "the window closes with the same seal it opened with"
+    Assert-True ($setupRaw -match 'startup\.lpDesktop = QuietDesktopName' -and
+        $setupRaw -match 'CreateDesktop\(QuietDesktopName') `
+        "children of setup start on a desktop nobody looks at, so none of them can put a window on screen"
+    Assert-True ($setupRaw -notmatch '(?i)\bStart-Process\b' -and
+        (Get-Content -LiteralPath $PairScript -Raw) -notmatch '(?i)\bStart-Process\b') `
+        "neither script starts a process through Start-Process, which opens a window by default"
+
+    # A live row is cut to the window, and a closed step is one line.
+    $script:SetupLive = $true
+    $script:SetupPhase = 2
+    $script:SetupProgressLabel = "Second phase"
+    $script:SetupPhaseStartedAt = (Get-Date).AddSeconds(-65)
+    $closed = @(& { Complete-SetupPhaseRow } 6>&1 | ForEach-Object { [string]$_ }) -join ""
+    Assert-True ($closed -match '\[ok\] 2/7 Second phase  \(1m0[45]s\)') "a finished step becomes one line with its own time (actual: $($closed.Trim()))"
+    $long = @(& { Write-SetupLiveRow ("x" * 400) } 6>&1 | ForEach-Object { [string]$_ }) -join ""
+    Assert-True ($long.Trim().Length -le 118) "a live row never exceeds the window (actual: $($long.Trim().Length))"
+    $script:SetupLive = $false
 }
 
 
@@ -1561,7 +1625,8 @@ function Test-FirewallAppRules {
     Assert-True (($script:created -join "`n") -match 'python\.exe') "the venv interpreter is authorised"
     Assert-True (($script:created -join "`n") -match 'hermes\.exe') "the launcher is authorised"
     Assert-True (($script:created -join "`n") -match 'Private\|LocalSubnet') "application rules keep the private LAN scope"
-    Assert-True (($script:created -join "`n") -match '8642,9119,9131') "application rules keep the same three ports"
+    Assert-True (($script:created -join "`n") -match '8642,9119(?!,)' -and
+        ($script:created -join "`n") -notmatch '9131') "application rules open the same two ports and not the old bridge port"
     Assert-True (@($script:SetupTransaction.FirewallRuleNames).Count -eq 2) "application rules are registered for rollback"
 
     # Una regla de BLOQUEO para el mismo ejecutable gana al permiso: hay que quitarla.
@@ -1616,13 +1681,23 @@ function Test-FirewallAppRules {
 function Test-RetireBridge {
     # -RetireBridge removes the Mobile Bridge an earlier setup installed and
     # nothing else, is idempotent, and refuses whole when the tasks are not ours.
+    # Earlier cases leave global stand-ins of real cmdlets behind; this case
+    # works on real files, so it needs the real ones back.
+    foreach ($leftover in @("Test-Path", "Remove-Item", "Get-Content", "New-Item")) {
+        Remove-Item -LiteralPath "Function:\$leftover" -ErrorAction SilentlyContinue
+    }
     foreach ($name in @(
         "Get-LegacyBridgeTaskNames", "Get-LegacyBridgeFiles", "Get-LegacyBridgeProcessIds",
         "Invoke-RetireBridge", "Assert-OwnedHermesTasks", "Test-SameWindowsIdentity"
     )) { Import-ProductFunction $setup $name }
     $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
     Assert-True ($setupRaw -match '(?m)^\s*\[switch\]\$RetireBridge,') "the installer exposes -RetireBridge"
-    Assert-True ($setupRaw -match '(?s)if \(\$RetireBridge\) \{\s*Invoke-RetireBridge\s*return\s*\}') `
+    $branchStart = $setupRaw.IndexOf('if ($RetireBridge) {')
+    $branchEnd = $setupRaw.IndexOf("`nif (", $branchStart + 10)
+    $branch = $setupRaw.Substring($branchStart, $branchEnd - $branchStart)
+    Assert-True ($branchStart -gt 0 -and $branch -match 'Invoke-RetireBridge' -and
+        @([regex]::Matches($branch, '(?m)^\s+return\s*$')).Count -eq 2 -and
+        $branch -notmatch 'Enter-SetupLock|Initialize-SetupTransaction|Install-HermesIfNeeded|Register-HermesTask') `
         "-RetireBridge runs alone and returns before any setup step"
     foreach ($fragment in @(
         '\$RepoRaw/hermes_bridge\.py', '\$RepoRaw/bridge-release\.json', '/bridge/',
@@ -1752,8 +1827,32 @@ function Test-RetireBridge {
     } finally {
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
         foreach ($name in @("Start-Sleep", "Stop-Process", "Get-CimInstance", "Get-ScheduledTask", "Stop-ScheduledTask", "Unregister-ScheduledTask")) {
-            Remove-Item -LiteralPath "Function:\global:$name" -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath "Function:\$name" -ErrorAction SilentlyContinue
         }
+    }
+
+    # Found on Windows 11: on a computer with no Hermes home, -RetireBridge and
+    # -Uninstall died writing their audit row into a folder that was not there.
+    # No home means nowhere to log: the row is skipped and no home is created.
+    Import-ProductFunction $setup "Protect-AuditText"
+    Import-ProductFunction $setup "Write-Audit"
+    $global:AuditOnly = $false
+    $global:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $script:SetupLive = $false
+    $script:SetupQuietRows = $false
+    $ghost = Join-Path ([IO.Path]::GetTempPath()) ("hermes-ghost-" + [Guid]::NewGuid().ToString("N"))
+    $global:AuditLog = Join-Path $ghost "audit\safe-setup-audit.jsonl"
+    $shown = @(& { Write-Audit "Retire bridge" "SKIP" "No Mobile Bridge on this computer; nothing to do" } 6>&1 |
+        ForEach-Object { [string]$_ }) -join "`n"
+    Assert-True ($shown -match 'nothing to do') "without a Hermes home the audit row is still shown"
+    Assert-True (-not (Test-Path -LiteralPath $ghost)) "and no Hermes home is created just to log it"
+    try {
+        [void](New-Item -ItemType Directory -Force -Path (Split-Path -Parent $global:AuditLog))
+        Write-Audit "Retire bridge" "OK" "task:HermesConsole-MobileBridge" 6>$null
+        Assert-True ((Get-Content -LiteralPath $global:AuditLog -Raw) -match '"detail":"task:HermesConsole-MobileBridge"') `
+            "with a Hermes home the row is written to its audit log"
+    } finally {
+        Remove-Item -LiteralPath $ghost -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1761,6 +1860,11 @@ function Test-DashboardAccess {
     # The Dashboard sign-in is written through Hermes' own configuration API,
     # goes into the code only when it is known and accepted, and is given back
     # when setup fails.
+    # Earlier cases leave global stand-ins of real cmdlets behind; this case
+    # works on real files, so it needs the real ones back.
+    foreach ($leftover in @("Test-Path", "Remove-Item", "Get-Content", "New-Item")) {
+        Remove-Item -LiteralPath "Function:\$leftover" -ErrorAction SilentlyContinue
+    }
     $setupRaw = Get-Content -LiteralPath $SetupScript -Raw
     $pairRaw = Get-Content -LiteralPath $PairScript -Raw
     Assert-True ($setupRaw -match '(?m)^\s*\[switch\]\$NewAccess,') "the installer exposes -NewAccess"
@@ -1832,8 +1936,42 @@ function Test-DashboardAccess {
     } finally {
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
         foreach ($name in @("Invoke-HermesPythonFile", "Invoke-HermesJsonRequest")) {
-            Remove-Item -LiteralPath "Function:\global:$name" -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath "Function:\$name" -ErrorAction SilentlyContinue
         }
+    }
+
+    # Found on Windows 11: showing the code again computed the picture and never
+    # showed it, because what the renderer printed became part of the function's
+    # answer. The picture now reaches the window, and the answer is one boolean.
+    Import-ProductFunction $pair "Render-Qr"
+    $drawTemp = Join-Path ([IO.Path]::GetTempPath()) ("hermes-draw-" + [Guid]::NewGuid().ToString("N"))
+    [void](New-Item -ItemType Directory -Force -Path $drawTemp)
+    try {
+        # A stand-in renderer: writes two rows of block characters, as UTF-8,
+        # to the file it is given last, and some noise to its own output.
+        $standIn = Join-Path $drawTemp "renderer.ps1"
+        [IO.File]::WriteAllText($standIn, @'
+[IO.File]::WriteAllText($args[-1], (([string][char]0x2588) * 4 + "`n" + ([string][char]0x2580) * 4 + "`n"), (New-Object Text.UTF8Encoding($false)))
+"renderer chatter that must not reach the answer"
+exit 0
+'@)
+        $global:Python = $standIn
+        $global:HermesHome = $drawTemp
+        $script:drawn = New-Object System.Collections.Generic.List[string]
+        function global:Write-Host { param($Object, $ForegroundColor, [switch]$NoNewline) [void]$script:drawn.Add([string]$Object) }
+        $answer = Render-Qr "hermes://pair?host=192.168.1.40"
+        Remove-Item -LiteralPath "Function:\Write-Host" -ErrorAction SilentlyContinue
+        Assert-True ($answer -is [bool] -and $answer -eq $true) "drawing the code answers one boolean, not the renderer's output"
+        Assert-True ($script:drawn.Count -eq 1 -and $script:drawn[0] -eq ((([string][char]0x2588) * 4) + "`n" + (([string][char]0x2580) * 4))) `
+            "the picture reaches the window with its block characters intact"
+        Assert-True (@(Get-ChildItem ([IO.Path]::GetTempPath()) -Filter "hermes-pair-code-*.txt" -ErrorAction SilentlyContinue).Count -eq 0) `
+            "the throwaway drawing is removed"
+        [IO.File]::WriteAllText($standIn, "exit 3")
+        $failed = Render-Qr "hermes://pair?host=192.168.1.40"
+        Assert-True ($failed -is [bool] -and $failed -eq $false) "a renderer that fails is reported, so the link is offered instead"
+    } finally {
+        Remove-Item -LiteralPath "Function:\Write-Host" -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $drawTemp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 

@@ -542,6 +542,14 @@ PY_RETIRE
 
 # Stop, disable and remove the Mobile Bridge and nothing else. Running it twice,
 # or on a computer that never had one, changes nothing and succeeds.
+# The seal every step of this installer opens with, when a person is watching.
+setup_seal() {
+  [ -t 1 ] || return 0
+  printf '\n  ================================================================\n'
+  printf '    xPetaLab  |  HERMES CONSOLE\n'
+  printf '  ================================================================\n'
+}
+
 retire_bridge() {
   if [ -z "$(bridge_leftovers)" ]; then
     echo "There is no Mobile Bridge on this computer. Nothing to do."
@@ -607,6 +615,7 @@ retire_bridge() {
 }
 
 if [ "$ACTION" = "retire-bridge" ]; then
+  setup_seal
   retire_status_final=0
   retire_bridge || retire_status_final=$?
   exit "$retire_status_final"
@@ -651,9 +660,7 @@ SETUP_PROGRESS_LABEL=""
 
 setup_banner() {
   [ "$SETUP_LIVE" -eq 1 ] || return 0
-  printf '\n  ================================================================\n'
-  printf '    xPetaLab  |  HERMES CONSOLE\n'
-  printf '  ================================================================\n'
+  setup_seal
   printf '    Self-hosted Hermes Agent + Gateway + Dashboard\n'
   printf '    %s - no popups, no telemetry\n' "$(uname -s 2>/dev/null || echo Unix)"
   printf '  ================================================================\n\n'
@@ -2468,3 +2475,8 @@ if [ -n "$(bridge_leftovers)" ]; then
   echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh -s -- --retire-bridge"
 fi
 echo "If chat has no model yet, open Dashboard from the app and configure your AI provider/model."
+if [ "$SETUP_LIVE" -eq 1 ]; then
+  setup_seal
+  printf '    Hermes keeps running in the background and starts by itself.\n'
+  printf '  ================================================================\n\n'
+fi

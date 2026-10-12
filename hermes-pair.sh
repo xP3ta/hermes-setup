@@ -19,6 +19,12 @@ if { [ -n "${WSL_INTEROP:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; 
   exit 2
 fi
 
+if [ -t 1 ]; then
+  printf '\n  ================================================================\n'
+  printf '    xPetaLab  |  HERMES CONSOLE\n'
+  printf '  ================================================================\n'
+fi
+
 HH="${HERMES_HOME:-$HOME/.hermes}"
 SERVICES="$HH/console-services"
 PAIR_ENV="$SERVICES/pairing.env"

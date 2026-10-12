@@ -1009,7 +1009,10 @@ function Write-Audit([string]$Step, [string]$State, [string]$Detail = "") {
         state = $State
         detail = $safe
     }
-    if (-not $AuditOnly) {
+    # The log lives inside the Hermes home. Where there is no home (nothing was
+    # ever installed, or -Purge just removed it) there is nowhere to log, and a
+    # command that only looks or removes must not create one, nor fail for it.
+    if (-not $AuditOnly -and (Test-Path -LiteralPath (Split-Path -Parent $AuditLog) -PathType Container)) {
         [IO.File]::AppendAllText(
             $AuditLog,
             (($row | ConvertTo-Json -Compress) + [Environment]::NewLine),
@@ -1018,6 +1021,13 @@ function Write-Audit([string]$Step, [string]$State, [string]$Detail = "") {
     }
     $color = if ($State -eq 'OK') { 'Green' } elseif ($State -in @('INFO', 'SKIP')) { 'Cyan' } else { 'Yellow' }
     $suffix = if ($safe) { ": $safe" } else { "" }
+    if ($script:SetupLive -and $script:SetupQuietRows) {
+        # In the window a person is looking at, the screen keeps one row per
+        # step. Every row is still in the audit log; only what needs their
+        # attention is also shown, and a failure is shown once, at the end.
+        if ($State -eq 'WARN') { Write-SetupLiveRow "  [!] $Step$suffix" Yellow -Full }
+        return
+    }
     Write-Host "[$State] $Step$suffix" -ForegroundColor $color
 }
 
@@ -1032,7 +1042,11 @@ $script:SetupPhaseTotal = 7
 # el Dashboard) mueven su tramo con senales reales, no con un reloj.
 $script:SetupPhaseWeights = @(3, 40, 4, 24, 17, 7, 5)
 $script:SetupProgressNote = ""
+$script:SetupProgressLabel = ""
 $script:SetupStartedAt = Get-Date
+$script:SetupPhaseStartedAt = $script:SetupStartedAt
+# Set once the window shows the seal: from then on audit rows stay in the log.
+$script:SetupQuietRows = $false
 # La barra solo se dibuja en una consola interactiva: redirigido (logs, CI) el
 # formato de siempre no cambia ni un byte.
 $script:SetupLive = $false
@@ -1050,9 +1064,85 @@ function Get-SetupPercent([int]$CompletedWeight) {
 
 function Format-Elapsed([TimeSpan]$Span) {
     if ($Span.TotalMinutes -ge 1) {
-        return ("{0}m{1:d2}s" -f [int]$Span.TotalMinutes, $Span.Seconds)
+        return ("{0}m{1:d2}s" -f [int][Math]::Floor($Span.TotalMinutes), $Span.Seconds)
     }
-    return ("{0}s" -f [int]$Span.TotalSeconds)
+    return ("{0}s" -f [int][Math]::Floor($Span.TotalSeconds))
+}
+
+function Get-SetupConsoleWidth {
+    # The columns one live row may use: one short of the window, so a full row
+    # never wraps (a wrapped row cannot be redrawn in place) in a narrow window.
+    $width = 79
+    try {
+        if ([Console]::WindowWidth -gt 20) { $width = [Console]::WindowWidth - 1 }
+    } catch {}
+    if ($width -gt 118) { $width = 118 }
+    return $width
+}
+
+function Write-SetupLiveRow([string]$Text, [string]$Color = "Gray", [switch]$Stay, [switch]$Full) {
+    # Draws one row over whatever the current row shows. -Stay leaves the cursor
+    # on it (the row will be redrawn); -Full lets a long sentence wrap instead of
+    # being cut to the window.
+    $width = Get-SetupConsoleWidth
+    try {
+        if ($Full) {
+            Write-Host ("`r" + (" " * $width) + "`r") -NoNewline
+            Write-Host $Text -ForegroundColor $Color
+            return
+        }
+        if ($Text.Length -gt $width) { $Text = $Text.Substring(0, $width) }
+        Write-Host ("`r" + $Text.PadRight($width)) -NoNewline:$Stay -ForegroundColor $Color
+    } catch {
+        Write-Host $Text -ForegroundColor $Color
+    }
+}
+
+function Complete-SetupPhaseRow([string]$Mark = "ok", [string]$Color = "DarkGreen") {
+    # Closes the row of the step that just ended: its bar becomes one line.
+    if (-not $script:SetupLive -or $script:SetupPhase -lt 1) { return }
+    if (-not $script:SetupProgressLabel) { return }
+    $took = Format-Elapsed ((Get-Date) - $script:SetupPhaseStartedAt)
+    Write-SetupLiveRow ("  [{0}] {1}/{2} {3}  ({4})" -f $Mark, $script:SetupPhase,
+        $script:SetupPhaseTotal, $script:SetupProgressLabel, $took) $Color
+    $script:SetupProgressLabel = ""
+}
+
+function Show-SetupSeal([string]$Line = "") {
+    $rule = "=" * 64
+    Write-Host "  $rule" -ForegroundColor DarkGray
+    Write-Host "    xPetaLab  |  HERMES CONSOLE" -ForegroundColor DarkYellow
+    Write-Host "  $rule" -ForegroundColor DarkGray
+    if ($Line) { Write-Host "    $Line" -ForegroundColor Gray }
+}
+
+function Show-SetupFailure([string]$Message) {
+    # One readable block in the window, instead of PowerShell's error record
+    # with its script positions. Scripts and CI (output redirected) still get
+    # the exception.
+    Complete-SetupPhaseRow "x" "Red"
+    $width = (Get-SetupConsoleWidth) - 6
+    Write-Host ""
+    Write-Host "  [x] Hermes Console setup did not finish. Nothing was left half done." -ForegroundColor Red
+    $row = ""
+    foreach ($word in ($Message -split '\s+')) {
+        if ($row -and ($row.Length + 1 + $word.Length) -gt $width) {
+            Write-Host "      $row" -ForegroundColor Gray
+            $row = $word
+        } elseif ($row) { $row = "$row $word" } else { $row = $word }
+    }
+    if ($row) { Write-Host "      $row" -ForegroundColor Gray }
+    Write-Host ""
+}
+
+function Show-SetupDone {
+    # The last thing in the window: the seal again, and what stays running.
+    if (-not $script:SetupLive) { return }
+    Show-SetupSeal ("Ready in {0}." -f (Format-Elapsed ((Get-Date) - $script:SetupStartedAt)))
+    Write-Host "    Hermes keeps running in the background, with no window, and starts" -ForegroundColor Gray
+    Write-Host "    by itself when you sign in to Windows. You can close this window." -ForegroundColor Gray
+    Write-Host "  $("=" * 64)" -ForegroundColor DarkGray
+    Write-Host ""
 }
 
 function Show-SetupBanner {
@@ -1078,14 +1168,12 @@ function Write-SetupProgressBar([int]$Percent, [string]$Label, [string]$Note = "
     $suffix = if ($Note) { " - $Note" } else { "" }
     $text = "  [$bar] {0,3}%  {1}/$($script:SetupPhaseTotal) {2}  ({3}){4}" -f `
         $Percent, $script:SetupPhase, $Label, $elapsed, $suffix
-    try {
-        Write-Host ("`r" + $text.PadRight(118)) -NoNewline -ForegroundColor Gray
-    } catch {
-        Write-Host $text -ForegroundColor Gray
-    }
+    Write-SetupLiveRow $text Gray -Stay
 }
 
 function Write-SetupPhase([string]$Label) {
+    Complete-SetupPhaseRow
+    $script:SetupPhaseStartedAt = Get-Date
     $script:SetupPhase++
     $weight = 0
     for ($i = 0; $i -lt ($script:SetupPhase - 1); $i++) {
@@ -1790,6 +1878,9 @@ namespace HermesConsole {
         IntPtr job;
         IntPtr process;
         bool disposed;
+        // Created once and kept for the life of this PowerShell process.
+        static IntPtr quietDesktop = IntPtr.Zero;
+        const string QuietDesktopName = "HermesConsoleSetup";
 
         [StructLayout(LayoutKind.Sequential)]
         struct SECURITY_ATTRIBUTES {
@@ -1851,6 +1942,9 @@ namespace HermesConsole {
         static extern bool CreateProcess(string application, StringBuilder commandLine, IntPtr processAttributes,
             IntPtr threadAttributes, bool inheritHandles, uint flags, IntPtr environment, string currentDirectory,
             ref STARTUPINFO startup, out PROCESS_INFORMATION processInfo);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateDesktop(string desktop, IntPtr device, IntPtr deviceMode, int flags,
+            uint access, IntPtr security);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -1922,7 +2016,23 @@ namespace HermesConsole {
                 startup.hStdOutput = stdoutHandle;
                 startup.hStdError = stderrHandle;
                 StringBuilder commandLine = new StringBuilder(Quote(file) + (String.IsNullOrEmpty(arguments) ? "" : " " + arguments));
-                if (!CreateProcess(file, commandLine, IntPtr.Zero, IntPtr.Zero, true,
+                // CREATE_NO_WINDOW hides consoles, but a tool down the tree that
+                // insists on a dialog of its own (a self-extractor's progress box)
+                // would still put it on the user's screen. The whole tree is
+                // started on a desktop nobody looks at; where one cannot be
+                // created, it shares ours as before.
+                if (quietDesktop == IntPtr.Zero) {
+                    try { quietDesktop = CreateDesktop(QuietDesktopName, IntPtr.Zero, IntPtr.Zero, 0, 0x10000000, IntPtr.Zero); }
+                    catch { quietDesktop = IntPtr.Zero; }
+                }
+                bool created = false;
+                if (quietDesktop != IntPtr.Zero) {
+                    startup.lpDesktop = QuietDesktopName;
+                    created = CreateProcess(file, commandLine, IntPtr.Zero, IntPtr.Zero, true,
+                        CREATE_SUSPENDED | CREATE_NO_WINDOW, IntPtr.Zero, currentDirectory, ref startup, out pi);
+                    if (!created) startup.lpDesktop = null;
+                }
+                if (!created && !CreateProcess(file, commandLine, IntPtr.Zero, IntPtr.Zero, true,
                     CREATE_SUSPENDED | CREATE_NO_WINDOW, IntPtr.Zero, currentDirectory, ref startup, out pi))
                     ThrowLast("CreateProcess failed");
                 if (!AssignProcessToJobObject(jobHandle, pi.hProcess))
@@ -2293,7 +2403,7 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
         if ((Get-RestrictedFirewallRuleState $display $Pairing.Kind) -ne "Exact") {
             throw "Created firewall rule did not verify exactly."
         }
-        Ensure-AppFirewallRules $display $Pairing $ruleName
+        [void](Ensure-AppFirewallRules $display $Pairing $ruleName)
         Write-TransactionJournal $script:SetupTransaction "firewall-create" "ok"
         Write-Ok $(if ($Pairing.Kind -eq "mesh") {
             "Tailscale-only Windows Firewall rule installed"
@@ -2961,15 +3071,15 @@ function Invoke-RetireBridge {
     foreach ($item in $removed) { Write-Audit "Retire bridge" "OK" $item }
     foreach ($item in $failed) { Write-Audit "Retire bridge" "FAIL" $item }
     if ($failed.Count -gt 0) {
-        Write-Host "Part of the Mobile Bridge could not be removed: $($failed -join ', ')."
-        Write-Host "Nothing else was touched. Close whatever still uses it and run this again."
+        Write-Host "  Part of the Mobile Bridge could not be removed: $($failed -join ', ')."
+        Write-Host "  Nothing else was touched. Close whatever still uses it and run this again."
     } elseif ($removed.Count -eq 0) {
         Write-Audit "Retire bridge" "SKIP" "No Mobile Bridge on this computer; nothing to do"
-        Write-Host "There is no Mobile Bridge on this computer. Nothing to do."
+        Write-Host "  There is no Mobile Bridge on this computer. Nothing to do."
     } else {
-        Write-Host "Done. The old Mobile Bridge is stopped and removed."
-        Write-Host "Hermes, its Gateway and its Dashboard were not touched: the app keeps working."
-        Write-Host "Port $LegacyBridgePort is no longer used; nothing listens there now."
+        Write-Host "  Done. The old Mobile Bridge is stopped and removed."
+        Write-Host "  Hermes, its Gateway and its Dashboard were not touched: the app keeps working."
+        Write-Host "  Port $LegacyBridgePort is no longer used; nothing listens there now."
     }
     [PSCustomObject]@{
         ok = ($failed.Count -eq 0)
@@ -3487,6 +3597,22 @@ function Invoke-SetupUninstall {
         }
     }
 
+    # Ending a task ends its hidden runner, not always the service it started:
+    # found on Windows 11, where Gateway and Dashboard kept listening after an
+    # uninstall. Only a listener that belongs to this Hermes home is stopped.
+    foreach ($service in @(
+        @{ Port = $GatewayPort; Name = "HermesConsole-Gateway" },
+        @{ Port = $DashboardPort; Name = "HermesConsole-Dashboard" }
+    )) {
+        try {
+            if (@(Get-ExistingHermesPortRecords | Where-Object { $_.Port -eq $service.Port }).Count -eq 0) { continue }
+            Stop-OwnedHermesListener $service.Port $service.Name
+            $removed.Add("listener:$($service.Port)")
+        } catch {
+            $failed.Add("listener:$($service.Port)")
+        }
+    }
+
     if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
         foreach ($rule in @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -like "HermesConsole-*" })) {
@@ -3552,6 +3678,14 @@ if ($Uninstall) {
 }
 
 if ($RetireBridge) {
+    Show-SetupBanner
+    if ($script:SetupLive) {
+        # In the window: the sentences only. The rows are in the audit log and
+        # the result object is for scripts.
+        $script:SetupQuietRows = $true
+        try { [void](Invoke-RetireBridge) } catch { Show-SetupFailure $_.Exception.Message }
+        return
+    }
     Invoke-RetireBridge
     return
 }
@@ -3566,13 +3700,23 @@ if ($Diagnose) {
     return
 }
 
-Assert-SupportedWindows
 Show-SetupBanner
-$AttemptPaths = New-SetupAttemptPaths -HermesHome $HermesHome
-$PairingNew = $AttemptPaths.PairingNew
-$EnvNew = $AttemptPaths.EnvNew
-$SetupLockName = Get-SetupLockName $HermesHome
-$SetupLockHandle = Enter-SetupLock -Name $SetupLockName -TimeoutMilliseconds ([int]$LockTimeoutSec * 1000)
+if ($script:SetupLive) { $script:SetupQuietRows = $true }
+$SetupLockHandle = $null
+try {
+    Assert-SupportedWindows
+    $AttemptPaths = New-SetupAttemptPaths -HermesHome $HermesHome
+    $PairingNew = $AttemptPaths.PairingNew
+    $EnvNew = $AttemptPaths.EnvNew
+    $SetupLockName = Get-SetupLockName $HermesHome
+    $SetupLockHandle = Enter-SetupLock -Name $SetupLockName -TimeoutMilliseconds ([int]$LockTimeoutSec * 1000)
+} catch {
+    # In a person's window a refusal is one readable block; scripts and CI
+    # (output redirected) keep getting the exception.
+    if (-not $script:SetupLive) { throw }
+    Show-SetupFailure $_.Exception.Message
+    return
+}
 
 try {
 Assert-SetupOwnership
@@ -3679,7 +3823,7 @@ WScript.Quit rc
     } else {
         Write-Audit "Gateway service" "SKIP" "Already healthy and authenticated"
     }
-    if (-not (Wait-HermesService "gateway" "http://127.0.0.1:$GatewayPort" $ApiKey 60)) {
+    if (-not (Wait-HermesService "gateway" "http://127.0.0.1:$GatewayPort" $ApiKey 60 "" -Note "Starting the Gateway")) {
         throw "Gateway readiness failed. Inspect its Scheduled Task and the owner of TCP $GatewayPort."
     }
     Write-Ok "Gateway identity and authentication passed on $GatewayPort"
@@ -3730,13 +3874,15 @@ WScript.Quit rc
     # The sign-in that goes into the code is proven by signing in with it.
     if ($DashboardAccess.State -ne "unknown") {
         $signedIn = Test-DashboardSignIn "http://127.0.0.1:$DashboardPort" $DashLoginFile
-        if (-not $signedIn -and $DashboardAccess.State -eq "created") {
-            # The Dashboard was already starting when the sign-in was written.
+        if (-not $signedIn) {
+            # A running Dashboard keeps the sign-in it read when it started:
+            # one that was just created, or one just written in .env, is only
+            # accepted after it starts again. Once, before deciding anything.
             Start-HermesProcess "HermesConsole-Dashboard" $DashboardPort
             if (-not (Wait-HermesService "dashboard" "http://127.0.0.1:$DashboardPort" $ApiKey 240 "" `
                     -ExtendWhileTaskRunning "HermesConsole-Dashboard" -MaxSeconds 1800 `
                     -Note "Restarting the Dashboard with its new sign-in")) {
-                throw "Dashboard readiness failed after its sign-in was created. Check its Scheduled Task and TCP $DashboardPort."
+                throw "Dashboard readiness failed after it was restarted to read its sign-in. Check its Scheduled Task and TCP $DashboardPort."
             }
             $signedIn = Test-DashboardSignIn "http://127.0.0.1:$DashboardPort" $DashLoginFile
         }
@@ -3839,12 +3985,16 @@ WScript.Quit rc
     $link = "hermes://pair?" + ($query -join "&")
     [void](Write-PairingQr $PythonExe $link)
 
+    Complete-SetupPhaseRow
     Show-PairingResult $link
     Show-DashboardAccess $DashboardAccess
     Complete-SetupTransaction -Transaction $script:SetupTransaction
 
     Write-Audit "Setup" "OK" "All local and phone-facing checks passed; pairing QR is ready"
     Write-Audit "Setup summary" "OK" "Hermes Agent, Gateway and Dashboard are ready; private phone access passed"
+    Show-SetupDone
+    # The result object is for scripts; a person's window ends with the seal.
+    if (-not $script:SetupLive) {
     [PSCustomObject]@{
         ok = $true
         qr = $QrFile
@@ -3857,6 +4007,7 @@ WScript.Quit rc
             "Private phone access verified"
         )
     } | ConvertTo-Json -Compress
+    }
 } catch {
     $safeError = Protect-AuditText $_.Exception.Message
     # Sin pista, el usuario que falla no sabe que existe un informe redactado.
@@ -3892,17 +4043,23 @@ WScript.Quit rc
     } else {
         "not-started"
     }
-    [PSCustomObject]@{
-        ok = $false
-        error = $safeError
-        rollback = $rollbackState
-        audit = $AuditLog
-        hint = $diagnoseHint
-    } | ConvertTo-Json -Compress
+    if (-not $script:SetupLive) {
+        [PSCustomObject]@{
+            ok = $false
+            error = $safeError
+            rollback = $rollbackState
+            audit = $AuditLog
+            hint = $diagnoseHint
+        } | ConvertTo-Json -Compress
+    }
     throw "$safeError $diagnoseHint"
 } finally {
     if ($script:MutationQuiescent) { Remove-OwnedSetupFiles -Paths $AttemptPaths }
 }
+} catch {
+    if (-not $script:SetupLive) { throw }
+    Show-SetupFailure $_.Exception.Message
+    return
 } finally {
     if ($script:MutationQuiescent) {
         Remove-OwnedSetupFiles -Paths $AttemptPaths

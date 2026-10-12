@@ -258,6 +258,29 @@ class WindowsParityTests(unittest.TestCase):
                     self.assertNotIn(fragment, source)
         self.assertNotIn(":9119", self.pair_ps1.replace('else { "9119" }', ""))
 
+    def test_every_script_opens_with_the_same_seal(self) -> None:
+        seal = "xPetaLab  |  HERMES CONSOLE"
+        rule = "=" * 64
+        for name in (
+            "hermes-mobile-setup.sh",
+            "hermes-pair.sh",
+            "hermes-mobile-setup.ps1",
+            "hermes-pair.ps1",
+        ):
+            with self.subTest(script=name):
+                source = (ROOT / name).read_text(encoding="utf-8")
+                self.assertIn(seal, source)
+                self.assertTrue(rule in source or '"=" * 64' in source)
+
+    def test_the_unix_seal_is_only_drawn_for_a_person(self) -> None:
+        # Piped or logged output keeps its plain lines: no seal, no bar.
+        function = review.shell_function(self.setup_sh, "setup_seal")
+        completed = subprocess.run(
+            ["sh", "-c", function + "\nsetup_seal\necho END"],
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(completed.stdout, "END\n")
+
     def test_both_platforms_offer_the_same_three_actions(self) -> None:
         for switch in ("[switch]$RetireBridge", "[switch]$NewAccess"):
             self.assertIn(switch, self.setup_ps1)

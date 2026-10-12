@@ -163,6 +163,31 @@ else:
     sys.exit("stand-in Hermes: unsupported command " + " ".join(arguments))
 '''
 
+# Loaded by every Python the scripts start (it sits in the stand-in's own
+# site-packages): a connection to anything but the two stand-in services is
+# refused and written down. A real Hermes that happens to run on this machine,
+# on its usual ports, can therefore never be reached by a test run.
+NETWORK_FENCE = r'''
+import os, socket
+
+_allowed = {int(p) for p in os.environ.get("STANDIN_PORTS", "").split(",") if p}
+_log = os.environ.get("STANDIN_FENCE_LOG", "")
+_connect = socket.socket.connect
+
+
+def _fenced(self, address, *rest):
+    port = address[1] if isinstance(address, tuple) and len(address) >= 2 else None
+    if _allowed and port not in _allowed:
+        if _log:
+            with open(_log, "a", encoding="utf-8") as trail:
+                trail.write("%r\n" % (address,))
+        raise ConnectionRefusedError("test fence: only the stand-in services may be reached")
+    return _connect(self, address, *rest)
+
+
+socket.socket.connect = _fenced
+'''
+
 MOCKS = {
     # No systemd for this user: setup falls back to its own portable manager.
     "systemctl": '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$MOCK_LOG.systemctl"\nexit 1\n',
@@ -263,6 +288,12 @@ class WholeSetupTests(unittest.TestCase):
             text=True, capture_output=True, timeout=30, check=True,
         ).stdout.strip()
         units.write_fake_hermes_modules(pathlib.Path(site))
+        # A .pth line runs at interpreter start whatever else the system adds
+        # (a distribution's own sitecustomize would shadow one placed here).
+        (pathlib.Path(site) / "standin_fence.py").write_text(NETWORK_FENCE, encoding="utf-8")
+        (pathlib.Path(site) / "standin_fence.pth").write_text("import standin_fence\n", encoding="utf-8")
+        self.fence_log = self.temp / "fence.log"
+        self.addCleanup(self.assert_nothing_else_was_reached)
         launcher = venv / "bin" / "hermes"
         launcher.write_text(FAKE_HERMES.replace("__PYTHON__", str(python)), encoding="utf-8")
         launcher.chmod(0o700)
@@ -287,8 +318,32 @@ class WholeSetupTests(unittest.TestCase):
             "HERMES_DASHBOARD_PORT": str(self.dashboard_port),
             "HERMES_REPO_RAW": "https://setup.invalid",
             "MOCK_LOG": str(self.temp / "mock"),
+            "STANDIN_PORTS": f"{self.gateway_port},{self.dashboard_port}",
+            "STANDIN_FENCE_LOG": str(self.fence_log),
             **extra,
         }
+
+    def assert_nothing_else_was_reached(self) -> None:
+        reached = self.fence_log.read_text(encoding="utf-8") if self.fence_log.exists() else ""
+        self.assertEqual(reached, "", "a script tried to reach something that is not the stand-in")
+
+    def test_the_fence_refuses_and_records_any_other_destination(self) -> None:
+        python = self.hermes / "hermes-agent" / "venv" / "bin" / "python3"
+        probe = subprocess.run(
+            [str(python), "-c",
+             "import urllib.request\n"
+             "try:\n"
+             "    urllib.request.urlopen('http://127.0.0.1:1/', timeout=3)\n"
+             "    print('REACHED')\n"
+             "except Exception as exc:\n"
+             "    print(type(exc).__name__)\n"],
+            text=True, capture_output=True, timeout=30, env=self.environment(),
+        )
+        # Port 1 is nobody's: what is checked is that the attempt was stopped
+        # by the fence and written down, before any packet left.
+        self.assertNotIn("REACHED", probe.stdout)
+        self.assertEqual(self.fence_log.read_text(encoding="utf-8"), "('127.0.0.1', 1)\n")
+        self.fence_log.unlink()
 
     def run_script(self, script, *arguments, **extra):
         return subprocess.run(
