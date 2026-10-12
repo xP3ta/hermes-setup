@@ -1946,6 +1946,21 @@ function Test-DashboardAccess {
         function global:Invoke-HermesJsonRequest { throw "401" }
         Assert-True (-not (Test-DashboardSignIn "http://192.168.1.40:9119" $global:DashLoginFile)) "a refused sign-in is reported as not working"
         Assert-True (-not (Test-DashboardSignIn "http://192.168.1.40:9119" (Join-Path $temp "missing.json"))) "no record means no sign-in"
+        # A connection that timed out is asked again; only an answer is a verdict.
+        $script:HermesDashboardCalls = 0
+        $script:DashboardRetryPauseSeconds = 0
+        function global:Invoke-HermesJsonRequest {
+            param($Method, $Url, $Token, $TimeoutSeconds, $Body)
+            $script:HermesDashboardCalls++
+            if ($script:HermesDashboardCalls -lt 3) { throw (New-Object Net.WebException("The operation has timed out")) }
+            return [PSCustomObject]@{ ok = $true }
+        }
+        Assert-True (Test-DashboardSignIn "http://192.168.1.40:9119" $global:DashLoginFile) "a Dashboard that was still starting accepts the sign-in on a later try"
+        Assert-True ($script:HermesDashboardCalls -eq 3) "two transient failures, then the answer"
+        $script:HermesDashboardCalls = 0
+        function global:Invoke-HermesJsonRequest { $script:HermesDashboardCalls++; throw "401" }
+        Assert-True (-not (Test-DashboardSignIn "http://192.168.1.40:9119" $global:DashLoginFile)) "a refusal is not retried into an acceptance"
+        Assert-True ($script:HermesDashboardCalls -eq 1) "a real refusal is a verdict on the first answer"
     } finally {
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
         foreach ($name in @("Invoke-HermesPythonFile", "Invoke-HermesJsonRequest")) {

@@ -735,7 +735,7 @@ class DashboardReadinessTests(unittest.TestCase):
             harness.write_text(
                 "#!/bin/sh\nset -eu\n"
                 f'LOGS="{temp}"\n'
-                "DASHBOARD_PORT=9119\n"
+                "DASHBOARD_PORT=9119\nGATEWAY_START_WAIT=60\n"
                 "sleep() { :; }\n"
                 "wait_probe() {\n"
                 "  n=$(cat \"$LOGS/counter\")\n"

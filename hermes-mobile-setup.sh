@@ -2482,7 +2482,10 @@ while [ "$dashboard_elapsed" -lt 1800 ]; do
     break
   fi
   dashboard_elapsed=$((dashboard_elapsed + 5))
-  if [ "$dashboard_elapsed" -lt 60 ]; then
+  # A cold first start can be quiet for minutes (its log stays empty while the
+  # web UI loads): the log only counts as evidence of life after the start
+  # allowance has passed, the same one the Gateway gets.
+  if [ "$dashboard_elapsed" -lt "$GATEWAY_START_WAIT" ]; then
     continue
   fi
   dashboard_size=0
@@ -2504,9 +2507,10 @@ if [ "$dashboard_ready" -ne 1 ]; then
 fi
 DASH_AUTH_STATUS=0
 if "$VP" - "http://127.0.0.1:$DASHBOARD_PORT" "$DASHBOARD_LOGIN_STATE" "$DASH_LOGIN_FILE" <<'PY_DASH_AUTH'
-import json, pathlib, sys, urllib.error, urllib.request
+import http.client, json, os, pathlib, sys, time, urllib.error, urllib.request
 
 base, state, login_path = sys.argv[1:]
+pause = float(os.environ.get("HERMES_SETUP_PROBE_PAUSE", "2"))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -2518,12 +2522,22 @@ opener = urllib.request.build_opener(NoRedirect)
 
 
 def request(path, headers=None, data=None):
+    # An answer, whatever its status, is a verdict. A connection that timed out
+    # or was dropped is not: a Dashboard that has only just finished starting
+    # (or a busy machine) is asked again, with a growing pause, before giving up.
     value = urllib.request.Request(base + path, headers=headers or {}, data=data)
-    try:
-        with opener.open(value, timeout=6) as response:
-            return response.status, response.headers, response.read(1024 * 1024)
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.headers, exc.read(1024 * 1024)
+    last = "no answer"
+    for attempt in range(1, 5):
+        try:
+            with opener.open(value, timeout=20) as response:
+                return response.status, response.headers, response.read(1024 * 1024)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read(1024 * 1024)
+        except (OSError, http.client.HTTPException) as exc:
+            last = type(exc).__name__
+            if attempt < 4:
+                time.sleep(attempt * pause)
+    raise SystemExit(f"the Dashboard did not answer {path} ({last}) after four tries")
 
 
 protected = "/api/model/options"
@@ -2597,6 +2611,13 @@ case "$DASH_AUTH_STATUS" in
     ;;
   *)
     echo "ERROR: Dashboard protected-route authentication checks failed; no code will be shown."
+    if [ -s "$LOGS/dashboard.log" ]; then
+      echo "Last lines of $LOGS/dashboard.log:"
+      tail -n 15 "$LOGS/dashboard.log" || true
+    else
+      echo "$LOGS/dashboard.log is empty: the Dashboard never wrote a line."
+    fi
+    echo "Look at that log and at the service manager's state for the Dashboard, then rerun setup."
     exit 1
     ;;
 esac
