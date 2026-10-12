@@ -29,6 +29,7 @@ def main() -> None:
         "tests/no-bridge_test.py",
         "tests/no-bridge-install_test.py",
         "tests/new-hermes-layout_test.py",
+        "tests/installer-lifecycle_test.py",
         "tests/legacy-bridge-release_test.py",
         "tests/legacy-bridge-security_test.py",
         "tests/legacy-bridge-coexistence_test.py",

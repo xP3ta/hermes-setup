@@ -2418,7 +2418,21 @@ function Ensure-PrivateFirewallRules([hashtable]$Pairing) {
     }
 }
 
-function Test-HermesLauncher([string]$Executable, [int]$TimeoutSeconds = 15) {
+function Test-HermesLauncher([string]$Executable, [int]$TimeoutSeconds = 15, [int]$Attempts = 3) {
+    # One failed answer is not a verdict: a launcher that is slow for a moment
+    # (cold disk, antivirus scan, the package manager updating itself) answers
+    # on the next try. A launcher that does not exist is not asked again.
+    if (-not $Executable -or -not (Test-Path -LiteralPath $Executable)) { return $false }
+    $pause = 2
+    if ($null -ne $script:HermesProbePauseSeconds) { $pause = [int]$script:HermesProbePauseSeconds }
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if (Test-HermesLauncherOnce $Executable $TimeoutSeconds) { return $true }
+        if ($attempt -lt $Attempts -and $pause -gt 0) { Start-Sleep -Seconds ($pause * $attempt) }
+    }
+    return $false
+}
+
+function Test-HermesLauncherOnce([string]$Executable, [int]$TimeoutSeconds = 15) {
     if (-not $Executable -or -not (Test-Path -LiteralPath $Executable)) { return $false }
     $probeId = [Guid]::NewGuid().ToString("N")
     $stdout = Join-Path ([IO.Path]::GetTempPath()) "hermes-launcher-$probeId.out.log"
@@ -2549,7 +2563,7 @@ function Install-HermesIfNeeded {
     $freshArtifacts = @(Get-FreshHermesInstallArtifacts)
     $existingArtifacts = @($freshArtifacts | Where-Object { Test-Path -LiteralPath $_ })
     if ($existingArtifacts.Count -gt 0) {
-        throw "Hermes Agent state exists but is not healthy; refusing to run the installer over it. Remove or repair the broken managed state explicitly."
+        throw "Hermes Agent state exists but did not answer after three tries; refusing to run the installer over it. Nothing was changed or removed. Remove or repair the broken managed state explicitly if it is really broken."
     }
 
     Write-Info "Installing Hermes Agent for native Windows..."
@@ -2560,11 +2574,18 @@ function Install-HermesIfNeeded {
         $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installer`" " +
             "-SkipSetup -SkipComputerUse -NonInteractive -Json -Commit $($script:HermesAgentCommit) " +
             "-HermesHome `"$HermesHome`" -InstallDir `"$InstallDir`""
-        Invoke-HiddenProcess -File (Get-PowerShellExecutable) -Arguments $arguments `
-            -TimeoutSeconds $script:HermesInstallTimeoutSeconds `
-            -StdoutPath $AttemptPaths.InstallerOut `
-            -StderrPath $AttemptPaths.InstallerErr `
-            -Operation "Hermes Agent installer"
+        try {
+            Invoke-HiddenProcess -File (Get-PowerShellExecutable) -Arguments $arguments `
+                -TimeoutSeconds $script:HermesInstallTimeoutSeconds `
+                -StdoutPath $AttemptPaths.InstallerOut `
+                -StderrPath $AttemptPaths.InstallerErr `
+                -Operation "Hermes Agent installer"
+        } catch {
+            if ($_.Exception.Message -match 'timed out after') {
+                throw "The Hermes Agent installer did not finish within $($script:HermesInstallTimeoutSeconds)s; it was stopped together with everything it had started. What this run had begun to create is removed and nothing that was there before was touched. Run setup again, or allow more time with -InstallerTimeoutSec."
+            }
+            throw
+        }
 
         $hermes = Get-HermesExecutable
         if (-not $hermes) { throw "Hermes Agent executable was not found after installation." }

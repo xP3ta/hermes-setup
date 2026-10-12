@@ -133,6 +133,11 @@ fi
 
 SETUP_LOCK_HELD=0
 SETUP_LOCK_DIR=""
+# One setup at a time per user, held from here to the end of the run and so
+# through the installer's real exit. The lock is a directory holding the
+# owner's pid: a run that was killed outright leaves the directory behind, and
+# the next run recognises that the pid is gone and takes the lock over, so a
+# crash can never lock people out. Only a lock whose owner is alive refuses.
 acquire_setup_lock() {
   lock_root="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
   if [ ! -d "$lock_root" ]; then
@@ -142,17 +147,47 @@ acquire_setup_lock() {
   SETUP_LOCK_DIR="$lock_root/hermes-console-setup-$(id -u).lock"
   old_umask="$(umask)"
   umask 077
-  if ! mkdir "$SETUP_LOCK_DIR" 2>/dev/null; then
+  lock_try=0
+  while ! mkdir "$SETUP_LOCK_DIR" 2>/dev/null; do
+    lock_try=$((lock_try + 1))
+    lock_owner=""
+    lock_wait=0
+    # A run that has just made the directory writes its pid a moment later.
+    while [ "$lock_wait" -lt 20 ]; do
+      lock_owner="$(cat "$SETUP_LOCK_DIR/pid" 2>/dev/null || true)"
+      [ -n "$lock_owner" ] && break
+      [ -d "$SETUP_LOCK_DIR" ] || break
+      sleep 0.1 2>/dev/null || sleep 1
+      lock_wait=$((lock_wait + 1))
+    done
+    if [ -n "$lock_owner" ] && [ "$lock_try" -le 3 ] && \
+       ! kill -0 "$lock_owner" 2>/dev/null; then
+      # Its owner is gone. Renaming is atomic, so when two runs find the same
+      # stale lock only one of them clears it.
+      lock_stale="$SETUP_LOCK_DIR.stale.$$"
+      if mv "$SETUP_LOCK_DIR" "$lock_stale" 2>/dev/null; then
+        rm -rf -- "$lock_stale"
+      fi
+      continue
+    fi
     umask "$old_umask"
-    echo "ERROR: another Console setup is already running for this user." >&2
+    if [ -n "$lock_owner" ]; then
+      echo "ERROR: another Console setup is already running for this user (process $lock_owner); nothing was changed." >&2
+    elif [ -d "$SETUP_LOCK_DIR" ]; then
+      echo "ERROR: another Console setup is already running for this user, or left $SETUP_LOCK_DIR without an owner; nothing was changed." >&2
+    else
+      echo "ERROR: another Console setup is already running for this user." >&2
+    fi
     return 1
-  fi
+  done
   umask "$old_umask"
+  printf '%s\n' "$$" > "$SETUP_LOCK_DIR/pid" 2>/dev/null || true
   SETUP_LOCK_HELD=1
 }
 
 release_setup_lock() {
   [ "$SETUP_LOCK_HELD" -eq 1 ] || return 0
+  rm -f "$SETUP_LOCK_DIR/pid" 2>/dev/null || true
   rmdir "$SETUP_LOCK_DIR" 2>/dev/null || true
   SETUP_LOCK_HELD=0
 }
@@ -816,12 +851,28 @@ AGENT_DIR="$HH/hermes-agent"
 # current installs publish <install dir>/.hermes/bin/hermes (a launcher that
 # runs the interpreter of Hermes' own package manager), older ones keep
 # <install dir>/venv/bin/hermes. The first candidate that answers wins.
+# One failed answer is not a verdict: a launcher that is slow for a moment
+# (cold disk, a package manager updating itself) answers on the next try, so
+# every candidate gets three tries with a pause that grows. Nothing in this
+# script removes an install it did not create in this run, whatever the answer.
 find_hermes_launcher() {
-  for candidate in "$AGENT_DIR/.hermes/bin/hermes" "$AGENT_DIR/venv/bin/hermes" "$HH/bin/hermes"; do
-    if [ -x "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
+  probe_try=1
+  while [ "$probe_try" -le 3 ]; do
+    found_any=0
+    for candidate in "$AGENT_DIR/.hermes/bin/hermes" "$AGENT_DIR/venv/bin/hermes" "$HH/bin/hermes"; do
+      if [ -x "$candidate" ]; then
+        found_any=1
+        if "$candidate" --version >/dev/null 2>&1; then
+          printf '%s\n' "$candidate"
+          return 0
+        fi
+      fi
+    done
+    # Nothing there to ask at all: waiting would not change the answer.
+    [ "$found_any" -eq 1 ] || return 1
+    [ "$probe_try" -lt 3 ] || break
+    sleep $((probe_try * ${HERMES_SETUP_PROBE_PAUSE:-2})) 2>/dev/null || true
+    probe_try=$((probe_try + 1))
   done
   return 1
 }
@@ -837,22 +888,104 @@ cleanup_fresh_agent_attempt() {
   [ "$SERVICES_CREATED_BY_SETUP" -ne 1 ] || rmdir "$SERVICES" 2>/dev/null || true
   rmdir "$HH/bin" 2>/dev/null || true
 }
+# The official installer takes several minutes on a clean host. It runs in a
+# session of its own so that, if it outlives the limit (default 30 minutes,
+# HERMES_INSTALLER_TIMEOUT_SEC) or this setup is interrupted, the whole tree it
+# started (uv, git, python, npm, shells) is stopped before the lock is released.
+INSTALLER_TIMEOUT_SEC="${HERMES_INSTALLER_TIMEOUT_SEC:-1800}"
+case "$INSTALLER_TIMEOUT_SEC" in
+  ''|*[!0-9]*|0)
+    echo "ERROR: HERMES_INSTALLER_TIMEOUT_SEC must be a whole number of seconds above zero." >&2
+    exit 1
+    ;;
+esac
+run_hermes_installer() {
+  runner_python="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+  if [ -z "$runner_python" ]; then
+    curl -fsSL https://hermes-agent.nousresearch.com/install.sh | \
+      UV_NO_CACHE=1 bash -s -- --skip-setup --non-interactive --skip-browser --skip-computer-use \
+      --hermes-home "$HH" --dir "$AGENT_DIR"
+    return $?
+  fi
+  "$runner_python" - "$INSTALLER_TIMEOUT_SEC" sh -c \
+    'curl -fsSL https://hermes-agent.nousresearch.com/install.sh | UV_NO_CACHE=1 bash -s -- "$@"' \
+    hermes-installer --skip-setup --non-interactive --skip-browser --skip-computer-use \
+    --hermes-home "$HH" --dir "$AGENT_DIR" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+limit = int(sys.argv[1])
+child = subprocess.Popen(sys.argv[2:], start_new_session=True, stdin=subprocess.DEVNULL)
+
+
+def group_alive():
+    try:
+        os.killpg(child.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_tree():
+    for sig, patience in ((signal.SIGTERM, 8.0), (signal.SIGKILL, 8.0)):
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            break
+        end = time.monotonic() + patience
+        while time.monotonic() < end:
+            child.poll()
+            if not group_alive():
+                return
+            time.sleep(0.1)
+    child.poll()
+
+
+def interrupted(number, _frame):
+    stop_tree()
+    sys.exit(128 + number)
+
+
+for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+    signal.signal(getattr(signal, name), interrupted)
+
+try:
+    status = child.wait(timeout=limit)
+except subprocess.TimeoutExpired:
+    stop_tree()
+    sys.exit(124)
+if status != 0:
+    # A failed installer takes whatever it left running with it.
+    stop_tree()
+sys.exit(status if status >= 0 else 128 - status)
+PY
+}
 if [ -z "$HB" ]; then
   if [ -e "$AGENT_DIR" ] || [ -L "$AGENT_DIR" ] || \
      [ -e "$HH/node" ] || [ -L "$HH/node" ] || \
      [ -e "$HH/bin/hermes" ] || [ -L "$HH/bin/hermes" ] || \
      [ -e "$HH/bin/uv" ] || [ -L "$HH/bin/uv" ] || \
      [ -e "$HH/bin/uvx" ] || [ -L "$HH/bin/uvx" ]; then
-    echo "ERROR: an existing Hermes Agent tree or shim is not healthy; refusing to run the installer over it." >&2
-    echo "Repair or remove the broken installation explicitly, then rerun setup." >&2
+    echo "ERROR: an existing Hermes Agent tree or shim did not answer after three tries; refusing to run the installer over it." >&2
+    echo "Nothing was changed or removed. Repair or remove it explicitly if it is really broken, then rerun setup." >&2
     exit 1
   fi
   echo "Installing Hermes Agent for $PLATFORM..."
-  if ! curl -fsSL https://hermes-agent.nousresearch.com/install.sh | \
-      UV_NO_CACHE=1 bash -s -- --skip-setup --non-interactive --skip-browser --skip-computer-use \
-      --hermes-home "$HH" --dir "$AGENT_DIR"; then
+  installer_status=0
+  run_hermes_installer || installer_status=$?
+  if [ "$installer_status" -ne 0 ]; then
     cleanup_fresh_agent_attempt
-    echo "ERROR: Hermes Agent installation failed; fresh attempt artifacts were removed." >&2
+    if [ "$installer_status" -eq 124 ]; then
+      echo "ERROR: the Hermes Agent installer did not finish within ${INSTALLER_TIMEOUT_SEC}s; it was stopped together with everything it had started." >&2
+      echo "What this run had begun to create was removed and nothing that was there before was touched. Run setup again, or allow more time with HERMES_INSTALLER_TIMEOUT_SEC." >&2
+    else
+      echo "ERROR: Hermes Agent installation failed; fresh attempt artifacts were removed." >&2
+    fi
     exit 1
   fi
   HB="$(find_hermes_launcher || true)"
