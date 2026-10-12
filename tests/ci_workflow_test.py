@@ -35,6 +35,10 @@ def main() -> None:
         "tests/bootstrap-unix_test.sh",
         "tests/powershell_test.ps1",
         "powershell",
+        "schedule:",
+        "workflow_dispatch:",
+        "tests/linux-real-install_test.sh",
+        "tests/macos-install_test.sh",
         "pwsh",
     )
     for fragment in required:
