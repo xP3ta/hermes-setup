@@ -1,7 +1,46 @@
 #!/bin/sh
-# Hermes Console — verified Unix setup (Linux, macOS, Termux and explicit WSL).
+# Hermes Console — verified Unix setup (Linux, macOS and explicit WSL).
 # Native Windows uses hermes-mobile-setup.ps1 from the same public repository.
+#
+# It prepares the two services of Hermes itself that the app talks to, the
+# Gateway and the Dashboard, and shows one code to scan. It installs no
+# companion service: the Mobile Bridge of earlier versions is gone, and
+# --retire-bridge removes one that an earlier setup left behind.
 set -eu
+
+# What to do. Piped from curl, an option goes after "sh -s --":
+#   curl -fsSL .../hermes-mobile-setup.sh | sh -s -- --new-access
+ACTION="setup"
+for _hermes_arg in "$@"; do
+  case "$_hermes_arg" in
+    --retire-bridge) ACTION="retire-bridge" ;;
+    --new-access) ACTION="new-access" ;;
+    -h|--help) ACTION="help" ;;
+    *)
+      echo "Unknown option: $_hermes_arg"
+      echo "Run it with --help to see what it can do."
+      exit 2
+      ;;
+  esac
+done
+case "$ACTION" in
+  setup|new-access|retire-bridge) ;;
+  help)
+    echo "Console setup for Hermes Agent"
+    echo ""
+    echo "  (no option)       Get this computer ready and show the code to scan."
+    echo "  --new-access      Make a new Dashboard sign-in and show a new code."
+    echo "                    Browsers and phones signed in before must sign in again."
+    echo "  --retire-bridge   Stop and remove the old Mobile Bridge. Nothing else"
+    echo "                    is touched. Console 1.2.15 and newer do not use it;"
+    echo "                    older versions still do."
+    exit 0
+    ;;
+  *)
+    echo "Unknown action: $ACTION"
+    exit 2
+    ;;
+esac
 
 REPO_RAW="${HERMES_REPO_RAW:-https://raw.githubusercontent.com/xP3ta/hermes-setup/main}"
 WINDOWS_COMMAND="irm $REPO_RAW/hermes-mobile-setup.ps1 | iex"
@@ -22,7 +61,7 @@ esac
 # so it is the reliable default. Routed WSL installations may opt in with an
 # explicit address.
 if [ "$PLATFORM" = "linux" ] && { [ -n "${WSL_INTEROP:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; }; then
-  if [ -z "${HERMES_PAIR_HOST:-}" ]; then
+  if [ -z "${HERMES_PAIR_HOST:-}" ] && [ "$ACTION" != "retire-bridge" ]; then
     echo "WSL detected. Its automatic IP is not reliably reachable from a phone."
     echo "Run the native Windows installer in PowerShell instead:"
     echo "  $WINDOWS_COMMAND"
@@ -105,7 +144,7 @@ acquire_setup_lock() {
   umask 077
   if ! mkdir "$SETUP_LOCK_DIR" 2>/dev/null; then
     umask "$old_umask"
-    echo "ERROR: another Hermes Console setup is already running for this user." >&2
+    echo "ERROR: another Console setup is already running for this user." >&2
     return 1
   fi
   umask "$old_umask"
@@ -333,10 +372,10 @@ preflight_service_ownership() {
   launchd_dir="$HOME/Library/LaunchAgents"
   case "$SERVICE_MANAGER" in
     systemd)
-      for unit in hermes-gateway.service hermes-dashboard.service hermes-bridge.service; do
+      for unit in hermes-gateway.service hermes-dashboard.service; do
         assert_systemd_unit_owner "$unit" || return 1
       done
-      for label in dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard dev.xpetalab.hermes-console.bridge; do
+      for label in dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard; do
         [ ! -e "$launchd_dir/$label.plist" ] || {
           echo "ERROR: stale launchd definition $label conflicts with systemd; refusing migration." >&2
           return 1
@@ -344,11 +383,11 @@ preflight_service_ownership() {
       done
       ;;
     launchd)
-      for label in dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard dev.xpetalab.hermes-console.bridge; do
+      for label in dev.xpetalab.hermes-console.gateway dev.xpetalab.hermes-console.dashboard; do
         assert_launchd_plist_owner "$label" || return 1
         assert_loaded_launchd_job_owner "$label" || return 1
       done
-      for unit in hermes-gateway.service hermes-dashboard.service hermes-bridge.service; do
+      for unit in hermes-gateway.service hermes-dashboard.service; do
         [ ! -e "$systemd_dir/$unit" ] || {
           echo "ERROR: stale systemd definition $unit conflicts with launchd; refusing migration." >&2
           return 1
@@ -359,16 +398,14 @@ preflight_service_ownership() {
       for path in \
         "$systemd_dir/hermes-gateway.service" \
         "$systemd_dir/hermes-dashboard.service" \
-        "$systemd_dir/hermes-bridge.service" \
         "$launchd_dir/dev.xpetalab.hermes-console.gateway.plist" \
-        "$launchd_dir/dev.xpetalab.hermes-console.dashboard.plist" \
-        "$launchd_dir/dev.xpetalab.hermes-console.bridge.plist"; do
+        "$launchd_dir/dev.xpetalab.hermes-console.dashboard.plist"; do
         [ ! -e "$path" ] || {
           echo "ERROR: $path exists but its effective manager state is unavailable; refusing migration." >&2
           return 1
         }
       done
-      for name in gateway dashboard bridge; do
+      for name in gateway dashboard; do
         pidfile="$HH/console-services/$name.pid"
         [ -f "$pidfile" ] || continue
         pid="$(sed -n '1p' "$pidfile" 2>/dev/null || true)"
@@ -379,7 +416,10 @@ preflight_service_ownership() {
             ;;
         esac
         if kill -0 "$pid" 2>/dev/null; then
-          echo "ERROR: live portable $name PID $pid cannot be migrated transactionally; stop it explicitly before setup." >&2
+          echo "ERROR: Hermes is running here without a service manager, and setup cannot replace it while it runs ($name, process $pid)." >&2
+          echo "Stop it first, then run this again:" >&2
+          echo "  sh $HH/console-services/service-manager.sh stop gateway" >&2
+          echo "  sh $HH/console-services/service-manager.sh stop dashboard" >&2
           return 1
         fi
       done
@@ -388,18 +428,211 @@ preflight_service_ownership() {
 }
 
 select_service_manager
+
+# LEGACY: cleanup of the Mobile Bridge that setups before Console 1.2.15 installed
+# (--retire-bridge and what it needs). Removed with Console 1.2.17.
+# What an earlier setup may have left of the Mobile Bridge. Setup itself no
+# longer creates, starts or checks any of it; only --retire-bridge touches it.
+# Its backups ($HH/backups/bridge) and logs are the user's and stay.
+BRIDGE_SYSTEMD_UNIT="$HOME/.config/systemd/user/hermes-bridge.service"
+BRIDGE_LAUNCHD_LABEL="dev.xpetalab.hermes-console.bridge"
+BRIDGE_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$BRIDGE_LAUNCHD_LABEL.plist"
+
+bridge_files() {
+  printf '%s\n' \
+    "$HH/hermes_bridge.py" \
+    "$HH/hermes_bridge.py.rollback" \
+    "$HH/hermes_bridge.py.new" \
+    "$HH/bridge.env" \
+    "$HH/bridge_token" \
+    "$HH/bridge-release.json.new" \
+    "$HH/console-services/hermes-bridge.sh" \
+    "$HH/console-services/bridge-release-check.py" \
+    "$HH/console-services/bridge.pid" \
+    "$HH/console-services/bridge.start" \
+    "$HH/console-services/bridge.exe"
+}
+
+bridge_leftovers() {
+  for path in "$BRIDGE_SYSTEMD_UNIT" "$BRIDGE_LAUNCHD_PLIST"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      printf '%s\n' "$path"
+    fi
+  done
+  bridge_files | while IFS= read -r path; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      printf '%s\n' "$path"
+    fi
+  done
+}
+
+# Without systemd or launchd the old setup started the bridge itself and wrote
+# down its PID. That PID is signalled only while it is still that process: the
+# same kernel start time when one was recorded, and the bridge of THIS Hermes
+# home on its command line. Anything else is left alone.
+stop_portable_bridge() {
+  pidfile="$HH/console-services/bridge.pid"
+  [ -f "$pidfile" ] || return 0
+  pid="$(sed -n '1p' "$pidfile" 2>/dev/null || true)"
+  case "$pid" in
+    *[!0-9]*|'') return 0 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 0
+  retire_python="$HH/hermes-agent/venv/bin/python3"
+  [ -x "$retire_python" ] || retire_python="$HH/hermes-agent/venv/bin/python"
+  [ -x "$retire_python" ] || retire_python="$(ownership_python)"
+  if [ -z "$retire_python" ] || [ ! -x "$retire_python" ]; then
+    echo "ERROR: process $pid may be the Mobile Bridge, but it cannot be identified safely without Python." >&2
+    echo "Nothing was removed. Stop that process yourself, then run this again." >&2
+    return 1
+  fi
+  recorded_start="$(sed -n '1p' "$HH/console-services/bridge.start" 2>/dev/null || true)"
+  retire_status=0
+  if "$retire_python" - "$pid" "$recorded_start" "$HH/hermes_bridge.py" <<'PY_RETIRE'
+import os, select, signal, sys
+
+pid = int(sys.argv[1])
+recorded_start, bridge_path = sys.argv[2:]
+try:
+    pidfd = os.pidfd_open(pid)
+except ProcessLookupError:
+    raise SystemExit(0)
+except (AttributeError, OSError):
+    raise SystemExit(4)
+try:
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as source:
+            rest = source.read().rstrip().rsplit(") ", 1)[1].split()
+        with open(f"/proc/{pid}/cmdline", "rb") as source:
+            arguments = [os.fsdecode(item) for item in source.read().split(b"\0") if item]
+    except (OSError, IndexError):
+        raise SystemExit(4)
+    same_start = not recorded_start or rest[19] == recorded_start
+    wanted = os.path.realpath(bridge_path)
+    runs_bridge = any(os.path.realpath(item) == wanted for item in arguments[1:])
+    if not (same_start and runs_bridge):
+        raise SystemExit(3)
+    signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+    if not select.select([pidfd], [], [], 10)[0]:
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        if not select.select([pidfd], [], [], 5)[0]:
+            raise SystemExit(1)
+finally:
+    os.close(pidfd)
+PY_RETIRE
+  then
+    retire_status=0
+  else
+    retire_status=$?
+  fi
+  case "$retire_status" in
+    0) return 0 ;;
+    3)
+      echo "Process $pid is no longer the Mobile Bridge; it was left alone."
+      return 0
+      ;;
+    4)
+      echo "ERROR: process $pid may be the Mobile Bridge, but this system cannot identify it safely." >&2
+      echo "Nothing was removed. Stop that process yourself, then run this again." >&2
+      return 1
+      ;;
+    *)
+      echo "ERROR: the Mobile Bridge (process $pid) did not stop. Nothing was removed." >&2
+      return 1
+      ;;
+  esac
+}
+
+# Stop, disable and remove the Mobile Bridge and nothing else. Running it twice,
+# or on a computer that never had one, changes nothing and succeeds.
+# The seal every step of this installer opens with, when a person is watching.
+setup_seal() {
+  [ -t 1 ] || return 0
+  printf '\n  ================================================================\n'
+  printf '    xPetaLab  |  CONSOLE\n'
+  printf '  ================================================================\n'
+}
+
+retire_bridge() {
+  if [ -z "$(bridge_leftovers)" ]; then
+    echo "There is no Mobile Bridge on this computer. Nothing to do."
+    return 0
+  fi
+  if [ -L "$HH/console-services" ]; then
+    echo "ERROR: $HH/console-services is a symbolic link; nothing was removed." >&2
+    return 1
+  fi
+  if [ -e "$BRIDGE_SYSTEMD_UNIT" ] || [ -L "$BRIDGE_SYSTEMD_UNIT" ]; then
+    if [ "$SERVICE_MANAGER" != "systemd" ]; then
+      echo "ERROR: the Mobile Bridge service belongs to your own login session, which is not available here." >&2
+      echo "Open a terminal as yourself (not through sudo or su) and run this again. Nothing was removed." >&2
+      return 1
+    fi
+    if ! assert_systemd_unit_owner hermes-bridge.service; then
+      echo "Nothing was removed." >&2
+      return 1
+    fi
+    systemctl --user disable --now hermes-bridge.service >/dev/null 2>&1 || true
+    if systemctl --user is-active --quiet hermes-bridge.service; then
+      echo "ERROR: the Mobile Bridge service is still running. Nothing was removed." >&2
+      return 1
+    fi
+    rm -f "$BRIDGE_SYSTEMD_UNIT"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user reset-failed hermes-bridge.service >/dev/null 2>&1 || true
+  fi
+  if [ -e "$BRIDGE_LAUNCHD_PLIST" ] || [ -L "$BRIDGE_LAUNCHD_PLIST" ]; then
+    if [ "$SERVICE_MANAGER" != "launchd" ]; then
+      echo "ERROR: the Mobile Bridge job belongs to your own login session, which is not available here." >&2
+      echo "Open Terminal as yourself (not through sudo or ssh) and run this again. Nothing was removed." >&2
+      return 1
+    fi
+    if ! assert_launchd_plist_owner "$BRIDGE_LAUNCHD_LABEL" || \
+       ! assert_loaded_launchd_job_owner "$BRIDGE_LAUNCHD_LABEL"; then
+      echo "Nothing was removed." >&2
+      return 1
+    fi
+    if launchctl print "gui/$(id -u)/$BRIDGE_LAUNCHD_LABEL" >/dev/null 2>&1; then
+      launchctl bootout "gui/$(id -u)/$BRIDGE_LAUNCHD_LABEL" >/dev/null 2>&1 || true
+    fi
+    if launchctl print "gui/$(id -u)/$BRIDGE_LAUNCHD_LABEL" >/dev/null 2>&1; then
+      echo "ERROR: the Mobile Bridge job is still loaded. Nothing was removed." >&2
+      return 1
+    fi
+    rm -f "$BRIDGE_LAUNCHD_PLIST"
+  fi
+  stop_portable_bridge || return 1
+  bridge_files | while IFS= read -r path; do
+    rm -f "$path" 2>/dev/null || true
+  done
+  if [ -n "$(bridge_leftovers)" ]; then
+    echo "ERROR: part of the Mobile Bridge could not be removed:" >&2
+    bridge_leftovers >&2
+    return 1
+  fi
+  echo "Done. The old Mobile Bridge is stopped and removed."
+  echo "Hermes, its Gateway and its Dashboard were not touched: Console 1.2.15 or newer keeps working."
+  if command -v ufw >/dev/null 2>&1 || command -v firewall-cmd >/dev/null 2>&1; then
+    echo "Port ${HERMES_BRIDGE_PORT:-9131} is no longer used. A firewall rule that opened it can be deleted; nothing listens there now."
+  fi
+}
+
+if [ "$ACTION" = "retire-bridge" ]; then
+  setup_seal
+  retire_status_final=0
+  retire_bridge || retire_status_final=$?
+  exit "$retire_status_final"
+fi
+
 preflight_service_ownership
 
 SERVICES="$HH/console-services"
 LOGS="$HH/logs"
 PROBE="$SERVICES/hermes-service-probe.py"
 PAIR_ENV="$SERVICES/pairing.env"
-TARGET="$HH/hermes_bridge.py"
-BACKUP="$TARGET.rollback"
-ENV_FILE="$HH/bridge.env"
+DASH_LOGIN_FILE="$SERVICES/dashboard-login.json"
 GATEWAY_RUNNER="$SERVICES/hermes-gateway.sh"
 DASHBOARD_RUNNER="$SERVICES/hermes-dashboard.sh"
-BRIDGE_RUNNER="$SERVICES/hermes-bridge.sh"
 HELPER="$SERVICES/service-manager.sh"
 for managed_dir in "$SERVICES" "$LOGS"; do
   if [ -L "$managed_dir" ]; then
@@ -430,10 +663,8 @@ SETUP_PROGRESS_LABEL=""
 
 setup_banner() {
   [ "$SETUP_LIVE" -eq 1 ] || return 0
-  printf '\n  ================================================================\n'
-  printf '    xPetaLab  |  HERMES CONSOLE\n'
-  printf '  ================================================================\n'
-  printf '    Self-hosted Hermes Agent + Gateway + Dashboard + Mobile Bridge\n'
+  setup_seal
+  printf '    Self-hosted Hermes Agent + Gateway + Dashboard\n'
   printf '    %s - no popups, no telemetry\n' "$(uname -s 2>/dev/null || echo Unix)"
   printf '  ================================================================\n\n'
 }
@@ -502,7 +733,7 @@ setup_step() {
 }
 
 setup_banner
-setup_step "Inspecting platform and service manager"
+setup_step "Looking at this computer"
 
 port_listening() {
   port="$1"
@@ -566,10 +797,10 @@ if [ "$SERVICE_MANAGER" = "systemd" ]; then
   fi
 fi
 
-setup_step "Checking Hermes Agent"
+setup_step "Checking Hermes"
 
 # Hermes Agent. A launcher only counts when it responds; stale shims from a
-# half-finished uninstall must not produce three crash-looping services.
+# half-finished uninstall must not produce crash-looping services.
 AGENT_DIR="$HH/hermes-agent"
 HB="$AGENT_DIR/venv/bin/hermes"
 cleanup_fresh_agent_attempt() {
@@ -609,7 +840,7 @@ if ! { [ -x "$HB" ] && "$HB" --version >/dev/null 2>&1; }; then
   fi
 fi
 
-# Python that owns the Hermes environment (and therefore aiohttp).
+# Python that owns the Hermes environment (its configuration API included).
 VP="$HH/hermes-agent/venv/bin/python3"
 [ -x "$VP" ] || VP="$HH/hermes-agent/venv/bin/python"
 if [ ! -x "$VP" ]; then
@@ -625,13 +856,9 @@ if [ ! -x "$VP" ]; then
 fi
 [ -x "$VP" ] || VP="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
 if [ -z "$VP" ] || [ ! -x "$VP" ]; then
-  echo "ERROR: no Python interpreter is available for the Mobile Bridge."
+  echo "ERROR: Hermes has no usable Python interpreter; repair the Hermes installation first."
   exit 1
 fi
-"$VP" -c 'import aiohttp' 2>/dev/null || {
-  echo "ERROR: $VP does not provide aiohttp; repair the Hermes installation first."
-  exit 1
-}
 
 TRANSACTION_PENDING=0
 TRANSACTION_DIR=""
@@ -640,21 +867,16 @@ transaction_path() {
   case "$1" in
     env) printf '%s\n' "$HH/.env" ;;
     probe) printf '%s\n' "$PROBE" ;;
-    bridge) printf '%s\n' "$TARGET" ;;
-    bridge_rollback) printf '%s\n' "$BACKUP" ;;
-    bridge_env) printf '%s\n' "$ENV_FILE" ;;
     gateway_runner) printf '%s\n' "$GATEWAY_RUNNER" ;;
     dashboard_runner) printf '%s\n' "$DASHBOARD_RUNNER" ;;
-    bridge_runner) printf '%s\n' "$BRIDGE_RUNNER" ;;
     helper) printf '%s\n' "$HELPER" ;;
     pair_env) printf '%s\n' "$PAIR_ENV" ;;
+    dash_login) printf '%s\n' "$DASH_LOGIN_FILE" ;;
     systemd_gateway) printf '%s\n' "$HOME/.config/systemd/user/hermes-gateway.service" ;;
     systemd_dashboard) printf '%s\n' "$HOME/.config/systemd/user/hermes-dashboard.service" ;;
-    systemd_bridge) printf '%s\n' "$HOME/.config/systemd/user/hermes-bridge.service" ;;
     systemd_dropin) printf '%s\n' "$HOME/.config/systemd/user/hermes-gateway.service.d/10-hermes-console-network.conf" ;;
     launchd_gateway) printf '%s\n' "$HOME/Library/LaunchAgents/dev.xpetalab.hermes-console.gateway.plist" ;;
     launchd_dashboard) printf '%s\n' "$HOME/Library/LaunchAgents/dev.xpetalab.hermes-console.dashboard.plist" ;;
-    launchd_bridge) printf '%s\n' "$HOME/Library/LaunchAgents/dev.xpetalab.hermes-console.bridge.plist" ;;
     *) return 2 ;;
   esac
 }
@@ -691,14 +913,14 @@ restore_transaction_file() {
 }
 
 begin_transaction() {
-  TRANSACTION_KEYS="env probe bridge bridge_rollback bridge_env gateway_runner dashboard_runner bridge_runner helper pair_env systemd_gateway systemd_dashboard systemd_bridge systemd_dropin launchd_gateway launchd_dashboard launchd_bridge"
+  TRANSACTION_KEYS="env probe gateway_runner dashboard_runner helper pair_env dash_login systemd_gateway systemd_dashboard systemd_dropin launchd_gateway launchd_dashboard"
   TRANSACTION_DIR="$(mktemp -d "$SERVICES/setup-transaction.XXXXXX")"
   TRANSACTION_PENDING=1
   for key in $TRANSACTION_KEYS; do
     snapshot_transaction_file "$key"
   done
   if [ "$SERVICE_MANAGER" = "systemd" ]; then
-    for name in gateway dashboard bridge; do
+    for name in gateway dashboard; do
       if systemctl --user is-active --quiet "hermes-$name"; then
         printf '1\n' > "$TRANSACTION_DIR/systemd_$name.active"
       else
@@ -711,7 +933,7 @@ begin_transaction() {
       fi
     done
   elif [ "$SERVICE_MANAGER" = "launchd" ]; then
-    for name in gateway dashboard bridge; do
+    for name in gateway dashboard; do
       label="dev.xpetalab.hermes-console.$name"
       if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
         printf '1\n' > "$TRANSACTION_DIR/launchd_$name.loaded"
@@ -725,7 +947,7 @@ begin_transaction() {
 restore_systemd_state() {
   restore_failed=0
   if ! systemctl --user daemon-reload >/dev/null 2>&1; then restore_failed=1; fi
-  for name in gateway dashboard bridge; do
+  for name in gateway dashboard; do
     had_unit="$(sed -n '1p' "$TRANSACTION_DIR/systemd_$name.had" 2>/dev/null || true)"
     if [ "$had_unit" = "0" ]; then continue; fi
     if [ "$had_unit" != "1" ]; then restore_failed=1; continue; fi
@@ -751,13 +973,16 @@ cleanup_transaction_backups() {
   for key in $TRANSACTION_KEYS; do
     rm -f "$TRANSACTION_DIR/$key.had" "$TRANSACTION_DIR/$key.data" || cleanup_failed=1
   done
-  for name in gateway dashboard bridge; do
+  for name in gateway dashboard; do
     rm -f \
       "$TRANSACTION_DIR/systemd_$name.active" \
       "$TRANSACTION_DIR/systemd_$name.enabled" \
       "$TRANSACTION_DIR/launchd_$name.loaded" || cleanup_failed=1
   done
   rm -f "$TRANSACTION_DIR/ufw.added" "$TRANSACTION_DIR/firewalld.added" || cleanup_failed=1
+  rm -f \
+    "$TRANSACTION_DIR/dashboard-access.state" \
+    "$TRANSACTION_DIR/dashboard-access.previous.json" || cleanup_failed=1
   if ! rmdir "$TRANSACTION_DIR" 2>/dev/null; then cleanup_failed=1; fi
   if [ "$cleanup_failed" -eq 0 ]; then TRANSACTION_DIR=""; fi
   return "$cleanup_failed"
@@ -790,20 +1015,47 @@ rollback_private_firewall() {
   return "$firewall_rollback_failed"
 }
 
+# A sign-in this attempt wrote into Hermes' configuration is taken back with
+# the rest: after a failed setup the Dashboard accepts what it accepted before.
+rollback_dashboard_access() {
+  [ -n "$TRANSACTION_DIR" ] || return 0
+  [ -f "$TRANSACTION_DIR/dashboard-access.previous.json" ] || return 0
+  HERMES_HOME="$HH" "$VP" - "$TRANSACTION_DIR/dashboard-access.previous.json" >/dev/null 2>&1 <<'PY_DASH_RESTORE'
+import json, pathlib, sys
+
+from hermes_cli.config import load_config, save_config
+
+previous = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+cfg = load_config()
+if not isinstance(cfg.get("dashboard"), dict):
+    cfg["dashboard"] = {}
+if not isinstance(cfg["dashboard"].get("basic_auth"), dict):
+    cfg["dashboard"]["basic_auth"] = {}
+basic = cfg["dashboard"]["basic_auth"]
+for key, value in previous.items():
+    if value is None:
+        basic.pop(key, None)
+    else:
+        basic[key] = value
+save_config(cfg)
+PY_DASH_RESTORE
+}
+
 rollback_transaction() {
   [ "$TRANSACTION_PENDING" -eq 1 ] || return 0
   TRANSACTION_PENDING=0
   rollback_failed=0
   if ! rollback_private_firewall; then rollback_failed=1; fi
+  if ! rollback_dashboard_access; then rollback_failed=1; fi
   if [ "$SERVICE_LIFECYCLE_TOUCHED" -eq 1 ]; then
     case "$SERVICE_MANAGER" in
       systemd)
-        for name in gateway dashboard bridge; do
+        for name in gateway dashboard; do
           if ! systemctl --user stop "hermes-$name" >/dev/null 2>&1; then rollback_failed=1; fi
         done
         ;;
       launchd)
-        for name in gateway dashboard bridge; do
+        for name in gateway dashboard; do
           label="dev.xpetalab.hermes-console.$name"
           if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 && \
              ! launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1; then
@@ -813,7 +1065,7 @@ rollback_transaction() {
         ;;
       portable)
         if [ -x "$HELPER" ]; then
-          for name in gateway dashboard bridge; do
+          for name in gateway dashboard; do
             if ! "$HELPER" stop "$name" >/dev/null 2>&1; then rollback_failed=1; fi
           done
         fi
@@ -829,7 +1081,7 @@ rollback_transaction() {
         if ! restore_systemd_state; then rollback_failed=1; fi
         ;;
       launchd)
-        for name in gateway dashboard bridge; do
+        for name in gateway dashboard; do
           loaded="$(sed -n '1p' "$TRANSACTION_DIR/launchd_$name.loaded" 2>/dev/null || true)"
           [ "$loaded" = "1" ] || continue
           label="dev.xpetalab.hermes-console.$name"
@@ -935,22 +1187,21 @@ if [ -z "$HOST" ]; then
 fi
 
 # Puertos de servicio: defaults historicos, con overrides para un host que ya
-# tiene 8642/9119/9131 ocupados. Todo consumidor (unidades, runners, firewall,
+# tiene 8642/9119 ocupados. Todo consumidor (unidades, runners, firewall,
 # probes, enlace de pairing) sale de aqui.
 GATEWAY_PORT="${HERMES_GATEWAY_PORT:-8642}"
 DASHBOARD_PORT="${HERMES_DASHBOARD_PORT:-9119}"
-BRIDGE_PORT="${HERMES_BRIDGE_PORT:-9131}"
-for _hermes_port in "$GATEWAY_PORT" "$DASHBOARD_PORT" "$BRIDGE_PORT"; do
+for _hermes_port in "$GATEWAY_PORT" "$DASHBOARD_PORT"; do
   case "$_hermes_port" in
-    *[!0-9]*|'') echo "ERROR: HERMES_GATEWAY_PORT, HERMES_DASHBOARD_PORT and HERMES_BRIDGE_PORT must be TCP ports. No changes were made."; exit 1 ;;
+    *[!0-9]*|'') echo "ERROR: HERMES_GATEWAY_PORT and HERMES_DASHBOARD_PORT must be TCP ports. No changes were made."; exit 1 ;;
   esac
   if [ "$_hermes_port" -lt 1 ] || [ "$_hermes_port" -gt 65535 ]; then
     echo "ERROR: a Hermes service port is out of range. No changes were made."
     exit 1
   fi
 done
-if [ "$GATEWAY_PORT" = "$DASHBOARD_PORT" ] || [ "$GATEWAY_PORT" = "$BRIDGE_PORT" ] || [ "$DASHBOARD_PORT" = "$BRIDGE_PORT" ]; then
-  echo "ERROR: HERMES_GATEWAY_PORT, HERMES_DASHBOARD_PORT and HERMES_BRIDGE_PORT must be three different ports. No changes were made."
+if [ "$GATEWAY_PORT" = "$DASHBOARD_PORT" ]; then
+  echo "ERROR: HERMES_GATEWAY_PORT and HERMES_DASHBOARD_PORT must be two different ports. No changes were made."
   exit 1
 fi
 
@@ -1045,11 +1296,9 @@ case "$BASE_HOST" in *:*) BASE_HOST="[$BASE_HOST]" ;; esac
 GATEWAY_BASE="$PAIR_SCHEME://$BASE_HOST:$PAIR_PORT"
 if [ "$PAIR_SCHEME" = "http" ]; then
   DASHBOARD_BASE="${HERMES_DASHBOARD_URL:-http://$BASE_HOST:$DASHBOARD_PORT}"
-  BRIDGE_BASE="${HERMES_BRIDGE_URL:-http://$BASE_HOST:$BRIDGE_PORT}"
   BIND_HOST="${HERMES_SERVICE_BIND_HOST:-0.0.0.0}"
 else
   DASHBOARD_BASE="${HERMES_DASHBOARD_URL:-$GATEWAY_BASE}"
-  BRIDGE_BASE="${HERMES_BRIDGE_URL:-$GATEWAY_BASE}"
   BIND_HOST="${HERMES_SERVICE_BIND_HOST:-127.0.0.1}"
 fi
 case "$BIND_HOST" in
@@ -1208,31 +1457,6 @@ try:
                 "/api/sessions is not the authenticated Hermes API"
             )
         assert_auth_required("/api/sessions")
-    elif kind == "bridge":
-        health = fetch("/bridge/health")
-        if health.get("status") != "ok" or not isinstance(
-            health.get("version"), str
-        ):
-            raise RuntimeError("/bridge/health is not Hermes Mobile Bridge")
-        if expected and health.get("version") != expected:
-            raise RuntimeError(
-                f"Bridge version is {health.get('version')}, expected {expected}"
-            )
-        caps = fetch("/bridge/capabilities", auth=True)
-        operations = caps.get("operations")
-        scopes = caps.get("scopes")
-        if (
-            caps.get("object") != "hermes.bridge.capabilities"
-            or not isinstance(operations, dict)
-            or operations.get("self_update") is not True
-            or not isinstance(scopes, list)
-            or "read" not in scopes
-            or "config" not in scopes
-        ):
-            raise RuntimeError(
-                "Bridge auth/config/self-update capability check failed"
-            )
-        assert_auth_required("/bridge/capabilities")
     elif kind == "dashboard":
         status = fetch("/api/status")
         if not isinstance(status.get("version"), str) or not isinstance(
@@ -1267,12 +1491,8 @@ wait_probe() {
   return 1
 }
 
-setup_step "Verifying Mobile Bridge release"
+setup_step "Preparing the services"
 
-# Verified Bridge release: closed manifest, exact size/hash/version, compile,
-# backup and atomic swap. No bytes execute before every check passes.
-NEW="$TARGET.new"
-MANIFEST="$HH/bridge-release.json.new"
 SYSTEMD_STAGE=""
 SYSTEMD_GATEWAY_PENDING=0
 SYSTEMD_GATEWAY_HAD_UNIT=0
@@ -1306,7 +1526,6 @@ cleanup_systemd_stage() {
     "$SYSTEMD_STAGE/hermes-gateway.service.d/10-hermes-console-network.conf" \
     "$SYSTEMD_STAGE/hermes-gateway.service" \
     "$SYSTEMD_STAGE/hermes-dashboard.service" \
-    "$SYSTEMD_STAGE/hermes-bridge.service" \
     "$SYSTEMD_STAGE/hermes-gateway.service.previous" \
     "$SYSTEMD_STAGE/hermes-gateway-network.conf.previous"
   rmdir "$SYSTEMD_STAGE/hermes-gateway.service.d" 2>/dev/null || true
@@ -1314,59 +1533,9 @@ cleanup_systemd_stage() {
   SYSTEMD_STAGE=""
 }
 cleanup_downloads() {
-  rm -f "$NEW" "$MANIFEST"
   rollback_pending_systemd_gateway
   cleanup_systemd_stage
 }
-curl -fsSL "$REPO_RAW/bridge-release.json" -o "$MANIFEST"
-curl -fsSL "$REPO_RAW/hermes_bridge.py" -o "$NEW"
-# bash 3.2 (el /bin/sh de macOS) no salta el cuerpo de un heredoc al buscar el
-# cierre de $( ... ): cualquier ")" del cuerpo lo desincroniza y el parser se
-# pierde. El verificador se escribe a fichero y se invoca sin anidar nada.
-BRIDGE_VERIFY_SCRIPT="$SERVICES/bridge-release-check.py"
-cat > "$BRIDGE_VERIFY_SCRIPT" <<'PY'
-import hashlib, json, pathlib, re, sys
-manifest_path, bridge_path = map(pathlib.Path, sys.argv[1:])
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-if set(manifest) != {"schema", "version", "min_app_build", "sha256", "size"}:
-    raise SystemExit("Invalid Bridge release manifest fields")
-version = manifest.get("version")
-digest = manifest.get("sha256")
-size = manifest.get("size")
-if (manifest.get("schema") != 1
-        or not isinstance(version, str)
-        or not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version)
-        or not isinstance(manifest.get("min_app_build"), int)
-        or manifest["min_app_build"] <= 0
-        or not isinstance(digest, str)
-        or not re.fullmatch(r"[a-f0-9]{64}", digest)
-        or not isinstance(size, int) or size <= 0 or size > 512 * 1024):
-    raise SystemExit("Invalid Bridge release manifest")
-payload = bridge_path.read_bytes()
-if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
-    raise SystemExit("Bridge release integrity check failed")
-source = payload.decode("utf-8", errors="strict")
-versions = re.findall(
-    r'''^VERSION\s*=\s*["']((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))["']\s*(?:#.*)?$''',
-    source, re.MULTILINE)
-if versions != [version]:
-    raise SystemExit("Bridge source VERSION mismatch")
-compile(source, str(bridge_path), "exec")
-print(version)
-PY
-BRIDGE_VERSION="$("$VP" "$BRIDGE_VERIFY_SCRIPT" "$MANIFEST" "$NEW")"
-chmod 600 "$NEW"
-"$VP" -m py_compile "$NEW"
-if [ -f "$TARGET" ]; then
-  cp -p "$TARGET" "$BACKUP"
-else
-  rm -f "$BACKUP"
-fi
-mv "$NEW" "$TARGET"
-
-printf 'BRIDGE_HOST=%s\nBRIDGE_PORT=%s\nBRIDGE_SCOPES=read,memory,soul,skills,cron,config,command\nBRIDGE_READ_ONLY=false\nBRIDGE_TOKEN=%s\n' "$BIND_HOST" "$BRIDGE_PORT" "$KEY" > "$ENV_FILE"
-chmod 600 "$ENV_FILE"
-
 cat > "$GATEWAY_RUNNER" <<EOF
 #!/bin/sh
 export HERMES_HOME="$HH"
@@ -1388,20 +1557,7 @@ export PATH="$HH/node/bin:$HH/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH"
 cd "$HH"
 exec "$HB" dashboard --host "$BIND_HOST" --port "$DASHBOARD_PORT" --no-open
 EOF
-HELPER_EXPORT=""
-[ "$SERVICE_MANAGER" = "portable" ] && HELPER_EXPORT="export BRIDGE_SERVICE_HELPER=\"$HELPER\""
-cat > "$BRIDGE_RUNNER" <<EOF
-#!/bin/sh
-set -a
-. "$ENV_FILE"
-set +a
-export HERMES_HOME="$HH"
-export BRIDGE_HERMES_HOME="$HH"
-$HELPER_EXPORT
-cd "$HH"
-exec "$VP" "$TARGET" --i-know-what-im-doing
-EOF
-chmod 700 "$GATEWAY_RUNNER" "$DASHBOARD_RUNNER" "$BRIDGE_RUNNER"
+chmod 700 "$GATEWAY_RUNNER" "$DASHBOARD_RUNNER"
 
 # Portable lifecycle helper. It only signals a PID through pidfd after its
 # kernel start time and executable match the identity captured at startup.
@@ -1413,7 +1569,6 @@ NAME="${2:-}"
 case "$NAME" in
   gateway) RUNNER="__GATEWAY_RUNNER__"; EXPECTED_ONE="__VP__"; EXPECTED_TWO="__HB__" ;;
   dashboard) RUNNER="__DASHBOARD_RUNNER__"; EXPECTED_ONE="__VP__"; EXPECTED_TWO="__HB__" ;;
-  bridge) RUNNER="__BRIDGE_RUNNER__"; EXPECTED_ONE="__VP__"; EXPECTED_TWO="__VP__" ;;
   *) exit 2 ;;
 esac
 PIDFILE="__SERVICES__/$NAME.pid"
@@ -1540,7 +1695,7 @@ HELPER_EOF
 # El cuerpo se escribe como datos y se sustituye despues. Un heredoc sin citar que
 # contiene otro heredoc y parentesis sin compensar (el helper portable) rompe el
 # parser de bash 3.2, que es el /bin/sh de macOS: el script ni siquiera parseaba.
-"$VP" - "$HELPER" "$VP" "$HB" "$GATEWAY_RUNNER" "$DASHBOARD_RUNNER" "$BRIDGE_RUNNER" "$SERVICES" "$LOGS" <<'PY'
+"$VP" - "$HELPER" "$VP" "$HB" "$GATEWAY_RUNNER" "$DASHBOARD_RUNNER" "$SERVICES" "$LOGS" <<'PY'
 import pathlib, sys
 
 path = sys.argv[1]
@@ -1549,9 +1704,8 @@ pairs = (
     ("__HB__", sys.argv[3]),
     ("__GATEWAY_RUNNER__", sys.argv[4]),
     ("__DASHBOARD_RUNNER__", sys.argv[5]),
-    ("__BRIDGE_RUNNER__", sys.argv[6]),
-    ("__SERVICES__", sys.argv[7]),
-    ("__LOGS__", sys.argv[8]),
+    ("__SERVICES__", sys.argv[6]),
+    ("__LOGS__", sys.argv[7]),
 )
 text = pathlib.Path(path).read_text(encoding="utf-8")
 for token, value in pairs:
@@ -1646,13 +1800,11 @@ install_verified_systemd_units() {
   SYSTEMD_STAGE="$(mktemp -d "$SERVICES/systemd-units.XXXXXX")"
   stage_gateway_systemd_unit
   install_systemd_unit dashboard "$DASHBOARD_RUNNER" "$SYSTEMD_STAGE"
-  install_systemd_unit bridge "$BRIDGE_RUNNER" "$SYSTEMD_STAGE"
 
   if command -v systemd-analyze >/dev/null 2>&1; then
     if ! systemd-analyze --user verify \
       "$SYSTEMD_STAGE/hermes-gateway.service" \
-      "$SYSTEMD_STAGE/hermes-dashboard.service" \
-      "$SYSTEMD_STAGE/hermes-bridge.service"; then
+      "$SYSTEMD_STAGE/hermes-dashboard.service"; then
       echo "ERROR: generated systemd user units are invalid; existing units were not replaced."
       rollback_pending_systemd_gateway
       cleanup_systemd_stage
@@ -1690,13 +1842,11 @@ install_verified_systemd_units() {
   mv "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf.new" \
     "$SYSTEMD_GATEWAY_DROPIN_DIR/10-hermes-console-network.conf"
 
-  for name in dashboard bridge; do
-    cp "$SYSTEMD_STAGE/hermes-$name.service" \
-      "$SYSTEMD_USER_DIR/hermes-$name.service.new"
-    chmod 644 "$SYSTEMD_USER_DIR/hermes-$name.service.new"
-    mv "$SYSTEMD_USER_DIR/hermes-$name.service.new" \
-      "$SYSTEMD_USER_DIR/hermes-$name.service"
-  done
+  cp "$SYSTEMD_STAGE/hermes-dashboard.service" \
+    "$SYSTEMD_USER_DIR/hermes-dashboard.service.new"
+  chmod 644 "$SYSTEMD_USER_DIR/hermes-dashboard.service.new"
+  mv "$SYSTEMD_USER_DIR/hermes-dashboard.service.new" \
+    "$SYSTEMD_USER_DIR/hermes-dashboard.service"
   SYSTEMD_GATEWAY_PENDING=0
   cleanup_systemd_stage
 }
@@ -1760,7 +1910,6 @@ start_named_service() {
       case "$name" in
         gateway) label="dev.xpetalab.hermes-console.gateway" ;;
         dashboard) label="dev.xpetalab.hermes-console.dashboard" ;;
-        bridge) label="dev.xpetalab.hermes-console.bridge" ;;
       esac
       if ! launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
         plist="$HOME/Library/LaunchAgents/$label.plist"
@@ -1781,7 +1930,6 @@ stop_named_service() {
       case "$name" in
         gateway) label="dev.xpetalab.hermes-console.gateway" ;;
         dashboard) label="dev.xpetalab.hermes-console.dashboard" ;;
-        bridge) label="dev.xpetalab.hermes-console.bridge" ;;
         *) return 2 ;;
       esac
       launchctl bootout "gui/$(id -u)/$label"
@@ -1790,25 +1938,22 @@ stop_named_service() {
   esac
 }
 
-setup_step "Installing hidden persistent services"
+setup_step "Starting Hermes in the background"
 
 SERVICE_LIFECYCLE_TOUCHED=1
 case "$SERVICE_MANAGER" in
   systemd)
     install_verified_systemd_units
     systemctl --user daemon-reload
-    systemctl --user enable hermes-gateway hermes-dashboard hermes-bridge >/dev/null 2>&1
+    systemctl --user enable hermes-gateway hermes-dashboard >/dev/null 2>&1
     systemctl --user restart hermes-gateway
-    systemctl --user restart hermes-bridge
     ;;
   launchd)
     install_launchd_job gateway dev.xpetalab.hermes-console.gateway "$GATEWAY_RUNNER" yes yes
     install_launchd_job dashboard dev.xpetalab.hermes-console.dashboard "$DASHBOARD_RUNNER" yes no
-    install_launchd_job bridge dev.xpetalab.hermes-console.bridge "$BRIDGE_RUNNER" yes yes
     ;;
   portable)
     "$HELPER" restart gateway
-    "$HELPER" restart bridge
     echo "WARNING: no supported persistent service manager is available."
     echo "Services work in this session but will not survive a reboot until a startup manager is configured."
     ;;
@@ -1819,79 +1964,182 @@ if ! wait_probe gateway "http://127.0.0.1:$GATEWAY_PORT" 40; then
 fi
 echo "Gateway identity + valid-token + auth-rejection checks OK ($SERVICE_MANAGER)"
 
-if ! wait_probe bridge "http://127.0.0.1:$BRIDGE_PORT" 40 "$BRIDGE_VERSION"; then
-  service_failure Bridge "$BRIDGE_PORT"
-fi
-echo "Mobile Bridge $BRIDGE_VERSION valid-token + auth-rejection + capability checks OK ($SERVICE_MANAGER)"
+setup_step "Setting up the Dashboard sign-in"
 
-setup_step "Checking Dashboard and credentials"
-
-# Ensure a strong initial Dashboard password through the authenticated Bridge.
-# Existing credentials are preserved on repair/update; setup never prints them.
+# The Dashboard sign-in, written through Hermes' own configuration API: the
+# calls `hermes dashboard` makes when it asks for a password on a terminal.
+#   - Hermes has none: one is created.
+#   - It has one this setup knows (it made it, or it is written in .env or in
+#     the configuration): it is kept and goes into the code.
+#   - It has one this setup does not know: it is kept and stays out of the code;
+#     the app asks for it once. Only --new-access replaces a sign-in.
 if ! stop_named_service dashboard >/dev/null 2>&1; then
   echo "ERROR: Dashboard ownership could not be proven before stopping it."
   exit 1
 fi
-DASH_PASS="$("$VP" -c 'import secrets; print(secrets.token_urlsafe(24))')"
-DASHBOARD_CREDENTIAL_RESULT=""
-if ! DASHBOARD_CREDENTIAL_RESULT="$("$VP" - "http://127.0.0.1:$BRIDGE_PORT" "$KEY" "$DASH_PASS" <<'PY'
-import json, sys, urllib.request
+DASH_ACCESS_STATE="$TRANSACTION_DIR/dashboard-access.state"
+DASH_ACCESS_PREVIOUS="$TRANSACTION_DIR/dashboard-access.previous.json"
+if ! HERMES_HOME="$HH" "$VP" - "$ACTION" "$HH" "$DASH_LOGIN_FILE" "$DASH_ACCESS_STATE" "$DASH_ACCESS_PREVIOUS" <<'PY_DASH_ACCESS'
+import json, os, pathlib, secrets, sys
 
-base, token, password = sys.argv[1:]
-headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
-created = False
+action, home, login_path, state_path, previous_path = sys.argv[1:]
+login_file = pathlib.Path(login_path)
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, file_pointer, code, message, headers, url):
+def write_private(path, text):
+    path = pathlib.Path(path)
+    pending = path.with_name(path.name + ".new")
+    descriptor = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+        target.write(text)
+    os.chmod(pending, 0o600)
+    os.replace(pending, path)
+
+
+def env_settings():
+    values = {}
+    path = pathlib.Path(home) / ".env"
+    if not path.exists():
+        return values
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if not line.startswith("HERMES_DASHBOARD_BASIC_AUTH_") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[name.strip()] = value
+    return values
+
+
+def stored_login():
+    try:
+        value = json.loads(login_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
+    if not isinstance(value, dict):
+        return None
+    username, password = value.get("username"), value.get("password")
+    if not isinstance(username, str) or not isinstance(password, str):
+        return None
+    if not username or not password:
+        return None
+    return value
 
 
-opener = urllib.request.build_opener(NoRedirect)
-try:
-    request = urllib.request.Request(
-        base + "/bridge/dashboard/credentials", headers=headers
-    )
-    with opener.open(request, timeout=65) as response:
-        status = response.status
-        value = json.loads(response.read(1024 * 1024).decode())
-    if status != 200 or value.get("ok") is not True:
-        raise RuntimeError("credential endpoint rejected the read")
-    username = value.get("username") or "admin"
-    if value.get("password_set") is not True:
-        body = json.dumps(
-            {"username": username, "password": password}
-        ).encode()
-        request = urllib.request.Request(
-            base + "/bridge/dashboard/credentials",
-            data=body,
-            headers={
-                "Authorization": "Bearer " + token,
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with opener.open(request, timeout=65) as response:
-            status = response.status
-            value = json.loads(response.read(1024 * 1024).decode())
-        if status != 200 or value.get("ok") is not True:
-            raise RuntimeError("credential endpoint rejected the change")
-        username = value.get("username") or username
-        created = True
-except Exception as exc:
-    print(
-        "Dashboard credential setup failed: " + type(exc).__name__,
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-print(json.dumps({"created": created, "username": username}))
-PY
-)"; then
-  echo "ERROR: Dashboard authentication could not be configured; no pairing QR will be shown."
+def remember(username, password, source):
+    record = {
+        "schema": 1,
+        "username": username,
+        "password": password,
+        "source": source,
+    }
+    write_private(login_file, json.dumps(record) + "\n")
+
+
+def forget():
+    try:
+        login_file.unlink()
+    except FileNotFoundError:
+        pass
+
+
+from hermes_cli.config import load_config, save_config
+
+cfg = load_config()
+if not isinstance(cfg.get("dashboard"), dict):
+    cfg["dashboard"] = {}
+if not isinstance(cfg["dashboard"].get("basic_auth"), dict):
+    cfg["dashboard"]["basic_auth"] = {}
+basic = cfg["dashboard"]["basic_auth"]
+env = env_settings()
+env_user = env.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "").strip()
+env_password = env.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "").strip()
+env_hash = env.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", "").strip()
+config_user = str(basic.get("username") or "").strip()
+config_hash = str(basic.get("password_hash") or "").strip()
+config_password = str(basic.get("password") or "").strip()
+username = env_user or config_user
+# A line in .env wins over the configuration inside Hermes, so a sign-in
+# written there cannot be replaced from here: it is used as it is.
+pinned = bool(env_password or env_hash)
+stored = stored_login()
+
+
+def create():
+    from plugins.dashboard_auth.basic import hash_password
+
+    previous = {
+        key: basic.get(key)
+        for key in ("username", "password_hash", "password", "secret")
+    }
+    write_private(previous_path, json.dumps(previous))
+    password = secrets.token_urlsafe(24)
+    if not config_user:
+        basic["username"] = env_user or "admin"
+    basic["password_hash"] = hash_password(password)
+    basic["password"] = ""
+    # --new-access also ends every session opened with the old sign-in.
+    if action == "new-access" or not str(basic.get("secret") or "").strip():
+        basic["secret"] = secrets.token_urlsafe(32)
+    save_config(cfg)
+    effective = env_user or str(basic["username"])
+    remember(effective, password, "setup")
+    return effective
+
+
+if action == "new-access" and not pinned:
+    username = create()
+    state = "created"
+elif env_password:
+    if username:
+        remember(username, env_password, "env")
+        state = "known"
+    else:
+        forget()
+        state = "unknown"
+elif env_hash:
+    forget()
+    state = "unknown"
+elif config_hash:
+    if stored is not None and stored["username"] == username:
+        state = "known"
+    else:
+        forget()
+        state = "unknown"
+elif config_password:
+    if username:
+        remember(username, config_password, "config")
+        state = "known"
+    else:
+        forget()
+        state = "unknown"
+else:
+    username = create()
+    state = "created"
+
+write_private(
+    state_path,
+    "\n".join((state, username, "1" if pinned else "0")) + "\n",
+)
+PY_DASH_ACCESS
+then
+  echo "ERROR: the Dashboard sign-in could not be prepared; no code will be shown."
   exit 1
 fi
-DASHBOARD_LOGIN_CREATED="$("$VP" -c 'import json,sys; print("1" if json.loads(sys.argv[1])["created"] else "0")' "$DASHBOARD_CREDENTIAL_RESULT")"
-DASHBOARD_LOGIN_USER="$("$VP" -c 'import json,sys; print(json.loads(sys.argv[1])["username"])' "$DASHBOARD_CREDENTIAL_RESULT")"
+DASHBOARD_LOGIN_STATE="$(sed -n '1p' "$DASH_ACCESS_STATE" 2>/dev/null || true)"
+DASHBOARD_LOGIN_USER="$(sed -n '2p' "$DASH_ACCESS_STATE" 2>/dev/null || true)"
+DASHBOARD_LOGIN_PINNED="$(sed -n '3p' "$DASH_ACCESS_STATE" 2>/dev/null || true)"
+case "$DASHBOARD_LOGIN_STATE" in
+  created|known|unknown) ;;
+  *)
+    echo "ERROR: the Dashboard sign-in could not be prepared; no code will be shown."
+    exit 1
+    ;;
+esac
 if ! start_named_service dashboard >/dev/null 2>&1; then
   echo "ERROR: Dashboard ownership could not be proven before starting it."
   exit 1
@@ -1929,10 +2177,11 @@ done
 if [ "$dashboard_ready" -ne 1 ]; then
   service_failure Dashboard "$DASHBOARD_PORT"
 fi
-if ! "$VP" - "http://127.0.0.1:$DASHBOARD_PORT" "$DASHBOARD_LOGIN_CREATED" "$DASHBOARD_LOGIN_USER" "$DASH_PASS" <<'PY_DASH_AUTH'
-import json, sys, urllib.error, urllib.request
+DASH_AUTH_STATUS=0
+if "$VP" - "http://127.0.0.1:$DASHBOARD_PORT" "$DASHBOARD_LOGIN_STATE" "$DASH_LOGIN_FILE" <<'PY_DASH_AUTH'
+import json, pathlib, sys, urllib.error, urllib.request
 
-base, created, username, password = sys.argv[1:]
+base, state, login_path = sys.argv[1:]
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1966,15 +2215,23 @@ for label, cookie in (
             f"Dashboard protected API did not reject {label} session (HTTP {status})"
         )
 
-if created == "1":
+if state in {"created", "known"}:
+    login = json.loads(pathlib.Path(login_path).read_text(encoding="utf-8"))
     body = json.dumps(
-        {"provider": "basic", "username": username, "password": password}
+        {
+            "provider": "basic",
+            "username": login["username"],
+            "password": login["password"],
+        }
     ).encode()
     status, headers, _ = request(
         "/auth/password-login",
         headers={"Content-Type": "application/json"},
         data=body,
     )
+    if status in {400, 401, 403}:
+        # The sign-in on record is not the one the Dashboard accepts.
+        raise SystemExit(10)
     if status != 200:
         raise SystemExit(f"Dashboard password login returned HTTP {status}")
     cookies = headers.get_all("Set-Cookie") or []
@@ -1997,14 +2254,32 @@ if created == "1":
         raise SystemExit("Dashboard authenticated protected API returned the wrong JSON shape")
 PY_DASH_AUTH
 then
-  echo "ERROR: Dashboard protected-route authentication checks failed; no pairing QR will be shown."
-  exit 1
-fi
-if [ "$DASHBOARD_LOGIN_CREATED" = "1" ]; then
-  echo "Dashboard password login + protected API enforcement OK ($SERVICE_MANAGER)"
+  DASH_AUTH_STATUS=0
 else
-  echo "Dashboard public health + protected API enforcement OK ($SERVICE_MANAGER); existing login was preserved, not replayed"
+  DASH_AUTH_STATUS=$?
 fi
+case "$DASH_AUTH_STATUS" in
+  0) ;;
+  10)
+    if [ "$DASHBOARD_LOGIN_STATE" = "created" ]; then
+      echo "ERROR: the Dashboard did not accept the sign-in that was just created; no code will be shown."
+      exit 1
+    fi
+    # A sign-in remembered from before no longer works (it was changed
+    # somewhere else). It is not replaced: the code goes out without it.
+    rm -f "$DASH_LOGIN_FILE"
+    DASHBOARD_LOGIN_STATE="unknown"
+    ;;
+  *)
+    echo "ERROR: Dashboard protected-route authentication checks failed; no code will be shown."
+    exit 1
+    ;;
+esac
+case "$DASHBOARD_LOGIN_STATE" in
+  created) echo "Dashboard: new sign-in created and checked ($SERVICE_MANAGER)" ;;
+  known) echo "Dashboard: your sign-in was kept and checked ($SERVICE_MANAGER)" ;;
+  *) echo "Dashboard: asks for a sign-in; yours was kept as it is ($SERVICE_MANAGER)" ;;
+esac
 
 SUDO_READY=0
 run_privileged() {
@@ -2023,7 +2298,7 @@ run_privileged() {
     # can finish firewall setup in one run. Agents/non-interactive shells still
     # fail closed and receive the exact manual commands below.
     if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-      echo "Hermes Console needs administrator approval for a private firewall rule." >/dev/tty
+      echo "Console needs administrator approval for a private firewall rule." >/dev/tty
       if sudo -v; then
         SUDO_READY=1
         sudo -n "$@"
@@ -2046,7 +2321,7 @@ ensure_private_firewall() {
     fi
     if [ -n "$UFW_ACTIVE" ]; then
       UFW_STATUS="$(run_privileged ufw status 2>/dev/null || true)"
-      for port in "$GATEWAY_PORT" "$DASHBOARD_PORT" "$BRIDGE_PORT"; do
+      for port in "$GATEWAY_PORT" "$DASHBOARD_PORT"; do
         if printf '%s\n' "$UFW_STATUS" | grep -E "^${port}/tcp[[:space:]]" | \
             grep -F "$FIREWALL_SOURCE" >/dev/null 2>&1; then
           continue
@@ -2056,7 +2331,6 @@ ensure_private_firewall() {
           echo "Run these commands, then rerun setup:"
           echo "  sudo ufw allow from $FIREWALL_SOURCE to any port $GATEWAY_PORT proto tcp"
           echo "  sudo ufw allow from $FIREWALL_SOURCE to any port $DASHBOARD_PORT proto tcp"
-          echo "  sudo ufw allow from $FIREWALL_SOURCE to any port $BRIDGE_PORT proto tcp"
           return 1
         fi
         printf '%s\n' "$port" >> "$TRANSACTION_DIR/ufw.added"
@@ -2065,14 +2339,14 @@ ensure_private_firewall() {
     fi
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    for port in "$GATEWAY_PORT" "$DASHBOARD_PORT" "$BRIDGE_PORT"; do
+    for port in "$GATEWAY_PORT" "$DASHBOARD_PORT"; do
       rule="rule family=ipv4 source address=$FIREWALL_SOURCE port port=$port protocol=tcp accept"
       if run_privileged firewall-cmd --permanent --query-rich-rule="$rule" >/dev/null 2>&1; then
         continue
       fi
       if ! run_privileged firewall-cmd --permanent --add-rich-rule="$rule" >/dev/null; then
         echo "ERROR: firewalld is active and a private rule could not be installed."
-        echo "Add private TCP rules for $GATEWAY_PORT, $DASHBOARD_PORT and $BRIDGE_PORT from $FIREWALL_SOURCE, then rerun setup."
+        echo "Add private TCP rules for $GATEWAY_PORT and $DASHBOARD_PORT from $FIREWALL_SOURCE, then rerun setup."
         return 1
       fi
       printf '%s\n' "$rule" >> "$TRANSACTION_DIR/firewalld.added"
@@ -2082,7 +2356,7 @@ ensure_private_firewall() {
   fi
 }
 
-setup_step "Verifying private phone access"
+setup_step "Checking that your phone can reach it"
 
 ensure_private_firewall
 
@@ -2093,44 +2367,43 @@ if ! wait_probe gateway "$GATEWAY_BASE" 12 "" phone; then
   echo "Check bind, VPN/LAN routing, reverse proxy and host/cloud firewall."
   exit 1
 fi
-if ! wait_probe bridge "$BRIDGE_BASE" 12 "$BRIDGE_VERSION" phone; then
-  echo "ERROR: Mobile Bridge works locally but not through $BRIDGE_BASE."
-  echo "Check routing/proxy rules for /bridge/*."
-  exit 1
-fi
 if ! wait_probe dashboard "$DASHBOARD_BASE" 12 "" phone; then
   echo "ERROR: Dashboard works locally but not through $DASHBOARD_BASE."
   echo "Check routing/proxy rules for /api/status."
   exit 1
 fi
 
-setup_step "Generating pairing QR and summary"
+setup_step "Making your code"
 
-printf 'PAIRING_SCHEMA=1\nPROBE_SECURITY_SCHEMA=2\nPAIR_HOST=%s\nPAIR_SCHEME=%s\nPAIR_PORT=%s\nGATEWAY_BASE=%s\nDASHBOARD_BASE=%s\nBRIDGE_BASE=%s\nNETWORK_KIND=%s\nPYTHON_BIN=%s\n' \
-  "$HOST" "$PAIR_SCHEME" "$PAIR_PORT" "$GATEWAY_BASE" "$DASHBOARD_BASE" "$BRIDGE_BASE" "$NETWORK_KIND" "$VP" > "$PAIR_ENV"
+printf 'PAIRING_SCHEMA=2\nPROBE_SECURITY_SCHEMA=2\nPAIR_HOST=%s\nPAIR_SCHEME=%s\nPAIR_PORT=%s\nGATEWAY_BASE=%s\nDASHBOARD_BASE=%s\nDASHBOARD_PORT=%s\nNETWORK_KIND=%s\nPYTHON_BIN=%s\n' \
+  "$HOST" "$PAIR_SCHEME" "$PAIR_PORT" "$GATEWAY_BASE" "$DASHBOARD_BASE" "$DASHBOARD_PORT" "$NETWORK_KIND" "$VP" > "$PAIR_ENV"
 chmod 600 "$PAIR_ENV"
 
 HTTPS_FLAG=""
 [ "$PAIR_SCHEME" != "https" ] || HTTPS_FLAG="1"
-LINK="$("$VP" - "$HOST" "$PAIR_PORT" "$KEY" "$HTTPS_FLAG" "$DASHBOARD_BASE" "$BRIDGE_BASE" <<'PY'
-import sys, urllib.parse
+LINK_LOGIN_FILE=""
+[ "$DASHBOARD_LOGIN_STATE" = "unknown" ] || LINK_LOGIN_FILE="$DASH_LOGIN_FILE"
+LINK="$("$VP" - "$HOST" "$PAIR_PORT" "$KEY" "$HTTPS_FLAG" "$DASHBOARD_BASE" "$LINK_LOGIN_FILE" <<'PY'
+import json, pathlib, sys, urllib.parse
 
-host, port, token, https, dashboard, bridge = sys.argv[1:]
+host, port, token, https, dashboard, login_path = sys.argv[1:]
 query = {
     "host": host,
     "port": port,
     "token": token,
     "dashboard": dashboard,
-    "bridge": bridge,
-    "bridge_token": token,
 }
+if login_path:
+    login = json.loads(pathlib.Path(login_path).read_text(encoding="utf-8"))
+    query["dash_user"] = login["username"]
+    query["dash_pass"] = login["password"]
 if https:
     query["https"] = "1"
 print("hermes://pair?" + urllib.parse.urlencode(query))
 PY
 )"
 echo ""
-echo "== SCAN THIS QR WITH HERMES CONSOLE (or copy the link) =="
+echo "== SCAN THIS CODE WITH CONSOLE =="
 echo ""
 QRPY='import qrcode,sys;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.make();q.print_ascii(invert=True)'
 QR_RENDERED=""
@@ -2147,21 +2420,72 @@ else
   fi
 fi
 if [ -z "$QR_RENDERED" ]; then
-  echo "A QR renderer could not be prepared. Paste the verified link below into Hermes Console."
+  echo "The code could not be drawn here. Copy the link below and paste it in the app instead."
 fi
 commit_transaction
 echo ""
+echo "No camera? Copy this link and paste it in the app (Scan, then Paste link):"
 echo "Link: $LINK"
 echo ""
-echo "All three services passed their scoped local and phone-address checks."
-echo "Setup summary:"
+case "$DASHBOARD_LOGIN_STATE" in
+  created)
+    echo "A Dashboard sign-in was created for you, and the code already carries it:"
+    echo "the app connects in one step."
+    echo "To open the Dashboard in a browser, the sign-in is:"
+    "$VP" - "$DASH_LOGIN_FILE" <<'PY_SHOW_LOGIN'
+import json, pathlib, sys
+
+login = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print("  user:     " + login["username"])
+print("  password: " + login["password"])
+PY_SHOW_LOGIN
+    ;;
+  known)
+    echo "The code carries your Dashboard sign-in (user $DASHBOARD_LOGIN_USER): the app connects in one step."
+    ;;
+  *)
+    echo "This Hermes already has a Dashboard password that this setup does not know."
+    echo "It was kept. The app will ask you for it once, after you scan the code."
+    if [ "$DASHBOARD_LOGIN_PINNED" = "1" ]; then
+      echo "That password is written in $HH/.env (the lines that start with"
+      echo "HERMES_DASHBOARD_BASIC_AUTH_). Change it there, then run this setup again."
+    else
+      echo "Forgot it? This makes a new sign-in and shows a new code:"
+      echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh -s -- --new-access"
+    fi
+    ;;
+esac
+if [ "$ACTION" = "new-access" ] && [ "$DASHBOARD_LOGIN_STATE" = "known" ]; then
+  echo "No new sign-in was made: the Dashboard password of this Hermes is written in"
+  echo "$HH/.env, and this setup does not change that file."
+fi
+echo "Keep the code and the link private: whoever has them can use your Hermes."
+echo ""
+echo "What was checked:"
 setup_finish_progress
-echo "  Hermes Agent: ready"
-echo "  Gateway: valid token accepted, missing/invalid tokens rejected, reachable"
-echo "  Dashboard: public health and protected-route enforcement checked"
-echo "  Mobile Bridge: $BRIDGE_VERSION, valid token accepted, missing/invalid tokens rejected, reachable"
-echo "  Service manager: $SERVICE_MANAGER"
-echo "  Pairing address: $HOST ($NETWORK_KIND)"
-echo "To verify them and show this QR again later:"
+echo "  Hermes: ready"
+echo "  Gateway (chat): answers at $GATEWAY_BASE, takes your key and refuses a wrong one"
+echo "  Dashboard (everything else): answers at $DASHBOARD_BASE and refuses whoever is not signed in"
+case "$SERVICE_MANAGER" in
+  portable) echo "  Starts by itself after a restart: no (this system has no service manager)" ;;
+  *) echo "  Starts by itself after a restart: yes ($SERVICE_MANAGER)" ;;
+esac
+echo "  Address your phone uses: $HOST ($NETWORK_KIND)"
+echo "To check everything and see the code again later:"
 echo "  curl -fsSL $REPO_RAW/hermes-pair.sh | sh"
+if [ -n "$(bridge_leftovers)" ]; then
+  echo "An old Mobile Bridge is still installed here and was left as it was: Console older"
+  echo "than 1.2.15 still uses it. Once every phone has Console 1.2.15 or newer, remove it:"
+  echo "  curl -fsSL $REPO_RAW/hermes-mobile-setup.sh | sh -s -- --retire-bridge"
+fi
 echo "If chat has no model yet, open Dashboard from the app and configure your AI provider/model."
+if [ "$SETUP_LIVE" -eq 1 ]; then
+  setup_seal
+  printf '    Hermes keeps running in the background and starts by itself.\n'
+  printf '    Needs Console 1.2.15 or newer on the phone.\n'
+  printf '    Help and guide: https://hermes.xpetalab.dev\n'
+  printf '  ================================================================\n\n'
+else
+  echo "Needs Console 1.2.15 or newer on the phone."
+  echo "Help and guide: https://hermes.xpetalab.dev"
+fi

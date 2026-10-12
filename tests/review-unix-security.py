@@ -390,34 +390,16 @@ class ProbeAuthenticationTests(unittest.TestCase):
 
         self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
-    def test_bridge_requires_valid_token_on_protected_route(self) -> None:
-        token = "VALID-BRIDGE-TOKEN"
+    def test_the_bridge_is_no_longer_a_service_the_probe_knows(self) -> None:
+        def anything(request):
+            return 200, {}, {"status": "ok", "version": "1.2.3"}
 
-        def bridge(request):
-            if request.path == "/bridge/health":
-                return 200, {}, {"status": "ok", "version": "1.2.3"}
-            if request.path == "/bridge/capabilities":
-                if request.headers.get("Authorization") != "Bearer " + token:
-                    return 403, {}, {"error": "unauthorized"}
-                return 200, {}, {
-                    "object": "hermes.bridge.capabilities",
-                    "operations": {"self_update": True},
-                    "scopes": ["read", "config"],
-                }
-            return 404, {}, {"error": "missing"}
+        with _Server(anything) as server, probe_file() as probe:
+            completed = run_probe(probe, "bridge", server.base)
 
-        with _Server(bridge) as server, probe_file() as probe:
-            completed = run_probe(probe, "bridge", server.base, token)
-
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        protected = [
-            row["authorization"]
-            for row in server.requests
-            if row["path"] == "/bridge/capabilities"
-        ]
-        self.assertIn("Bearer " + token, protected)
-        self.assertIn(None, protected)
-        self.assertTrue(any(value not in (None, "Bearer " + token) for value in protected))
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("unknown service kind", completed.stderr)
+        self.assertEqual(server.requests, [])
 
     def test_dashboard_probe_only_claims_public_health(self) -> None:
         def dashboard(request):
@@ -433,38 +415,51 @@ class ProbeAuthenticationTests(unittest.TestCase):
 
 
 class DashboardAuthenticationTests(unittest.TestCase):
-    def test_created_password_login_accepts_cookie_and_rejects_unauthorized(self) -> None:
-        username = "admin"
-        password = "SYNTHETIC-PASSWORD"
+    USERNAME = "admin"
+    PASSWORD = "SYNTHETIC-PASSWORD"
 
+    def _dashboard(self, accepted_password):
         def dashboard(request):
             if request.path == "/auth/password-login" and request.command == "POST":
-                return 200, {"Set-Cookie": "hermes_session_at=AT1; Path=/; HttpOnly"}, {"ok": True}
+                body = json.loads(request.server.owner_body(request))
+                if body == {
+                    "provider": "basic",
+                    "username": self.USERNAME,
+                    "password": accepted_password,
+                }:
+                    return 200, {"Set-Cookie": "hermes_session_at=AT1; Path=/; HttpOnly"}, {"ok": True}
+                return 401, {}, {"error": "invalid_credentials"}
             if request.path == "/api/model/options":
                 if request.headers.get("Cookie") == "hermes_session_at=AT1":
                     return 200, {}, {"providers": []}
                 return 401, {}, {"error": "unauthorized"}
             return 404, {}, {"error": "missing"}
 
+        return dashboard
+
+    def _verify(self, state, accepted_password):
         source = SETUP.read_text(encoding="utf-8")
         verifier = embedded_python(source, "PY_DASH_AUTH")
         with tempfile.TemporaryDirectory(prefix="hermes-dashboard-auth-") as raw:
             script = pathlib.Path(raw) / "dashboard-auth.py"
             script.write_text(verifier, encoding="utf-8")
-            with _Server(dashboard) as server:
+            login = pathlib.Path(raw) / "dashboard-login.json"
+            login.write_text(
+                json.dumps({"username": self.USERNAME, "password": self.PASSWORD}),
+                encoding="utf-8",
+            )
+            with _Server(self._dashboard(accepted_password)) as server:
+                server.httpd.owner_body = lambda request: server.requests[-1]["body"]
                 completed = subprocess.run(
-                    [
-                        sys.executable,
-                        str(script),
-                        server.base,
-                        "1",
-                        username,
-                        password,
-                    ],
+                    [sys.executable, str(script), server.base, state, str(login)],
                     text=True,
                     capture_output=True,
                     timeout=15,
                 )
+        return completed, server
+
+    def test_created_password_login_accepts_cookie_and_rejects_unauthorized(self) -> None:
+        completed, server = self._verify("created", self.PASSWORD)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         protected = [row for row in server.requests if row["path"] == "/api/model/options"]
         self.assertEqual(len(protected), 3)
@@ -472,13 +467,37 @@ class DashboardAuthenticationTests(unittest.TestCase):
         self.assertTrue(any(row["cookie"] is None for row in protected))
         self.assertTrue(any(row["cookie"] not in (None, "hermes_session_at=AT1") for row in protected))
 
+    def test_a_remembered_sign_in_the_dashboard_refuses_is_reported_apart(self) -> None:
+        # Exit 10 is "the sign-in on record is stale": setup then shows the code
+        # without it instead of failing or replacing the user's password.
+        completed, server = self._verify("known", "CHANGED-SOMEWHERE-ELSE")
+        self.assertEqual(completed.returncode, 10, completed.stderr)
+        self.assertNotIn(self.PASSWORD, completed.stdout + completed.stderr)
+
+    def test_an_unknown_sign_in_is_never_tried(self) -> None:
+        completed, server = self._verify("unknown", self.PASSWORD)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            [row["path"] for row in server.requests if row["method"] == "POST"], []
+        )
+
 
 class DeliverySyntaxTests(unittest.TestCase):
     def test_all_embedded_python_blocks_compile(self) -> None:
         setup = SETUP.read_text(encoding="utf-8")
         blocks = re.findall(r"<<'PY'\n(.*?)\nPY$", setup, re.MULTILINE | re.DOTALL)
-        blocks.append(embedded_python(setup, "PY_DASH_AUTH"))
-        self.assertGreaterEqual(len(blocks), 10)
+        for marker in (
+            "PY_DASH_AUTH",
+            "PY_DASH_ACCESS",
+            "PY_DASH_RESTORE",
+            "PY_RETIRE",
+            "PY_SHOW_LOGIN",
+        ):
+            blocks.append(embedded_python(setup, marker))
+        pair = PAIR.read_text(encoding="utf-8")
+        blocks.extend(re.findall(r"<<'PY'\n(.*?)\nPY$", pair, re.MULTILINE | re.DOTALL))
+        blocks.append(embedded_python(pair, "PY_DASH_LOGIN"))
+        self.assertGreaterEqual(len(blocks), 14)
         for index, block in enumerate(blocks):
             with self.subTest(block=index):
                 compile(block, f"<embedded-{index}>", "exec")
@@ -624,7 +643,7 @@ class DeliverySyntaxTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertEqual(after, before)
             self.assertEqual(probe_log.read_text(encoding="utf-8").splitlines(), [
-                "gateway", "bridge", "dashboard"
+                "gateway", "dashboard"
             ])
             self.assertNotIn("predates redirect-safe", completed.stdout + completed.stderr)
             self.assertIn("Link: hermes://pair?", completed.stdout)
@@ -667,7 +686,6 @@ class DeliverySyntaxTests(unittest.TestCase):
                 "LOGS": temp / "logs space",
                 "GATEWAY_RUNNER": temp / "gateway runner",
                 "DASHBOARD_RUNNER": temp / "dashboard runner",
-                "BRIDGE_RUNNER": temp / "bridge runner",
                 "VP": pathlib.Path(sys.executable),
                 "HB": temp / "hermes launcher",
             }
@@ -1024,6 +1042,7 @@ class TransactionRollbackTests(unittest.TestCase):
             "restore_systemd_state",
             "cleanup_transaction_backups",
             "rollback_private_firewall",
+            "rollback_dashboard_access",
             "rollback_transaction",
         )
         functions = "\n".join(shell_function(source, name) for name in names)
@@ -1038,8 +1057,7 @@ class TransactionRollbackTests(unittest.TestCase):
             dropin_dir.mkdir(parents=True)
             existing = {
                 selected / ".env": "old-env\n",
-                selected / "bridge.env": "old-bridge-env\n",
-                selected / "hermes_bridge.py": "old-bridge\n",
+                services / "dashboard-login.json": "old-login\n",
                 services / "hermes-gateway.sh": "old-gateway-runner\n",
                 services / "hermes-dashboard.sh": "old-dashboard-runner\n",
                 services / "hermes-service-probe.py": "old-probe\n",
@@ -1050,11 +1068,18 @@ class TransactionRollbackTests(unittest.TestCase):
             for path, value in existing.items():
                 path.write_text(value, encoding="utf-8")
             absent_before = [
-                services / "hermes-bridge.sh",
                 services / "service-manager.sh",
                 services / "pairing.env",
-                unit_dir / "hermes-bridge.service",
             ]
+            # Leftovers of the old Mobile Bridge are not setup's to touch, not
+            # even when it rolls back: only --retire-bridge removes them.
+            bridge_leftovers = {
+                selected / "bridge.env": "old-bridge-env\n",
+                selected / "hermes_bridge.py": "old-bridge\n",
+                unit_dir / "hermes-bridge.service": "old-bridge-unit\n",
+            }
+            for path, value in bridge_leftovers.items():
+                path.write_text(value, encoding="utf-8")
             mock_bin = temp / "mock-bin"
             mock_bin.mkdir()
             systemctl_log = temp / "mock-systemctl.log"
@@ -1079,18 +1104,17 @@ esac
                 + functions
                 + "\nHOME=$1\nHH=$2\nSERVICES=$HH/console-services\n"
                 + "PROBE=$SERVICES/hermes-service-probe.py\nPAIR_ENV=$SERVICES/pairing.env\n"
-                + "TARGET=$HH/hermes_bridge.py\nBACKUP=$TARGET.rollback\nENV_FILE=$HH/bridge.env\n"
+                + "DASH_LOGIN_FILE=$SERVICES/dashboard-login.json\n"
                 + "GATEWAY_RUNNER=$SERVICES/hermes-gateway.sh\n"
                 + "DASHBOARD_RUNNER=$SERVICES/hermes-dashboard.sh\n"
-                + "BRIDGE_RUNNER=$SERVICES/hermes-bridge.sh\nHELPER=$SERVICES/service-manager.sh\n"
+                + "HELPER=$SERVICES/service-manager.sh\n"
                 + "SERVICE_MANAGER=systemd\nSERVICE_LIFECYCLE_TOUCHED=0\n"
                 + "begin_transaction\nSERVICE_LIFECYCLE_TOUCHED=1\n"
-                + "for path in \"$HH/.env\" \"$HH/bridge.env\" \"$TARGET\" \"$PROBE\" "
-                + "\"$GATEWAY_RUNNER\" \"$DASHBOARD_RUNNER\" \"$BRIDGE_RUNNER\" "
+                + "for path in \"$HH/.env\" \"$DASH_LOGIN_FILE\" \"$PROBE\" "
+                + "\"$GATEWAY_RUNNER\" \"$DASHBOARD_RUNNER\" "
                 + "\"$HELPER\" \"$PAIR_ENV\" "
                 + "\"$HOME/.config/systemd/user/hermes-gateway.service\" "
                 + "\"$HOME/.config/systemd/user/hermes-dashboard.service\" "
-                + "\"$HOME/.config/systemd/user/hermes-bridge.service\" "
                 + "\"$HOME/.config/systemd/user/hermes-gateway.service.d/10-hermes-console-network.conf\"; do "
                 + "mkdir -p \"$(dirname -- \"$path\")\"; printf 'new\\n' > \"$path\"; done\n"
                 + "rollback_transaction\n",
@@ -1113,7 +1137,10 @@ esac
                 self.assertEqual(path.read_text(encoding="utf-8"), value, str(path))
             for path in absent_before:
                 self.assertFalse(path.exists(), str(path))
+            for path, value in bridge_leftovers.items():
+                self.assertEqual(path.read_text(encoding="utf-8"), value, str(path))
             calls = systemctl_log.read_text(encoding="utf-8")
+            self.assertNotIn("hermes-bridge", calls)
             self.assertIn("daemon-reload", calls)
             self.assertIn("restart hermes-gateway", calls)
             self.assertIn("stop hermes-dashboard", calls)
@@ -1127,6 +1154,7 @@ esac
             "restore_systemd_state",
             "cleanup_transaction_backups",
             "rollback_private_firewall",
+            "rollback_dashboard_access",
             "rollback_transaction",
         )
         functions = "\n".join(shell_function(source, name) for name in names)
@@ -1197,7 +1225,7 @@ class InstallerHygieneTests(unittest.TestCase):
             (temp / "ufw.added").write_text("8642\n", encoding="utf-8")
             rule = (
                 "rule family=ipv4 source address=192.168.10.0/24 "
-                "port port=9131 protocol=tcp accept"
+                "port port=9119 protocol=tcp accept"
             )
             (temp / "firewalld.added").write_text(rule + "\n", encoding="utf-8")
             harness = temp / "rollback.sh"
@@ -1237,10 +1265,11 @@ class ServicePortTests(unittest.TestCase):
         for variable, name, default in (
             ("GATEWAY_PORT", "HERMES_GATEWAY_PORT", "8642"),
             ("DASHBOARD_PORT", "HERMES_DASHBOARD_PORT", "9119"),
-            ("BRIDGE_PORT", "HERMES_BRIDGE_PORT", "9131"),
         ):
             with self.subTest(port=name):
                 self.assertIn(f'{variable}="${{{name}:-{default}}}"', self.source)
+        # Setup resolves no port for the Mobile Bridge: it no longer runs one.
+        self.assertNotIn("BRIDGE_PORT=", self.source)
 
     def _port_block(self) -> str:
         """El bloque de resolucion de puertos, aislado de la instalacion."""
@@ -1261,15 +1290,14 @@ class ServicePortTests(unittest.TestCase):
     def test_the_port_block_is_resolved_at_the_top_level(self) -> None:
         # Si el bloque se colgara de alguna funcion, el rechazo llegaria tarde.
         for line in self._port_block().splitlines():
-            if line.startswith("GATEWAY_PORT=") or line.startswith("DASHBOARD_PORT=") \
-                    or line.startswith("BRIDGE_PORT="):
+            if line.startswith("GATEWAY_PORT=") or line.startswith("DASHBOARD_PORT="):
                 self.assertFalse(line.startswith(" "), f"no es de nivel superior: {line}")
         self.assertLess(self.source.index("GATEWAY_PORT="), self.source.index("PAIR_SCHEME="))
 
     def test_a_port_collision_is_refused_without_resolving(self) -> None:
         result = self._run_ports({"HERMES_GATEWAY_PORT": "9119"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must be three different ports", result.stdout + result.stderr)
+        self.assertIn("must be two different ports", result.stdout + result.stderr)
         self.assertNotIn("RESOLVED", result.stdout)
 
     def test_invalid_and_out_of_range_ports_are_refused(self) -> None:
@@ -1277,7 +1305,7 @@ class ServicePortTests(unittest.TestCase):
             ({"HERMES_GATEWAY_PORT": "abc"}, "must be TCP ports"),
             ({"HERMES_GATEWAY_PORT": "0"}, "out of range"),
             ({"HERMES_DASHBOARD_PORT": "70000"}, "out of range"),
-            ({"HERMES_BRIDGE_PORT": "9131.5"}, "must be TCP ports"),
+            ({"HERMES_DASHBOARD_PORT": "9119.5"}, "must be TCP ports"),
         ):
             with self.subTest(override=override):
                 result = self._run_ports(override)
@@ -1291,7 +1319,6 @@ class ServicePortTests(unittest.TestCase):
             result = self._run_ports({
                 "HERMES_GATEWAY_PORT": "18642",
                 "HERMES_DASHBOARD_PORT": "19119",
-                "HERMES_BRIDGE_PORT": "19131",
             })
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("RESOLVED", result.stdout)

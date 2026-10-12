@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Verify that the release manifest describes the exact Bridge bytes."""
+"""LEGACY (removed with Console 1.2.17): the manifest describes the exact Bridge bytes.
+
+The Bridge file and its manifest stay published only for apps older than
+Console 1.2.15 that still update a bridge they already have.
+"""
 
 import hashlib
 import json

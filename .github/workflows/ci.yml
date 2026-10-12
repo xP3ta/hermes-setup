@@ -25,7 +25,7 @@ jobs:
           for script in hermes-mobile-setup.sh hermes-pair.sh; do
             sh -n "$script"
           done
-          for script in sync-from-app.sh tests/sync-from-app_test.sh tests/bootstrap-unix_test.sh; do
+          for script in tests/bootstrap-unix_test.sh; do
             bash -n "$script"
           done
 
@@ -33,23 +33,21 @@ jobs:
         shell: bash
         run: |
           # These exclusions cover pre-existing parser false positives/intentional
-          # portability idioms in app-synchronized runtime artifacts.
+          # portability idioms in the runtime scripts.
           shellcheck --severity=warning \
             --exclude=SC1007,SC1087,SC2015,SC2221,SC2222 \
-            hermes-mobile-setup.sh hermes-pair.sh sync-from-app.sh
+            hermes-mobile-setup.sh hermes-pair.sh
           # The POSIX harness sources functions generated at runtime.
           shellcheck --severity=warning --exclude=SC1007,SC2034 \
-            tests/sync-from-app_test.sh tests/bootstrap-unix_test.sh
+            tests/bootstrap-unix_test.sh
 
-      - name: Verify CI contract and Bridge release
+      - name: Verify CI contract
         shell: bash
         run: |
           python3 tests/ci_workflow_test.py
           python3 tests/ci-parse-closure_test.py
           python3 tests/bootstrap-isolation_test.py
           python3 tests/checkout-integrity_test.py
-          python3 tests/sync-work-preservation_test.py
-          python3 tests/bridge-release_test.py
 
       # Product-level contract suites: systemd/launchd unit safety, lock and
       # home identity, authenticated redirects, negative auth probes, rollback.
@@ -57,18 +55,30 @@ jobs:
         shell: bash
         run: python3 tests/review-unix-security.py
 
-      # Mobile Bridge handlers in-process against a disposable home: path
-      # confinement, structured redaction, destination scopes, unique backups.
-      - name: Review suite (Mobile Bridge)
+      # Setup without the Mobile Bridge: the Dashboard sign-in decision, the
+      # code that carries it, --retire-bridge, and a whole setup against a
+      # stand-in Hermes in a disposable home (nothing is installed or fetched).
+      - name: Setup without the Mobile Bridge
         shell: bash
         run: |
+          python3 tests/no-bridge_test.py
+          python3 tests/no-bridge-install_test.py
+
+      # LEGACY, removed with Console 1.2.17. The Mobile Bridge is no longer
+      # installed, but its file and manifest stay published for apps older than
+      # 1.2.15 that still update a bridge they already have: the manifest must
+      # describe the exact bytes, and the handlers keep their own suite.
+      - name: Legacy (bridge-era installs) - manifest, handlers, old installs
+        shell: bash
+        run: |
+          python3 tests/legacy-bridge-release_test.py
+          python3 tests/legacy-bridge-coexistence_test.py
           python3 -m pip install --quiet --disable-pip-version-check aiohttp pyyaml
-          python3 tests/bridge_security_test.py
+          python3 tests/legacy-bridge-security_test.py
 
       - name: Run Unix tests
         shell: bash
         run: |
-          bash tests/sync-from-app_test.sh
           bash tests/bootstrap-unix_test.sh
 
   macos:
@@ -102,7 +112,9 @@ jobs:
 
       - name: Run the contract suite on macOS
         shell: bash
-        run: python3 tests/review-unix-security.py
+        run: |
+          python3 tests/review-unix-security.py
+          python3 tests/no-bridge_test.py
 
       # launchd es otro gestor de servicios: se valida con `launchctl` real,
       # usando las propias funciones del instalador (plist, guardas de propiedad
@@ -111,7 +123,7 @@ jobs:
         shell: bash
         run: python3 tests/macos-launchd_test.py
 
-      # Instalacion completa y aislada con probes autenticados contra los tres
+      # Instalacion completa y aislada con probes autenticados contra los dos
       # servicios, para que macOS deje de ser codigo sin evidencia nativa.
       - name: Native isolated install and authenticated probes
         shell: bash

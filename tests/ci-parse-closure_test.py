@@ -18,8 +18,8 @@ class SyntaxStepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ci-parse-closure-") as temp:
             root = Path(temp)
             (root / "tests").mkdir()
-            for name in ("hermes-mobile-setup.sh", "hermes-pair.sh", "sync-from-app.sh",
-                         "tests/sync-from-app_test.sh", "tests/bootstrap-unix_test.sh"):
+            for name in ("hermes-mobile-setup.sh", "hermes-pair.sh",
+                         "tests/bootstrap-unix_test.sh"):
                 (root / name).write_text("#!/bin/sh\ntrue\n")
             (root / "hermes-pair.sh").write_text("#!/bin/sh\nif (\n")
             result = subprocess.run(["bash", "-e", "-c", command], cwd=root,
