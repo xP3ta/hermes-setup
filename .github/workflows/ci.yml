@@ -41,14 +41,13 @@ jobs:
           shellcheck --severity=warning --exclude=SC1007,SC2034 \
             tests/bootstrap-unix_test.sh
 
-      - name: Verify CI contract and Bridge release
+      - name: Verify CI contract
         shell: bash
         run: |
           python3 tests/ci_workflow_test.py
           python3 tests/ci-parse-closure_test.py
           python3 tests/bootstrap-isolation_test.py
           python3 tests/checkout-integrity_test.py
-          python3 tests/bridge-release_test.py
 
       # Product-level contract suites: systemd/launchd unit safety, lock and
       # home identity, authenticated redirects, negative auth probes, rollback.
@@ -65,13 +64,17 @@ jobs:
           python3 tests/no-bridge_test.py
           python3 tests/no-bridge-install_test.py
 
-      # The Mobile Bridge is no longer installed, but its file stays published
-      # for apps that still update it: its handlers keep their own suite.
-      - name: Review suite (Mobile Bridge)
+      # LEGACY, removed with Console 1.2.17. The Mobile Bridge is no longer
+      # installed, but its file and manifest stay published for apps older than
+      # 1.2.15 that still update a bridge they already have: the manifest must
+      # describe the exact bytes, and the handlers keep their own suite.
+      - name: Legacy (bridge-era installs) - manifest, handlers, old installs
         shell: bash
         run: |
+          python3 tests/legacy-bridge-release_test.py
+          python3 tests/legacy-bridge-coexistence_test.py
           python3 -m pip install --quiet --disable-pip-version-check aiohttp pyyaml
-          python3 tests/bridge_security_test.py
+          python3 tests/legacy-bridge-security_test.py
 
       - name: Run Unix tests
         shell: bash

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Mobile Bridge security regressions (audit findings B1-B4).
+"""LEGACY (removed with Console 1.2.17): Mobile Bridge security regressions (audit findings B1-B4).
+
+The Bridge is no longer installed; its file stays published for apps older than
+Console 1.2.15 that still update a bridge they already have.
 
 Runs the real handlers in-process against a disposable HERMES_HOME. No network,
 no Hermes CLI invocation and no real service manager.

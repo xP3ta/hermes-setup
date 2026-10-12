@@ -255,7 +255,10 @@ def http(method, url, body=None, cookie=None, bearer=None):
 
 
 @unittest.skipUnless(platform.system() == "Linux", "drives the Linux portable manager")
-class WholeSetupTests(unittest.TestCase):
+class SetupRig(unittest.TestCase):
+    """A disposable home, the stand-in Hermes, the mocks and the fence. No tests
+    of its own: tests/legacy-bridge-coexistence_test.py builds on it too."""
+
     def setUp(self) -> None:
         self.host = private_address()
         if not self.host:
@@ -326,24 +329,6 @@ class WholeSetupTests(unittest.TestCase):
     def assert_nothing_else_was_reached(self) -> None:
         reached = self.fence_log.read_text(encoding="utf-8") if self.fence_log.exists() else ""
         self.assertEqual(reached, "", "a script tried to reach something that is not the stand-in")
-
-    def test_the_fence_refuses_and_records_any_other_destination(self) -> None:
-        python = self.hermes / "hermes-agent" / "venv" / "bin" / "python3"
-        probe = subprocess.run(
-            [str(python), "-c",
-             "import urllib.request\n"
-             "try:\n"
-             "    urllib.request.urlopen('http://127.0.0.1:1/', timeout=3)\n"
-             "    print('REACHED')\n"
-             "except Exception as exc:\n"
-             "    print(type(exc).__name__)\n"],
-            text=True, capture_output=True, timeout=30, env=self.environment(),
-        )
-        # Port 1 is nobody's: what is checked is that the attempt was stopped
-        # by the fence and written down, before any packet left.
-        self.assertNotIn("REACHED", probe.stdout)
-        self.assertEqual(self.fence_log.read_text(encoding="utf-8"), "('127.0.0.1', 1)\n")
-        self.fence_log.unlink()
 
     def run_script(self, script, *arguments, **extra):
         return subprocess.run(
@@ -420,6 +405,25 @@ class WholeSetupTests(unittest.TestCase):
     def assert_no_bridge(self) -> None:
         names = [str(path.relative_to(self.home)) for path in self.home.rglob("*")]
         self.assertEqual([name for name in names if "bridge" in name.lower()], [])
+
+class WholeSetupTests(SetupRig):
+    def test_the_fence_refuses_and_records_any_other_destination(self) -> None:
+        python = self.hermes / "hermes-agent" / "venv" / "bin" / "python3"
+        probe = subprocess.run(
+            [str(python), "-c",
+             "import urllib.request\n"
+             "try:\n"
+             "    urllib.request.urlopen('http://127.0.0.1:1/', timeout=3)\n"
+             "    print('REACHED')\n"
+             "except Exception as exc:\n"
+             "    print(type(exc).__name__)\n"],
+            text=True, capture_output=True, timeout=30, env=self.environment(),
+        )
+        # Port 1 is nobody's: what is checked is that the attempt was stopped
+        # by the fence and written down, before any packet left.
+        self.assertNotIn("REACHED", probe.stdout)
+        self.assertEqual(self.fence_log.read_text(encoding="utf-8"), "('127.0.0.1', 1)\n")
+        self.fence_log.unlink()
 
     def test_scan_and_done_then_every_way_the_sign_in_can_change(self) -> None:
         # A computer with Hermes and nothing else: one command, one code.
