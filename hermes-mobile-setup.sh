@@ -768,6 +768,15 @@ service_failure() {
   else
     echo "Nothing is listening on TCP $port."
   fi
+  if [ "$SERVICE_MANAGER" = "launchd" ]; then
+    launchd_report "dev.xpetalab.hermes-console.$log_name"
+  fi
+  if [ -s "$LOGS/$log_name.log" ]; then
+    echo "Last lines of $LOGS/$log_name.log:"
+    tail -n 15 "$LOGS/$log_name.log" || true
+  else
+    echo "$LOGS/$log_name.log is empty: the service never wrote a line."
+  fi
   echo "Inspect $LOGS/$log_name.log or the platform service logs, then retry."
   exit 1
 }
@@ -1950,9 +1959,38 @@ PY
   assert_loaded_launchd_job_owner "$label"
   launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
   mv "$plist_new" "$plist"
-  launchctl bootstrap "gui/$(id -u)" "$plist"
+  # bootout is asynchronous: a bootstrap straight after it can find the old job
+  # still going away. Every call is checked; the bootstrap gets a second try.
+  if ! launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
+    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+    sleep 2
+    if ! launchctl bootstrap "gui/$(id -u)" "$plist"; then
+      launchd_report "$label"
+      echo "ERROR: launchd would not load $label." >&2
+      return 1
+    fi
+  fi
   launchctl enable "gui/$(id -u)/$label" >/dev/null 2>&1 || true
-  [ "$start_now" != "yes" ] || launchctl kickstart -k "gui/$(id -u)/$label"
+  if [ "$start_now" = "yes" ]; then
+    # RunAtLoad already started it when the job was loaded. A kickstart with -k
+    # would kill that first start a moment after it began and restart it, which
+    # on a cold machine costs the first start's progress; without -k it starts
+    # the job only if it is not running.
+    if ! launchctl kickstart "gui/$(id -u)/$label" >/dev/null 2>&1 && \
+       ! launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      launchd_report "$label"
+      echo "ERROR: launchd loaded $label but could not start it." >&2
+      return 1
+    fi
+  fi
+}
+
+# launchd's own account of a job, for when a service did not come up.
+launchd_report() {
+  label="$1"
+  echo "launchd state of $label:" >&2
+  launchctl print "gui/$(id -u)/$label" 2>&1 | \
+    grep -E 'state =|last exit code|runs =|pid =|could not|Could not' | sed -n '1,8p' >&2 || true
 }
 
 assert_named_service_owner() {
@@ -2026,7 +2064,11 @@ case "$SERVICE_MANAGER" in
     ;;
 esac
 
-if ! wait_probe gateway "http://127.0.0.1:$GATEWAY_PORT" 40; then
+# The first start of a freshly built Hermes on a cold machine (bytecode
+# compiled, caches filled) can take minutes; a warm restart answers at once, so
+# the generous limit costs nothing when all is well.
+GATEWAY_START_WAIT="${HERMES_SETUP_START_WAIT:-240}"
+if ! wait_probe gateway "http://127.0.0.1:$GATEWAY_PORT" "$GATEWAY_START_WAIT"; then
   service_failure Gateway "$GATEWAY_PORT"
 fi
 echo "Gateway identity + valid-token + auth-rejection checks OK ($SERVICE_MANAGER)"
