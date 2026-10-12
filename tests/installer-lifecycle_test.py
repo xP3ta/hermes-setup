@@ -262,6 +262,24 @@ class SystemdUnitTests(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertNotIn("incomplete", done.stderr)
 
+    def test_no_exit_is_silent(self) -> None:
+        source = SETUP.read_text(encoding="utf-8")
+        parts = []
+        for name in ("systemd_diagnostics", "cleanup_setup"):
+            match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", source, re.MULTILINE | re.DOTALL)
+            self.assertIsNotNone(match, name)
+            parts.append(match.group(0))
+        script = (
+            "set -eu\nSETUP_PROGRESS_LABEL='Starting Hermes in the background'\n"
+            "SERVICE_LIFECYCLE_TOUCHED=0\nSERVICE_MANAGER=systemd\n" + "".join(parts)
+            + "trap cleanup_setup EXIT\nfalse\n"
+        )
+        done = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=30)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("Setup stopped during", done.stderr)
+        self.assertIn("Starting Hermes in the background", done.stderr)
+        self.assertIn("exit code 1", done.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

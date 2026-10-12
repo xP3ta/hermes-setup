@@ -18,11 +18,19 @@ fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SETUP="$HERE/../hermes-mobile-setup.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/hermes-linux-install.XXXXXX")"
-export HOME="$WORK/user"
-export HERMES_HOME="$HOME/.hermes"
+# A normal Linux user session: the user's service manager was started with the
+# real HOME and reads its units from there, so HOME stays what it is and only
+# the Hermes home (and the ports) are isolated.
+export HERMES_HOME="$WORK/hermes-home"
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+  DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+  export DBUS_SESSION_BUS_ADDRESS
+fi
 export HERMES_GATEWAY_PORT="${HERMES_GATEWAY_PORT:-18642}"
 export HERMES_DASHBOARD_PORT="${HERMES_DASHBOARD_PORT:-19119}"
-mkdir -p "$HOME"
+mkdir -p "$HERMES_HOME"
 # Pairing needs an address a phone could use; a runner's own private one will do.
 if [ -z "${HERMES_PAIR_HOST:-}" ]; then
   HERMES_PAIR_HOST="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | head -1 || true)"
@@ -41,12 +49,37 @@ redact() {
       -e 's|hermes://pair?[^ ]*|hermes://pair?REDACTED|g'
 }
 stop_all() {
-  systemctl --user stop hermes-gateway hermes-dashboard >/dev/null 2>&1 || true
+  systemctl --user disable --now hermes-gateway hermes-dashboard >/dev/null 2>&1 || true
   for name in gateway dashboard; do
     if [ -f "$HERMES_HOME/console-services/service-manager.sh" ]; then
       sh "$HERMES_HOME/console-services/service-manager.sh" stop "$name" >/dev/null 2>&1 || true
     fi
   done
+  # The units are this test's own on a disposable runner: leave none behind.
+  rm -f "$HOME/.config/systemd/user/hermes-gateway.service" \
+    "$HOME/.config/systemd/user/hermes-dashboard.service" \
+    "$HOME/.config/systemd/user/hermes-gateway.service.d/10-hermes-console-network.conf"
+  rmdir "$HOME/.config/systemd/user/hermes-gateway.service.d" 2>/dev/null || true
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+}
+dump_systemd() {
+  say "== session: user=$(id -un) uid=$(id -u) XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR bus=${DBUS_SESSION_BUS_ADDRESS:-unset} =="
+  loginctl show-user "$(id -un)" -p Linger -p State 2>&1 || true
+  systemctl --user is-system-running 2>&1 || true
+  for unit in hermes-gateway hermes-dashboard; do
+    say "== systemctl --user status $unit =="
+    systemctl --user status "$unit" --no-pager 2>&1 | head -25 | redact || true
+    say "== journalctl --user -u $unit =="
+    journalctl --user -u "$unit" -n 60 --no-pager 2>&1 | tail -60 | redact || true
+  done
+  for file in "$HOME/.config/systemd/user/hermes-gateway.service" \
+      "$HOME/.config/systemd/user/hermes-gateway.service.d/10-hermes-console-network.conf" \
+      "$HOME/.config/systemd/user/hermes-dashboard.service"; do
+    say "== $file =="
+    [ -f "$file" ] && redact < "$file" || say "absent"
+  done
+  say "== setup-transaction leftovers =="
+  ls -la "$HERMES_HOME/console-services" 2>&1 | head -20
 }
 trap stop_all EXIT
 
@@ -56,8 +89,9 @@ sh "$SETUP" > "$LOG" 2>&1
 RC=$?
 set -e
 if [ "$RC" -ne 0 ]; then
-  say "== last lines of the installer =="
-  tail -60 "$LOG" | redact
+  say "== the installer's full output (stdout and stderr) =="
+  redact < "$LOG"
+  dump_systemd
   for svc in gateway dashboard; do
     say "== $svc.log =="
     [ -f "$HERMES_HOME/logs/$svc.log" ] && tail -25 "$HERMES_HOME/logs/$svc.log" | redact || say "absent"

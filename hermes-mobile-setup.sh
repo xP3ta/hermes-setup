@@ -192,7 +192,29 @@ release_setup_lock() {
   SETUP_LOCK_HELD=0
 }
 
+# What systemd itself says about the two services, for when one did not come up.
+systemd_diagnostics() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  for diag_unit in hermes-gateway hermes-dashboard; do
+    echo "--- systemctl --user status $diag_unit" >&2
+    systemctl --user status "$diag_unit" --no-pager 2>&1 | sed -n '1,14p' >&2 || true
+    if command -v journalctl >/dev/null 2>&1; then
+      echo "--- journalctl --user -u $diag_unit (last 40 lines)" >&2
+      journalctl --user -u "$diag_unit" -n 40 --no-pager 2>&1 | tail -n 40 >&2 || true
+    fi
+  done
+}
+
 cleanup_setup() {
+  setup_exit_status=$?
+  # No exit is silent: whatever stopped the run, the step it stopped in and the
+  # exit code are said before anything is rolled back.
+  if [ "$setup_exit_status" -ne 0 ]; then
+    echo "Setup stopped during \"${SETUP_PROGRESS_LABEL:-startup}\" (exit code $setup_exit_status); changes made so far are being rolled back." >&2
+    if [ "${SERVICE_LIFECYCLE_TOUCHED:-0}" -eq 1 ] && [ "${SERVICE_MANAGER:-}" = "systemd" ]; then
+      systemd_diagnostics
+    fi
+  fi
   if command -v rollback_transaction >/dev/null 2>&1; then
     rollback_transaction
   fi
@@ -2234,9 +2256,18 @@ SERVICE_LIFECYCLE_TOUCHED=1
 case "$SERVICE_MANAGER" in
   systemd)
     install_verified_systemd_units
-    systemctl --user daemon-reload
-    systemctl --user enable hermes-gateway hermes-dashboard >/dev/null 2>&1
-    systemctl --user restart hermes-gateway
+    if ! systemctl --user daemon-reload; then
+      echo "ERROR: systemd did not reload its user units."
+      exit 1
+    fi
+    if ! systemctl --user enable hermes-gateway hermes-dashboard; then
+      echo "ERROR: systemd would not enable the Hermes services (its answer is above)."
+      exit 1
+    fi
+    if ! systemctl --user restart hermes-gateway; then
+      echo "ERROR: systemd could not start the Hermes Gateway."
+      exit 1
+    fi
     ;;
   launchd)
     install_launchd_job gateway dev.xpetalab.hermes-console.gateway "$GATEWAY_RUNNER" yes yes
