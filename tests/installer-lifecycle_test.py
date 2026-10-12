@@ -281,5 +281,34 @@ class SystemdUnitTests(unittest.TestCase):
         self.assertIn("exit code 1", done.stderr)
 
 
+class SlowDashboardTests(rig.SetupRig):
+    def test_a_dashboard_that_is_slow_to_start_and_drops_connections_still_succeeds(self) -> None:
+        done = self.run_script(
+            SETUP,
+            STANDIN_DASHBOARD_DELAY="6",
+            STANDIN_DASHBOARD_DROPS="2",
+            HERMES_SETUP_PROBE_PAUSE="1",
+        )
+        self.assertEqual(done.returncode, 0, done.stdout[-500:] + done.stderr[-800:])
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+
+    def test_a_dashboard_that_never_answers_a_protected_route_fails_cleanly(self) -> None:
+        done = self.run_script(
+            SETUP,
+            STANDIN_DASHBOARD_DROPS="1000",
+            HERMES_SETUP_PROBE_PAUSE="0",
+        )
+        self.assertNotEqual(done.returncode, 0)
+        combined = done.stdout + done.stderr
+        self.assertNotIn("Traceback", combined)
+        self.assertIn("did not answer", combined)
+        self.assertIn("authentication checks failed", combined)
+        self.assertIn("Look at that log", combined)
+        self.assertNotIn("rollback was incomplete", combined)
+        # Rolled back: no pairing record, no transaction left behind.
+        self.assertFalse((self.services / "pairing.env").exists())
+        self.assertEqual(list(self.services.glob("setup-transaction.*")), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
