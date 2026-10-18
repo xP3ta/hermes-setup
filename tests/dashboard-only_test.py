@@ -550,6 +550,20 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 2, action)
             self.assertEqual(left, [])
 
+    def test_removing_the_api_key_is_an_option_of_the_gateway_retire_only(self) -> None:
+        for arguments in (("--also-remove-api-key",), ("--new-access", "--also-remove-api-key"),
+                          ("--retire-bridge", "--also-remove-api-key"), ("--help", "--also-remove-api-key")):
+            with self.subTest(arguments):
+                completed, left = self.run_it(*arguments)
+                self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+                self.assertIn("--also-remove-api-key only goes with --retire-gateway-exposure", completed.stdout)
+                self.assertEqual(left, [])
+
+    def test_help_tells_that_the_api_key_is_kept_unless_asked(self) -> None:
+        completed, _ = self.run_it("--help")
+        self.assertIn("--also-remove-api-key", completed.stdout)
+        self.assertIn("API key is kept", completed.stdout)
+
     def test_a_script_piped_into_sh_cannot_also_read_a_password_from_stdin(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hermes-dash-pipe-") as raw:
             home = pathlib.Path(raw) / "home"
@@ -1038,11 +1052,14 @@ class RetireGatewayExposureTests(DashRig):
         runner = self.services / "hermes-gateway.sh"
         self.assertIn("API_SERVER_HOST", runner.read_text())
 
+        env_before = (self.hermes / ".env").read_bytes()
         completed = self.retire()
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn("Done.", completed.stdout)
+        # The key is kept: it may be somebody else's. The file is not even rewritten.
+        self.assertEqual((self.hermes / ".env").read_bytes(), env_before)
         env = (self.hermes / ".env").read_text()
-        self.assertNotIn("API_SERVER_KEY", env)
+        self.assertIn(key_line, env)
         self.assertIn("BEFORE=1", env)
         self.assertIn("AFTER=2", env)
         self.assertFalse((self.services / "pairing.env").exists())
@@ -1057,11 +1074,12 @@ class RetireGatewayExposureTests(DashRig):
         self.assertIn("until the Gateway is restarted", completed.stdout)
         self.assertIn("Left in place", completed.stdout)
         self.assertIn("dashboard-login.json", completed.stdout)
-        # The key line is recoverable, privately.
-        backups = list((self.hermes / "backups" / "gateway-exposure").glob("*"))
-        self.assertEqual(len(backups), 1)
-        self.assertIn(key_line, backups[0].read_text())
-        self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o600)
+        # What it says about the key: kept, and how to take it out. No promise about cron.
+        self.assertIn("Your API key", completed.stdout)
+        self.assertIn("was kept", completed.stdout)
+        self.assertIn("--also-remove-api-key", completed.stdout)
+        self.assertNotIn("not affected", completed.stdout)
+        self.assertFalse((self.hermes / "backups" / "gateway-exposure").exists())
         self.assertNotIn(key_line.split("=", 1)[1], completed.stdout + completed.stderr)
 
         # Twice is the same as once.
@@ -1081,6 +1099,71 @@ class RetireGatewayExposureTests(DashRig):
         self.assertEqual(self.sign_in(renewed)[0], 200)
         self.assertEqual(self.sign_in(link["dash_pass"])[0], 401)
         self.assertNotIn(renewed.encode(), self.everything_on_disk())
+
+    def test_a_key_that_was_already_there_before_the_old_setup_is_still_there_after(self) -> None:
+        # Open WebUI, a cron provider or another client may use it: the old setup
+        # reuses a strong key it finds, so the key is not proof of anything it added.
+        key = "preexisting-" + "k" * 40
+        self.hermes.mkdir(exist_ok=True)
+        (self.hermes / ".env").write_text("OPEN_WEBUI=1\nAPI_SERVER_KEY=" + key + "\nOTHER=2\n", encoding="utf-8")
+        link = self.old_setup()
+        self.assertEqual(link["token"], key)
+        runner = self.services / "hermes-gateway.sh"
+        self.assertIn("API_SERVER_HOST", runner.read_text())
+        self.assertIn("API_SERVER_PORT", runner.read_text())
+        env_before = (self.hermes / ".env").read_bytes()
+        self.assertIn(("API_SERVER_KEY=" + key).encode(), env_before)
+
+        completed = self.retire()
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual((self.hermes / ".env").read_bytes(), env_before)
+        text = runner.read_text()
+        self.assertNotIn("API_SERVER_HOST", text)
+        self.assertNotIn("API_SERVER_PORT", text)
+        self.assertNotIn("API_SERVER_HOST", (self.hermes / ".env").read_text())
+        self.assertFalse((self.services / "pairing.env").exists())
+        self.assertFalse((self.hermes / "backups" / "gateway-exposure").exists())
+        # The running Gateway still answers to that key, and a restart would find it.
+        self.assertEqual(rig.http("GET", self.gateway + "/api/sessions", bearer=key)[0], 200)
+
+    def test_the_key_goes_only_when_asked_and_a_private_copy_stays(self) -> None:
+        link = self.old_setup()
+        key_line = next(line for line in (self.hermes / ".env").read_text().splitlines()
+                        if line.startswith("API_SERVER_KEY="))
+        (self.hermes / ".env").write_text("BEFORE=1\n" + key_line + "\nAFTER=2\n", encoding="utf-8")
+        completed = self.retire("--also-remove-api-key")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        env = (self.hermes / ".env").read_text()
+        self.assertNotIn("API_SERVER_KEY", env)
+        self.assertEqual(env, "BEFORE=1\nAFTER=2\n")
+        for gone in ("API_SERVER_HOST", "API_SERVER_PORT"):
+            self.assertNotIn(gone, (self.services / "hermes-gateway.sh").read_text())
+        self.assertFalse((self.services / "pairing.env").exists())
+        backups = list((self.hermes / "backups" / "gateway-exposure").glob("*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), key_line + "\n")
+        self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o600)
+        # It says what this costs.
+        self.assertIn("WARNING", completed.stdout)
+        self.assertIn("does not start its API server", completed.stdout)
+        self.assertIn("stops working", completed.stdout)
+        self.assertNotIn(key_line.split("=", 1)[1], completed.stdout + completed.stderr)
+        self.assertEqual(rig.http("GET", self.gateway + "/api/sessions", bearer=link["token"])[0], 200)
+
+    def test_the_key_can_be_removed_in_a_second_step_after_the_default_retire(self) -> None:
+        self.old_setup()
+        first = self.retire()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("API_SERVER_KEY=", (self.hermes / ".env").read_text())
+        plain = self.retire()
+        self.assertIn("Nothing to do", plain.stdout)
+        self.assertIn("API_SERVER_KEY=", (self.hermes / ".env").read_text())
+        second = self.retire("--also-remove-api-key")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertNotIn("API_SERVER_KEY", (self.hermes / ".env").read_text())
+        self.assertEqual(len(list((self.hermes / "backups" / "gateway-exposure").glob("*"))), 1)
+        again = self.retire("--also-remove-api-key")
+        self.assertIn("Nothing to do", again.stdout)
 
     def test_a_key_without_the_old_setup_record_is_not_ours_and_stays(self) -> None:
         self.hermes.mkdir(exist_ok=True)
