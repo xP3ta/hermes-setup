@@ -79,7 +79,19 @@ def load_hermes_dotenv(*, hermes_home=None, project_env=None, load_external_secr
     return [path]
 ''',
     "hermes_cli/plugins.py": '''
+import glob, os, stat
+
 def discover_plugins(force=False):
+    # STANDIN_NOISE: Hermes printing a line on standard output while it loads.
+    if os.environ.get("STANDIN_NOISE") == "1":
+        print("plugin discovery noise")
+    # STANDIN_RECORD_PASSWORD_FILE: the mode of the password file at this moment.
+    record = os.environ.get("STANDIN_RECORD_PASSWORD_FILE")
+    if record:
+        pattern = os.path.join(os.environ["HERMES_HOME"], "console-services", "setup-transaction.*", "new-password")
+        with open(record, "a") as out:
+            for path in glob.glob(pattern):
+                out.write("%o\\n" % stat.S_IMODE(os.stat(path).st_mode))
     return None
 ''',
     "hermes_cli/plugins_cmd.py": '''
@@ -119,7 +131,7 @@ def list_providers(*, scope=None):
 
 STANDIN = r'''#!__PYTHON__
 """Stand-in for Hermes Agent: --version, gateway run, dashboard."""
-import hashlib, hmac, http.server, json, os, pathlib, socket, sys, time
+import glob, hashlib, hmac, http.server, json, os, pathlib, socket, sys, time
 
 with open(os.environ.get("MOCK_LOG", os.devnull) + ".hermes", "a", encoding="utf-8") as trail:
     trail.write(" ".join(sys.argv[1:]) + "\n")
@@ -186,6 +198,11 @@ def gateway():
 
 def dashboard(host, port):
     time.sleep(float(os.environ.get("STANDIN_DASHBOARD_DELAY", "0")))
+    watch = os.environ.get("STANDIN_RECORD_TRANSACTION")
+    if watch:
+        found = glob.glob(str(HOME / "console-services" / "setup-transaction.*" / "*"))
+        with open(watch, "a") as out:
+            out.write(json.dumps(sorted(os.path.basename(item) for item in found)) + "\n")
     # What main.py:714 and main_dashboard.py:709-712 do before the gate.
     load_hermes_dotenv(hermes_home=HOME)
     discover_plugins(force=True)
@@ -624,6 +641,10 @@ class SourceContractTests(unittest.TestCase):
             self.assertIn("no native Windows version", completed.stdout)
             self.assertEqual(list(home.iterdir()), [])
 
+    def test_no_gnu_only_alternation_in_a_basic_regular_expression(self) -> None:
+        # \\| in a BRE is a GNU extension; macOS grep and sed do not read it.
+        self.assertIsNone(re.search(r"\\\|", self.source), "use grep -E and (a|b)")
+
     def test_it_stays_posix_and_ascii(self) -> None:
         self.assertTrue(self.source.startswith("#!/bin/sh\n"))
         self.source.encode("ascii")
@@ -842,6 +863,111 @@ class SetupTests(DashRig):
         self.assertEqual(list(self.runtime.glob("hermes-console-setup-*")), [])
 
 
+    # -- P2-1 / P2-5: a sign-in that is written down but parked ------------------
+
+    PARKED = {"dashboard": {"basic_auth": {"username": "owner", "password_hash": units.fake_hash("mine"),
+                                           "password": "", "secret": "s" * 32}},
+              "plugins": {"disabled": ["basic"]}}
+
+    def test_a_sign_in_that_is_written_down_but_parked_is_switched_on_not_replaced(self) -> None:
+        (self.hermes / "config.json").write_text(json.dumps(self.PARKED, sort_keys=True), encoding="utf-8")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertIn("kept as it is", completed.stdout)
+        self.assertIsNone(re.search(r"^  password: ", completed.stdout, re.MULTILINE))
+        self.assertIn("Re-enabled the bundled 'basic' auth plugin", completed.stderr)
+        basic = self.basic()
+        self.assertEqual(basic["password_hash"], units.fake_hash("mine"))
+        self.assertEqual(basic["secret"], "s" * 32)
+        self.assertEqual(basic["username"], "owner")
+        self.assertEqual(self.config()["plugins"]["disabled"], [])
+        self.assertEqual(rig.http("GET", self.dashboard + "/api/model/options")[0], 401)
+        self.assertEqual(self.sign_in("mine", user="owner")[0], 200)
+
+    def test_a_parked_sign_in_comes_back_parked_when_setup_fails(self) -> None:
+        (self.hermes / "config.json").write_text(json.dumps(self.PARKED, sort_keys=True), encoding="utf-8")
+        before = self.config()
+        failed = self.dash(STANDIN_OPEN_DASHBOARD="1")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(self.config(), before)
+        self.assertEqual(list(self.services.glob("setup-transaction.*")), [])
+
+    def test_a_plugin_this_run_switched_on_is_switched_off_again_when_setup_fails(self) -> None:
+        (self.hermes / "config.json").write_text(
+            json.dumps({"model": "kept", "plugins": {"disabled": ["basic", "other"]}}, sort_keys=True), encoding="utf-8")
+        failed = self.dash(STANDIN_BREAK_SIGN_IN="1")
+        self.assertNotEqual(failed.returncode, 0)
+        restored = self.config()
+        self.assertEqual(restored["model"], "kept")
+        self.assertEqual(sorted(restored["plugins"]["disabled"]), ["basic", "other"])
+        self.assertEqual((restored.get("dashboard") or {}).get("basic_auth") or {}, {})
+        self.assertEqual(list(self.services.glob("setup-transaction.*")), [])
+
+    # -- P2-3: the generated password does not travel on standard output ----------
+
+    def test_a_line_printed_while_hermes_loads_does_not_become_part_of_the_password(self) -> None:
+        completed = self.dash(STANDIN_NOISE="1")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        password = self.password_from(completed)
+        self.assertNotIn("noise", password)
+        # Shown (it is Hermes' answer), but with the errors, not in the setup's own output.
+        self.assertIn("plugin discovery noise", completed.stderr)
+        self.assertNotIn("plugin discovery noise", completed.stdout)
+        self.assertEqual(self.sign_in(password)[0], 200)
+
+    def test_the_password_file_is_private_from_the_start_and_gone_before_the_dashboard_starts(self) -> None:
+        seen_mode = self.temp / "password-file-mode"
+        seen_files = self.temp / "transaction-files"
+        previous = os.umask(0o022)
+        try:
+            completed = self.dash(STANDIN_RECORD_PASSWORD_FILE=str(seen_mode),
+                                  STANDIN_RECORD_TRANSACTION=str(seen_files))
+        finally:
+            os.umask(previous)
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertEqual(seen_mode.read_text().split(), ["600"])
+        listings = [json.loads(line) for line in seen_files.read_text().splitlines()]
+        self.assertTrue(listings)
+        for names in listings:
+            self.assertNotIn("new-password", names)
+        self.assertEqual(list(self.services.glob("setup-transaction.*")), [])
+
+    def test_a_password_given_on_stdin_leaves_no_password_file_behind(self) -> None:
+        seen_files = self.temp / "transaction-files"
+        completed = self.dash("--password-stdin", stdin="a chosen password\n",
+                              STANDIN_RECORD_TRANSACTION=str(seen_files))
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        for line in seen_files.read_text().splitlines():
+            self.assertNotIn("new-password", json.loads(line))
+        self.assertEqual(self.sign_in("a chosen password")[0], 200)
+
+    # -- P2-2 / P2-6: what the final message says -----------------------------------
+
+    def test_a_new_password_says_that_external_secret_sources_were_not_read(self) -> None:
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertIn("external secret source", completed.stdout)
+
+    def test_a_clear_password_record_that_is_kept_is_warned_about_at_setup(self) -> None:
+        self.services.mkdir(parents=True)
+        self.login_file.write_text(json.dumps({"user": "old", "password": "old-clear-password"}), encoding="utf-8")
+        (self.hermes / "config.json").write_text(json.dumps(self.PARKED, sort_keys=True), encoding="utf-8")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertIn("kept as it is", completed.stdout)
+        self.assertTrue(self.login_file.exists())
+        self.assertIn("dashboard-login.json still holds a Dashboard password", completed.stdout)
+        self.assertNotIn("old-clear-password", completed.stdout + completed.stderr)
+
+    def test_a_new_sign_in_replaces_the_clear_record_and_has_nothing_to_warn_about(self) -> None:
+        self.services.mkdir(parents=True)
+        self.login_file.write_text(json.dumps({"user": "old", "password": "old-clear-password"}), encoding="utf-8")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertFalse(self.login_file.exists())
+        self.assertNotIn("still holds a Dashboard password", completed.stdout)
+
+
     def test_a_dashboard_that_does_not_protect_its_pages_is_not_accepted(self) -> None:
         completed = self.dash(STANDIN_OPEN_DASHBOARD="1")
         self.assertNotEqual(completed.returncode, 0)
@@ -986,6 +1112,14 @@ class SystemdTests(DashRig):
         self.assertEqual(self.sign_in(password)[0], 200)
         self.assertFalse(self.dash_pid.exists(), "the portable manager must not run beside systemd")
         self.assert_gateway_untouched()
+
+    def test_a_slow_network_cannot_leave_the_unit_failed_for_good(self) -> None:
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        text = self.unit.read_text()
+        unit_section = text.split("[Service]", 1)[0]
+        self.assertIn("\nStartLimitIntervalSec=0\n", unit_section)
+        self.assertIn("Restart=on-failure", text.split("[Service]", 1)[1])
 
     def test_a_unit_of_another_home_is_refused_and_nothing_changes(self) -> None:
         self.unit.parent.mkdir(parents=True)

@@ -711,7 +711,7 @@ retire_gateway_exposure() {
   evidence=0
   has_runner_exposure=0
   has_dropin=0
-  if [ -f "$runner" ] && grep -q '^export API_SERVER_\(HOST\|PORT\)=' "$runner" 2>/dev/null; then
+  if [ -f "$runner" ] && grep -Eq '^export API_SERVER_(HOST|PORT)=' "$runner" 2>/dev/null; then
     has_runner_exposure=1
     evidence=1
   fi
@@ -1335,7 +1335,7 @@ rollback_transaction() {
     for key in $TRANSACTION_KEYS; do
       rm -f "$TRANSACTION_DIR/$key.had" "$TRANSACTION_DIR/$key.data"
     done
-    rm -f "$TRANSACTION_DIR/dashboard-access.previous.json" "$TRANSACTION_DIR/state"
+    rm -f "$TRANSACTION_DIR/dashboard-access.previous.json" "$TRANSACTION_DIR/state" "$TRANSACTION_DIR/new-password"
     rmdir "$TRANSACTION_DIR" 2>/dev/null || rollback_failed=1
   fi
   if [ "$rollback_failed" -ne 0 ]; then
@@ -1350,7 +1350,7 @@ commit_transaction() {
   for key in $TRANSACTION_KEYS; do
     rm -f "$TRANSACTION_DIR/$key.had" "$TRANSACTION_DIR/$key.data"
   done
-  rm -f "$TRANSACTION_DIR/dashboard-access.previous.json" "$TRANSACTION_DIR/state"
+  rm -f "$TRANSACTION_DIR/dashboard-access.previous.json" "$TRANSACTION_DIR/state" "$TRANSACTION_DIR/new-password"
   rmdir "$TRANSACTION_DIR" 2>/dev/null || {
     echo "ERROR: setup completed but transaction cleanup failed in $TRANSACTION_DIR" >&2
     return 1
@@ -1367,7 +1367,7 @@ write_auth_scripts() {
   cat > "$WORK/auth.py" <<'PY_AUTH'
 import json, os, pathlib, secrets, sys
 
-action, home, state_path, previous_path, from_stdin = sys.argv[1:]
+action, home, state_path, previous_path, from_stdin, password_out = sys.argv[1:]
 os.environ["HERMES_HOME"] = home
 password_given = sys.stdin.readline().rstrip("\r\n") if from_stdin == "1" else ""
 if from_stdin == "1" and not password_given.strip():
@@ -1382,6 +1382,10 @@ def pinned_names():
     names = {}
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
+        # Only the .env is read. Sources outside it (a secret manager Hermes is
+        # set up to use) are not asked: a setup script must not run those helpers
+        # (hermes_cli/env_loader.py:488-493 resolves them). A sign-in kept only
+        # there is not seen; the final message says so.
         load_hermes_dotenv(hermes_home=home, load_external_secrets=False)
         for key in ("USERNAME", "PASSWORD", "PASSWORD_HASH"):
             names[key] = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_" + key, "").strip()
@@ -1440,6 +1444,39 @@ if providers is None:
 
 pinned = bool(env.get("PASSWORD") or env.get("PASSWORD_HASH"))
 other = [name for name in providers if name != "basic"]
+# A password sign-in that is written down but not registered: Hermes parks the
+# bundled plugin in plugins.disabled in that case (hermes_cli/plugins_cmd.py:531-537).
+configured = bool(
+    (env.get("USERNAME") or str(basic.get("username") or "").strip())
+    and (env.get("PASSWORD") or env.get("PASSWORD_HASH") or basic.get("password_hash") or basic.get("password"))
+)
+
+
+def disabled_plugins():
+    plugins = cfg.get("plugins")
+    value = plugins.get("disabled") if isinstance(plugins, dict) else None
+    return list(value) if isinstance(value, list) else []
+
+
+def enable_basic_plugin():
+    """Take the bundled basic plugin out of plugins.disabled; returns the names
+    that were taken out, so a rolled-back run can park them there again."""
+    before = disabled_plugins()
+    try:
+        from hermes_cli.plugins_cmd import ensure_basic_auth_plugin_enabled_in_config
+        if ensure_basic_auth_plugin_enabled_in_config(cfg):
+            sys.stderr.write("Re-enabled the bundled 'basic' auth plugin (it was in plugins.disabled)\n")
+    except ImportError:
+        pass
+    after = disabled_plugins()
+    return [name for name in before if name not in after]
+
+
+def remember(basic_before, reenabled):
+    pathlib.Path(previous_path).write_text(
+        json.dumps({"basic": basic_before, "reenabled": reenabled}), encoding="utf-8")
+    os.chmod(previous_path, 0o600)
+
 
 if action == "new-access":
     if pinned:
@@ -1452,12 +1489,19 @@ else:
     if providers:
         say("existing", str(basic.get("username") or env.get("USERNAME") or ""))
         raise SystemExit(0)
+    if configured:
+        # The user's own sign-in is there and only parked: switch the plugin back
+        # on and change nothing else; a new password would replace their hash.
+        reenabled = enable_basic_plugin()
+        if reenabled:
+            remember({}, reenabled)
+            save_config(cfg)
+        say("pinned" if pinned else "existing", str(basic.get("username") or env.get("USERNAME") or ""))
+        raise SystemExit(0)
 
 from plugins.dashboard_auth.basic import hash_password
 
 previous = {key: basic.get(key) for key in ("username", "password_hash", "password", "secret")}
-pathlib.Path(previous_path).write_text(json.dumps(previous), encoding="utf-8")
-os.chmod(previous_path, 0o600)
 password = password_given or secrets.token_urlsafe(24)
 username = str(basic.get("username") or "").strip() or env.get("USERNAME") or "admin"
 basic["username"] = username
@@ -1466,16 +1510,13 @@ basic["password"] = ""  # never persist the plaintext
 # --new-access also ends the sessions opened with the old sign-in.
 if action == "new-access" or not str(basic.get("secret") or "").strip():
     basic["secret"] = secrets.token_urlsafe(32)
-try:
-    from hermes_cli.plugins_cmd import ensure_basic_auth_plugin_enabled_in_config
-    if ensure_basic_auth_plugin_enabled_in_config(cfg):
-        sys.stderr.write("Re-enabled the bundled 'basic' auth plugin (it was in plugins.disabled)\n")
-except ImportError:
-    pass
+remember(previous, enable_basic_plugin())
 save_config(cfg)
 say("created", username)
 if not password_given:
-    sys.stdout.write(password)
+    # Into the private file the caller made, not onto standard output, where any
+    # line Hermes prints while it loads would be taken for part of the password.
+    pathlib.Path(password_out).write_text(password, encoding="utf-8")
 PY_AUTH
   cat > "$WORK/restore.py" <<'PY_RESTORE'
 import json, pathlib, sys
@@ -1489,11 +1530,22 @@ if not isinstance(cfg.get("dashboard"), dict):
 if not isinstance(cfg["dashboard"].get("basic_auth"), dict):
     cfg["dashboard"]["basic_auth"] = {}
 basic = cfg["dashboard"]["basic_auth"]
-for key, value in previous.items():
+for key, value in (previous.get("basic") or {}).items():
     if value is None:
         basic.pop(key, None)
     else:
         basic[key] = value
+# A plugin this run took out of plugins.disabled goes back in.
+parked = [name for name in (previous.get("reenabled") or []) if isinstance(name, str)]
+if parked:
+    if not isinstance(cfg.get("plugins"), dict):
+        cfg["plugins"] = {}
+    disabled = cfg["plugins"].get("disabled")
+    if not isinstance(disabled, list):
+        disabled = cfg["plugins"]["disabled"] = []
+    for name in parked:
+        if name not in disabled:
+            disabled.append(name)
 save_config(cfg)
 PY_RESTORE
 }
@@ -1627,9 +1679,17 @@ write_probe
 LOGIN_PW_FILE_FLAG=0
 [ "$PASSWORD_STDIN" -eq 0 ] || LOGIN_PW_FILE_FLAG=1
 auth_status=0
+# A generated password comes back in a file made here, private from the start and
+# inside the transaction folder (owner only), not on standard output: whatever
+# Hermes prints while it loads cannot end up inside the password.
+NEW_PASSWORD_FILE="$TRANSACTION_DIR/new-password"
+( umask 077; : > "$NEW_PASSWORD_FILE" ) || exit 1
 # The password given on standard input reaches Python through a pipe made by a
 # shell builtin: it is in no argument and in no environment variable.
-NEW_PASSWORD="$(printf '%s\n' "$DASH_PASSWORD" | HERMES_HOME="$HH" "$HP" "$WORK/auth.py" "$ACTION" "$HH" "$TRANSACTION_DIR/state" "$TRANSACTION_DIR/dashboard-access.previous.json" "$LOGIN_PW_FILE_FLAG")" || auth_status=$?
+printf '%s\n' "$DASH_PASSWORD" | HERMES_HOME="$HH" "$HP" "$WORK/auth.py" "$ACTION" "$HH" "$TRANSACTION_DIR/state" "$TRANSACTION_DIR/dashboard-access.previous.json" "$LOGIN_PW_FILE_FLAG" "$NEW_PASSWORD_FILE" 1>&2 || auth_status=$?
+NEW_PASSWORD=""
+IFS= read -r NEW_PASSWORD < "$NEW_PASSWORD_FILE" || true
+rm -f "$NEW_PASSWORD_FILE"
 if [ "$auth_status" -ne 0 ]; then
   echo "ERROR: Hermes would not accept the sign-in settings (its answer is above). Nothing was kept." >&2
   exit 1
@@ -1699,6 +1759,7 @@ payload = f"""[Unit]
 Description=Hermes Console dashboard
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 [Service]
 ExecStart={exec_argument(runner)}
 WorkingDirectory={directive_path(workdir)}
@@ -1858,6 +1919,8 @@ case "$LOGIN_STATE" in
     else
       echo "  password: as you gave it on standard input (not shown, not saved in clear)"
     fi
+    echo "A sign-in kept only in an external secret source (a secret manager Hermes is set up"
+    echo "to use) is not read by this setup: if you have one, this password was added next to it."
     ;;
   existing)
     echo ""
@@ -1876,6 +1939,12 @@ case "$LOGIN_STATE" in
     echo "and the configuration was not changed."
     ;;
 esac
+if [ -f "$SERVICES/dashboard-login.json" ]; then
+  echo ""
+  echo "WARNING: $SERVICES/dashboard-login.json still holds a Dashboard password"
+  echo "in clear, written by the earlier Console setup. This run did not touch it;"
+  echo "delete it yourself if you do not want that password stored."
+fi
 case "$SERVICE_MANAGER" in
   portable) echo "Starts by itself after a restart: no (this system has no service manager)" ;;
   *) echo "Starts by itself after a restart: yes ($SERVICE_MANAGER)" ;;
