@@ -14,6 +14,7 @@ set -eu
 ACTION="setup"
 ACTION_SET=""
 PASSWORD_STDIN=0
+ALSO_REMOVE_KEY=0
 for _hermes_arg in "$@"; do
   _hermes_next=""
   case "$_hermes_arg" in
@@ -22,6 +23,7 @@ for _hermes_arg in "$@"; do
     --retire-bridge) _hermes_next="retire-bridge" ;;
     -h|--help) _hermes_next="help" ;;
     --password-stdin) PASSWORD_STDIN=1 ;;
+    --also-remove-api-key) ALSO_REMOVE_KEY=1 ;;
     --password|--password=*)
       # The value is never echoed: a password on a command line is a leak.
       echo "Unknown option: --password"
@@ -44,6 +46,10 @@ for _hermes_arg in "$@"; do
     ACTION="$_hermes_next"
   fi
 done
+if [ "$ALSO_REMOVE_KEY" -eq 1 ] && [ "$ACTION" != "retire-gateway-exposure" ]; then
+  echo "--also-remove-api-key only goes with --retire-gateway-exposure."
+  exit 2
+fi
 case "$ACTION" in
   setup|new-access) ;;
   retire-gateway-exposure|retire-bridge|help)
@@ -67,8 +73,13 @@ if [ "$ACTION" = "help" ]; then
   echo "  --password-stdin  Take the password from the first line of standard input"
   echo "                    instead of generating one (run the saved script, not a pipe)."
   echo "  --retire-gateway-exposure"
-  echo "                    Undo what the earlier Console setup added to the Gateway"
-  echo "                    (API key, network address). The Gateway is not stopped."
+  echo "                    Undo what the earlier Console setup added to the Gateway:"
+  echo "                    its network address and port and its pairing record. Your"
+  echo "                    API key is kept. The Gateway is not stopped."
+  echo "  --also-remove-api-key"
+  echo "                    With --retire-gateway-exposure only: also remove the API key"
+  echo "                    from .env (a private copy is kept). Anything of yours that"
+  echo "                    uses that key stops working."
   echo "  --retire-bridge   Stop and remove the old Mobile Bridge. Nothing else is touched."
   exit 0
 fi
@@ -668,14 +679,21 @@ if [ "$ACTION" = "retire-bridge" ]; then
 fi
 
 # Undo what hermes-mobile-setup.sh added to the Gateway, and nothing else:
-#   - the API_SERVER_KEY line it put in .env,
 #   - the API_SERVER_HOST / API_SERVER_PORT it exported in console-services/hermes-gateway.sh,
 #   - the same two variables in the systemd drop-in 10-hermes-console-network.conf,
-#   - the pairing record (it points at that key).
+#   - the pairing record.
+# The API_SERVER_KEY line in .env is KEPT. The earlier setup reuses a strong key
+# that was already there (hermes-mobile-setup.sh:1353-1389, "Preserve one usable
+# existing API key"), so the line can belong to Open WebUI, a cron provider or
+# another client of the user. Without a usable key Hermes does not start its API
+# server at all (gateway/config_env.py:306-310, gateway/config.py:566) and external
+# cron providers, which fire over loopback HTTP into it, fail every time
+# (gateway/run.py:5672-5688). What exposed the Gateway was the address and port;
+# without them the API server binds its default, this computer only
+# (gateway/platforms/api_server.py:216,227). Only the explicit option
+# --also-remove-api-key takes the key out, and it says what that costs.
 # The Gateway is not stopped or restarted. Its own unit, its other settings and
-# every other line of .env stay as they are. Hermes enables the API server only
-# while it has a usable API_SERVER_KEY (gateway/config.py:566), so after the
-# Gateway's next restart nothing listens on the network API any more.
+# every other line of .env stay as they are.
 retire_gateway_exposure() {
   env_file="$HH/.env"
   runner="$HH/console-services/hermes-gateway.sh"
@@ -701,7 +719,17 @@ retire_gateway_exposure() {
     has_dropin=1
     evidence=1
   fi
-  [ ! -f "$pairing" ] || evidence=1
+  has_pairing=0
+  [ ! -f "$pairing" ] || has_pairing=1
+  [ "$has_pairing" -eq 0 ] || evidence=1
+  key_present=0
+  if [ -f "$env_file" ] && grep -q '^API_SERVER_KEY=' "$env_file" 2>/dev/null; then
+    key_present=1
+  fi
+  # Asking for the key to go too is an explicit order, so it needs no other trace.
+  if [ "$ALSO_REMOVE_KEY" -eq 1 ] && [ "$key_present" -eq 1 ]; then
+    evidence=1
+  fi
   if [ "$evidence" -eq 0 ]; then
     echo "The earlier Console setup left nothing exposed on the Gateway. Nothing to do."
     return 0
@@ -713,7 +741,7 @@ retire_gateway_exposure() {
   umask 077
   removed_key=0
   backup=""
-  if [ -f "$env_file" ] && grep -q '^API_SERVER_KEY=' "$env_file"; then
+  if [ "$ALSO_REMOVE_KEY" -eq 1 ] && [ "$key_present" -eq 1 ]; then
     removed_key=1
     awk '!/^API_SERVER_KEY=/' "$env_file" > "$prepared/env" || return 1
     mkdir -p "$HH/backups/gateway-exposure"
@@ -758,13 +786,21 @@ retire_gateway_exposure() {
   rm -f "$pairing"
 
   echo "Done. What the earlier Console setup added to the Gateway was removed:"
-  [ "$removed_key" -eq 0 ] || echo "  - the API_SERVER_KEY line in $env_file"
   [ "$has_runner_exposure" -eq 0 ] || echo "  - the network address and port in $runner"
   [ "$has_dropin" -eq 0 ] || echo "  - the network address and port in the Gateway's systemd drop-in"
-  echo "  - the pairing record (it pointed at that key)"
-  if [ -n "$backup" ]; then
-    echo "A private copy of the removed key line is in $backup. If you used that key"
-    echo "for something of your own, copy it back into $env_file."
+  [ "$has_pairing" -eq 0 ] || echo "  - the pairing record"
+  [ "$removed_key" -eq 0 ] || echo "  - the API key line in $env_file (you asked for it)"
+  if [ "$removed_key" -eq 1 ]; then
+    echo "A private copy of the removed key line is in $backup."
+    echo "WARNING: without a usable API key Hermes does not start its API server. After the"
+    echo "Gateway's next restart anything of yours that uses that key stops working: a cron"
+    echo "provider other than the built-in one, Open WebUI or any other client. To undo,"
+    echo "copy the line back into $env_file."
+  elif [ "$key_present" -eq 1 ]; then
+    echo "Your API key in $env_file was kept: Open WebUI, a cron provider or another client"
+    echo "of yours may be using it. Without this network address and port, Hermes' API server"
+    echo "listens on its default, this computer only, unless you set a host yourself."
+    echo "To remove the key too, run this again with --also-remove-api-key."
   fi
   if [ -f "$HH/console-services/dashboard-login.json" ]; then
     echo "Left in place: $HH/console-services/dashboard-login.json holds the Dashboard"
@@ -772,9 +808,8 @@ retire_gateway_exposure() {
     echo "yourself if you do not want the password stored."
   fi
   echo "Your Gateway was not stopped or restarted. It keeps listening as it was"
-  echo "until the Gateway is restarted (hermes gateway restart). Without that key"
-  echo "Hermes does not start its API server. Telegram, cron and your other bots"
-  echo "are not affected."
+  echo "until the Gateway is restarted (hermes gateway restart). Its other settings"
+  echo "and the rest of your .env were not changed."
   return 0
 }
 
