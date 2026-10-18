@@ -190,6 +190,10 @@ MUTANTS = [
     ("M51", "retire-bridge: no service manager, no removal",
      ('    if [ "$SERVICE_MANAGER" != "systemd" ]; then\n      echo "ERROR: the Mobile Bridge service', '    if false; then\n      echo "ERROR: the Mobile Bridge service'),
      [BRG + "test_a_unit_without_its_service_manager_is_refused_whole"]),
+    ("M52", "native Windows is refused, not half-run",
+     ('    echo "setup yet, so nothing was changed. This setup covers Linux and macOS only."\n    exit 2',
+      '    echo "setup yet, so nothing was changed. This setup covers Linux and macOS only."\n    exit 0'),
+     [SRC + "test_native_windows_is_told_there_is_no_version_for_it_yet"]),
 ]
 
 
