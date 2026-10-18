@@ -28,6 +28,8 @@ def main() -> None:
         "tests/review-unix-security.py",
         "tests/no-bridge_test.py",
         "tests/no-bridge-install_test.py",
+        "tests/dashboard-only_test.py",
+        "hermes-dashboard-setup.sh",
         "tests/new-hermes-layout_test.py",
         "tests/installer-lifecycle_test.py",
         "tests/legacy-bridge-release_test.py",

@@ -2,6 +2,27 @@
 
 One-command installer that connects a self-hosted [Hermes Agent](https://hermes-agent.nousresearch.com) server to **Console** (the Android app). Needs Console 1.2.15 or newer on the phone. Help and guide: <https://hermes.xpetalab.dev>.
 
+## Dashboard only (Console 1.3)
+
+Console 1.3 talks to the **Dashboard** and nothing else. For it, install Hermes with the **official installer** and then run the small complement below. It installs and downloads nothing, creates no API key, does not touch the Gateway and shows no pairing code:
+
+```sh
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive --skip-browser
+curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.sh | sh
+```
+
+The second command keeps the Dashboard on at all times (a user service that starts with the machine and restarts itself: `systemd --user` on Linux, `launchd` on macOS), listening on **one** LAN or Tailscale address, behind a sign-in. It asks nothing: it picks the address (Tailscale first, then the private LAN) and shows the generated password **once**, at the end. The password is stored only as Hermes' own scrypt hash in `config.yaml`; it is never an argument of any command and never written in clear.
+
+- A sign-in that already exists (in `config.yaml`, in `.env` or another provider) is **kept as it is**; no password is shown.
+- Forgot it? `... | sh -s -- --new-access` makes a new one and ends the sessions of the old one.
+- Choose the address or port: `HERMES_DASHBOARD_HOST=<private address>`, `HERMES_DASHBOARD_PORT=<port>`. Only a private LAN, Tailscale or unique-local address is accepted, never `0.0.0.0`.
+- Your own password: save the script, then `sh hermes-dashboard-setup.sh --password-stdin < file` (the first line is the password).
+- `--retire-gateway-exposure` undoes only what the earlier Console setup added to the Gateway (the `API_SERVER_KEY` line, the network address and port, the pairing record). It does not stop the Gateway, so Telegram, cron and your bots keep running; the Gateway stops listening on the network the next time it is restarted. A private copy of the removed key line is kept under `backups/gateway-exposure`.
+- `--retire-bridge` is the same cleanup of the old Mobile Bridge described under [Legacy](#legacy-bridge-era-installs).
+- Without `--non-interactive` the official installer asks for a model/provider and the Gateway. With it, the model/provider stays unset: choose it from the Dashboard (Console). Windows: the PowerShell version of this complement is not published yet; the installer below still works there.
+
+The all-in-one installer in the next section keeps working for Console 1.2.15 to 1.2.x.
+
 ## Install
 
 Linux, macOS and other Unix hosts:
@@ -307,7 +328,8 @@ journalctl --user -u hermes-gateway.service
 
 | File | What it is |
 |---|---|
-| `hermes-mobile-setup.sh` | The installer (readable top to bottom) |
+| `hermes-dashboard-setup.sh` | Dashboard-only complement to the official Hermes installer, for Console 1.3 (readable top to bottom) |
+| `hermes-mobile-setup.sh` | The all-in-one installer (readable top to bottom) |
 | `hermes-mobile-setup.ps1` | Native Windows installer |
 | `hermes-pair.sh` | Prints the pairing QR/link on demand (no reinstall) |
 | `hermes-pair.ps1` | Native Windows pairing QR/link |
@@ -328,4 +350,6 @@ python3 tests/review-unix-security.py     # contract suite
 python3 tests/no-bridge_test.py           # sign-in decision, code, --retire-bridge
 python3 tests/no-bridge-install_test.py   # a whole setup against a stand-in Hermes
 python3 tests/legacy-bridge-coexistence_test.py  # bridge-era installs: setup, show again, cleanup
+python3 tests/dashboard-only_test.py      # the Dashboard-only complement, its two cleanups
+python3 tests/dashboard-only_mutants.py   # one mutant per guard; every one must be killed
 ```
