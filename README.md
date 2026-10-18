@@ -23,9 +23,45 @@ The second command keeps the Dashboard on at all times (a user service that star
 - `--retire-gateway-exposure` undoes only what the earlier Console setup exposed on the Gateway: the network address and port (`API_SERVER_HOST` and `API_SERVER_PORT`, in the Gateway runner and in its systemd drop-in) and the pairing record. **Your `API_SERVER_KEY` is kept**: the earlier setup reuses a key that was already in `.env`, so it can belong to Open WebUI, a cron provider or another client of yours, and without a usable key Hermes does not start its API server at all. It does not stop the Gateway: it keeps listening as it was until the Gateway is restarted, and then Hermes' API server binds its default, this computer only (unless you set a host yourself).
 - `--retire-gateway-exposure --also-remove-api-key` also takes the `API_SERVER_KEY` line out of `.env`. Use it only when nothing else uses that key: after the Gateway's next restart Hermes does not start its API server, so a cron provider other than the built-in one, Open WebUI or any other client that depends on it stops working. The setup says so, and keeps a private copy of the removed line under `backups/gateway-exposure`. The option is refused with any other action.
 - `--retire-bridge` is the same cleanup of the old Mobile Bridge described under [Legacy](#legacy-bridge-era-installs).
-- Without `--non-interactive` the official installer asks for a model/provider and the Gateway. With it, the model/provider stays unset: choose it from the Dashboard (Console). **Windows: there is no PowerShell version of this complement yet. On Windows the earlier flow below still applies, with the Gateway exposed on the network as before, until a Dashboard-only script for Windows exists.**
+- Without `--non-interactive` the official installer asks for a model/provider and the Gateway. With it, the model/provider stays unset: choose it from the Dashboard (Console). On Windows, use the PowerShell version in the next subsection.
 
 The all-in-one installer in the next section keeps working for Console 1.2.15 to 1.2.x.
+
+
+### Dashboard only on Windows (PowerShell)
+
+The same complement for native Windows (**Windows PowerShell 5.1 or newer**, not
+WSL; tried on Windows 11, see the end of this subsection). Install Hermes with its official installer, then run the complement; it
+installs and downloads nothing, creates no API key, does not touch the Gateway
+and shows no pairing code:
+
+```powershell
+& ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -NonInteractive -SkipBrowser
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.ps1)))
+```
+
+Or save it, read it, and run it from the file (needed for `-PasswordStdin`):
+
+```powershell
+irm https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.ps1 -OutFile "$env:TEMP\hermes-dashboard-setup.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\hermes-dashboard-setup.ps1"
+```
+
+Run it from an **elevated** PowerShell (Run as administrator) so it can do the
+two things only an administrator can: start with the computer, and open the
+firewall for the Dashboard. Without elevation it still sets everything else up,
+says what it could not do, and prints the command for the firewall rule.
+
+- **Starts with the computer**: a Scheduled Task (`HermesConsole-Dashboard`) at startup, as you, with no stored password and nobody signed in. Not elevated, it starts when you sign in instead, and says so. A hidden runner starts the Dashboard again five seconds after it stops with an error.
+- **One address**: Tailscale first, then the private LAN address of the interface with the default route. `-BindAddress <address>` / `-Port <port>` (or `HERMES_DASHBOARD_HOST` / `HERMES_DASHBOARD_PORT`) choose them; only private IPv4 (10/8, 172.16/12, 192.168/16) or Tailscale (100.64/10) addresses of this computer are accepted, never `0.0.0.0`. A LAN address must be on a network Windows calls **Private**.
+- **One firewall rule of its own** (`HermesConsole-Dashboard-Only`): inbound TCP, that address and that port only, Private profile and the local subnet (Tailscale: its own range). Rules it did not make are never changed; a broader one that already lets the port in is reported.
+- **Sign-in** as in the shell version: a password is generated and shown **once**; only Hermes' scrypt hash is stored (`config.yaml`); a sign-in that already exists is kept. `-NewAccess` makes a new one and ends the old sessions. `-PasswordStdin` takes your own from the first line of standard input (`'my password' | powershell -NoProfile -ExecutionPolicy Bypass -File .\hermes-dashboard-setup.ps1 -PasswordStdin`). A password on the command line is refused.
+- **Checks like the app**: the status page answers, the protected pages refuse anyone who is not signed in, and the new password really signs in. If anything fails, the sign-in settings, the task, its runner and the firewall rule go back to what they were.
+- `-RetireGatewayExposure` undoes only what the earlier Windows setup added to the Gateway: `API_SERVER_HOST` and `API_SERVER_PORT` in `console-services\hermes-gateway.vbs`, the pairing record, and the Gateway's port in the firewall rules it made. **Your `API_SERVER_KEY` is kept**; `-RetireGatewayExposure -AlsoRemoveApiKey` also removes it (a private copy stays under `backups\gateway-exposure`) and says what that costs. The Gateway is not stopped and its task is not touched.
+- `-RetireBridge` removes the old Mobile Bridge, as under [Legacy](#legacy-bridge-era-installs). `-Help` lists the options.
+- To take it off a computer: stop the running Dashboard (Task Manager: the `wscript.exe`, `hermes.exe` and `python.exe` that run `dashboard`), then from an elevated PowerShell `Unregister-ScheduledTask -TaskName HermesConsole-Dashboard -Confirm:$false`, `Remove-NetFirewallRule -Name HermesConsole-Dashboard-Only` and delete `console-services\hermes-dashboard.vbs`. The sign-in stays in `config.yaml` (`dashboard.basic_auth`).
+
+Not the same as the shell version: IPv4 only (no IPv6). Tried on Windows 11 Pro 25H2 (build 26200, Spanish) with Windows PowerShell 5.1 and Hermes 0.21.7: a first setup, a repeat, `-NewAccess`, `-PasswordStdin` with a password that has non-ASCII characters, a restart of the computer with nobody signed in, both clean-ups, and a setup that fails half-way. **Not tried**: Windows 10, Server, ARM64, PowerShell 7, Tailscale, a non-elevated run, an installation on a path with spaces, a Hermes home on another drive.
 
 ## Install
 
@@ -333,6 +369,7 @@ journalctl --user -u hermes-gateway.service
 | File | What it is |
 |---|---|
 | `hermes-dashboard-setup.sh` | Dashboard-only complement to the official Hermes installer, for Console 1.3 (readable top to bottom) |
+| `hermes-dashboard-setup.ps1` | The same Dashboard-only complement for native Windows (PowerShell 5.1+) |
 | `hermes-mobile-setup.sh` | The all-in-one installer (readable top to bottom) |
 | `hermes-mobile-setup.ps1` | Native Windows installer |
 | `hermes-pair.sh` | Prints the pairing QR/link on demand (no reinstall) |
@@ -356,4 +393,7 @@ python3 tests/no-bridge-install_test.py   # a whole setup against a stand-in Her
 python3 tests/legacy-bridge-coexistence_test.py  # bridge-era installs: setup, show again, cleanup
 python3 tests/dashboard-only_test.py      # the Dashboard-only complement, its two cleanups
 python3 tests/dashboard-only_mutants.py   # one mutant per guard; every one must be killed
+python3 tests/dashboard-only-windows_test.py     # the Windows script: static contract (it READS the script)
+python3 tests/dashboard-only-windows_mutants.py  # one mutant per guard of the Windows script
+./tests/dashboard-only-windows.Tests.ps1         # on Windows PowerShell 5.1: functions, probe, clean-ups
 ```

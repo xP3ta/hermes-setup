@@ -85,6 +85,16 @@ jobs:
         shell: bash
         run: python3 tests/dashboard-only_test.py
 
+      # The Windows version of the same setup (hermes-dashboard-setup.ps1). There
+      # is no PowerShell on this runner, so this suite READS the script: plain
+      # ASCII, balanced brackets, no Gateway, no API key, no download, no
+      # personal data, every guard written where it must be, and the sign-in code
+      # identical to the one the suite above runs against Hermes. It does not
+      # prove the script works on Windows: the windows job below runs it.
+      - name: Dashboard-only setup for Windows (static contract)
+        shell: bash
+        run: python3 tests/dashboard-only-windows_test.py
+
       - name: Legacy (bridge-era installs) - manifest, handlers, old installs
         shell: bash
         run: |
@@ -194,6 +204,15 @@ jobs:
       - name: Parse and test with PowerShell 7
         shell: pwsh
         run: ./tests/powershell_test.ps1
+
+      # Dashboard-only setup for Windows: the pure functions, the Dashboard probe
+      # against a stand-in server on loopback, the generated runner under
+      # wscript, and both clean-ups in a throw-away home. Nothing is installed.
+      # Windows PowerShell 5.1 only: that is what the script targets and what it
+      # was run on; PowerShell 7 has not been tried.
+      - name: Dashboard-only setup for Windows (behaviour)
+        shell: powershell
+        run: ./tests/dashboard-only-windows.Tests.ps1
 
       # Native suite on a real Windows Server runner: Job Objects, Scheduled
       # Tasks, CIM inventory, firewall filters executable overrides and process
