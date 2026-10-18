@@ -589,6 +589,27 @@ class SourceContractTests(unittest.TestCase):
         for fragment in ("| bash -s", "install.sh | bash", "run_hermes_installer", "--skip-setup", "git clone"):
             self.assertNotIn(fragment, self.source.replace(OFFICIAL_INSTALL, ""))
 
+    def test_it_never_points_at_a_windows_script_that_does_not_exist(self) -> None:
+        self.assertFalse((ROOT / "hermes-dashboard-setup.ps1").exists())
+        self.assertNotIn("dashboard-setup.ps1", self.source)
+
+    def test_native_windows_is_told_there_is_no_version_for_it_yet(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hermes-dash-win-") as raw:
+            home = pathlib.Path(raw) / "home"
+            home.mkdir()
+            mock = pathlib.Path(raw) / "bin"
+            mock.mkdir()
+            (mock / "uname").write_text("#!/bin/sh\necho MINGW64_NT-10.0\n", encoding="utf-8")
+            (mock / "uname").chmod(0o700)
+            completed = subprocess.run(
+                ["sh", str(SCRIPT)], text=True, input="", capture_output=True, timeout=20,
+                env={**os.environ, "HOME": str(home), "XDG_RUNTIME_DIR": raw,
+                     "PATH": str(mock) + os.pathsep + os.environ["PATH"]},
+            )
+            self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+            self.assertIn("no native Windows version", completed.stdout)
+            self.assertEqual(list(home.iterdir()), [])
+
     def test_it_stays_posix_and_ascii(self) -> None:
         self.assertTrue(self.source.startswith("#!/bin/sh\n"))
         self.source.encode("ascii")

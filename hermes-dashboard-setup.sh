@@ -1,6 +1,6 @@
 #!/bin/sh
-# Hermes Console - Dashboard-only setup (Linux, macOS and explicit WSL).
-# Native Windows uses hermes-dashboard-setup.ps1 from the same public repository.
+# Hermes Console - Dashboard-only setup (Linux and macOS).
+# There is no native Windows version of this setup yet.
 #
 # A thin complement to the official Hermes installer. It installs nothing,
 # downloads nothing and does not touch the Gateway. It does the one thing the
@@ -75,15 +75,14 @@ fi
 
 # The one line that installs Hermes. Nothing here runs it.
 OFFICIAL_INSTALL="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
-REPO_RAW="${HERMES_REPO_RAW:-https://raw.githubusercontent.com/xP3ta/hermes-setup/main}"
-WINDOWS_COMMAND="irm $REPO_RAW/hermes-dashboard-setup.ps1 | iex"
+
 
 case "$(uname -s 2>/dev/null || echo unknown)" in
   Linux*) PLATFORM="linux" ;;
   Darwin*) PLATFORM="macos" ;;
   CYGWIN*|MINGW*|MSYS*)
-    echo "Windows native detected. Run this command in PowerShell:"
-    echo "  $WINDOWS_COMMAND"
+    echo "Windows native detected. There is no native Windows version of this Dashboard-only"
+    echo "setup yet, so nothing was changed. This setup covers Linux and macOS only."
     exit 2
     ;;
   *) PLATFORM="unix" ;;
@@ -95,10 +94,9 @@ if [ "$PLATFORM" = "linux" ] && { [ -n "${WSL_INTEROP:-}" ] || grep -qi microsof
   case "$ACTION" in
     setup|new-access)
       if [ -z "${HERMES_DASHBOARD_HOST:-}" ]; then
-        echo "WSL detected. Its automatic IP is not reliably reachable from a phone."
-        echo "Run the native Windows installer in PowerShell instead:"
-        echo "  $WINDOWS_COMMAND"
-        echo "Advanced routed WSL setups may set HERMES_DASHBOARD_HOST explicitly."
+        echo "WSL detected. Its automatic IP is not reliably reachable from a phone, so"
+        echo "nothing was changed. Advanced routed WSL setups may set HERMES_DASHBOARD_HOST"
+        echo "explicitly to an address the phone can reach."
         exit 2
       fi
       ;;
