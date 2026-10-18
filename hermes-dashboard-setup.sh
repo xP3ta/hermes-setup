@@ -1,6 +1,6 @@
 #!/bin/sh
 # Hermes Console - Dashboard-only setup (Linux and macOS).
-# There is no native Windows version of this setup yet.
+# On native Windows use hermes-dashboard-setup.ps1 (the same setup, in PowerShell).
 #
 # A thin complement to the official Hermes installer. It installs nothing,
 # downloads nothing and does not touch the Gateway. It does the one thing the
@@ -92,8 +92,8 @@ case "$(uname -s 2>/dev/null || echo unknown)" in
   Linux*) PLATFORM="linux" ;;
   Darwin*) PLATFORM="macos" ;;
   CYGWIN*|MINGW*|MSYS*)
-    echo "Windows native detected. There is no native Windows version of this Dashboard-only"
-    echo "setup yet, so nothing was changed. This setup covers Linux and macOS only."
+    echo "Windows native detected. This shell script covers Linux and macOS, so nothing"
+    echo "was changed. On Windows run hermes-dashboard-setup.ps1 from Windows PowerShell 5.1 or newer."
     exit 2
     ;;
   *) PLATFORM="unix" ;;

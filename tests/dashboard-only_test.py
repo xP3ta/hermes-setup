@@ -620,11 +620,12 @@ class SourceContractTests(unittest.TestCase):
         for fragment in ("| bash -s", "install.sh | bash", "run_hermes_installer", "--skip-setup", "git clone"):
             self.assertNotIn(fragment, self.source.replace(OFFICIAL_INSTALL, ""))
 
-    def test_it_never_points_at_a_windows_script_that_does_not_exist(self) -> None:
-        self.assertFalse((ROOT / "hermes-dashboard-setup.ps1").exists())
-        self.assertNotIn("dashboard-setup.ps1", self.source)
+    def test_the_windows_script_it_points_at_exists(self) -> None:
+        # The shell script names the PowerShell one; it must be there to be named.
+        self.assertIn("hermes-dashboard-setup.ps1", self.source)
+        self.assertTrue((ROOT / "hermes-dashboard-setup.ps1").is_file())
 
-    def test_native_windows_is_told_there_is_no_version_for_it_yet(self) -> None:
+    def test_native_windows_is_sent_to_the_powershell_script(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hermes-dash-win-") as raw:
             home = pathlib.Path(raw) / "home"
             home.mkdir()
@@ -638,7 +639,8 @@ class SourceContractTests(unittest.TestCase):
                      "PATH": str(mock) + os.pathsep + os.environ["PATH"]},
             )
             self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
-            self.assertIn("no native Windows version", completed.stdout)
+            self.assertIn("hermes-dashboard-setup.ps1", completed.stdout)
+            self.assertIn("Windows PowerShell", completed.stdout)
             self.assertEqual(list(home.iterdir()), [])
 
     def test_no_gnu_only_alternation_in_a_basic_regular_expression(self) -> None:
