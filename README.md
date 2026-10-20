@@ -35,6 +35,8 @@ The setup keeps the Dashboard on at all times (a user service that starts with t
 - If the earlier Console setup (Console 1.2) left its Gateway exposure (network address and port, or pairing record) or the old Mobile Bridge, the setup **tells you at the end and names the two options, but changes nothing**: a phone still on Console 1.2 would stop working. Run them yourself when every phone uses Console 1.3.
 - The official installer runs with `--non-interactive`, so the model/provider stays unset: choose it from the Dashboard (Console). On Windows, use the PowerShell version in the next subsection.
 
+Tried on a clean Debian 13 (shell version): Hermes installed with the official installer, a repeat run with no call to the installer, a restart, `--new-access`, `--remove`, and the QR code drawn and decoded (`v=2`, `url`, `user`, `pass`; no token, host or port). **Not tried**: macOS and a real VPS.
+
 The all-in-one installer in the next section keeps working for Console 1.2.15 to 1.2.x: its address (`main/hermes-mobile-setup.*`) is frozen for those apps and goes away with Console 1.4. Console 1.3 uses the command above.
 
 
@@ -42,13 +44,11 @@ The all-in-one installer in the next section keeps working for Console 1.2.15 to
 
 A server on the internet has no private address, so the setup stops with nothing changed and says so: it never opens a public address and never listens on `0.0.0.0`. Console connects through **Tailscale**:
 
-1. Install Tailscale on the server. Linux or macOS: `curl -fsSL https://tailscale.com/install.sh | sh`, then `sudo tailscale up`. Windows: <https://tailscale.com/download/windows>, then connect.
+1. Install Tailscale on the server. Linux: `curl -fsSL https://tailscale.com/install.sh | sh`, then `sudo tailscale up`. macOS or Windows: <https://tailscale.com/download>, then connect.
 2. Install Tailscale on the phone and sign in with the **same** account.
 3. Run the same setup command again.
 
 The setup does not install or start Tailscale for you.
-
-Tried on a clean Debian 13 (shell version): Hermes installed with the official installer, a repeat run with no call to the installer, a restart, `--new-access`, `--remove`, and the QR code drawn and decoded (`v=2`, `url`, `user`, `pass`; no token, host or port). **Not tried**: macOS and a real VPS.
 
 ### Dashboard only on Windows (PowerShell)
 
@@ -85,7 +85,7 @@ says what it could not do, and prints the command for the firewall rule.
 - `-Remove` takes it off the computer: it stops the Dashboard and removes its Scheduled Task, its runner and its own firewall rule (from a window that is not elevated it says the one command left for the rule). The sign-in stays in `config.yaml` (`dashboard.basic_auth`); Hermes and the Gateway are not touched. Safe to repeat.
 - If this computer's address changes, run the setup again: the firewall rule is made for the address, so on Windows the Dashboard does not follow a new address by itself (the shell version does).
 
-Not the same as the shell version: IPv4 only (no IPv6). Tried on a clean Windows 11 with Windows PowerShell 5.1: Hermes installed with the official installer, a repeat run with no call to the installer, a restart of the computer, `-NewAccess`, `-Remove`, and the QR code drawn and decoded (`v=2`, `url`, `user`, `pass`; no token, host or port). **Not tried**: PowerShell 7, Windows 10, Windows Server, ARM64, the Windows "Public" network profile, an installation with no network, a real VPS.
+Not the same as the shell version: IPv4 only (no IPv6). Tried on a clean Windows 11 with Windows PowerShell 5.1: Hermes installed with the official installer, a repeat run with no call to the installer, a restart of the computer, `-NewAccess`, `-Remove`, and the QR code drawn and decoded (`v=2`, `url`, `user`, `pass`; no token, host or port). Tried earlier on Windows 11 with Hermes already installed: `-PasswordStdin` with a password that has non-ASCII characters, and a setup that fails half-way. **Not tried**: PowerShell 7, Windows 10, Windows Server, ARM64, Tailscale on Windows, a non-elevated run, an installation on a path with spaces, a Hermes home on another drive, the Windows "Public" network profile, an installation with no network, a real VPS.
 
 ## Install
 
