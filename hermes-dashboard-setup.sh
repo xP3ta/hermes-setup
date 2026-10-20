@@ -2,11 +2,11 @@
 # Hermes Console - Dashboard-only setup (Linux and macOS).
 # On native Windows use hermes-dashboard-setup.ps1 (the same setup, in PowerShell).
 #
-# A thin complement to the official Hermes installer. It installs nothing,
-# downloads nothing and does not touch the Gateway. It does the one thing the
-# official installer leaves undone: it keeps the Dashboard on all the time, on
-# one LAN or Tailscale address, behind a sign-in, and shows the generated
-# password once.
+# A thin complement to the official Hermes installer. If Hermes is missing it
+# runs the official installer and nothing else; if Hermes is there it never runs
+# it. It does not touch the Gateway. It does the one thing the official
+# installer leaves undone: it keeps the Dashboard on all the time, on one LAN or
+# Tailscale address, behind a sign-in, and shows the generated password once.
 
 # Everything below is one function, called on the last line. A download that
 # stops half way (curl | sh) ends inside it, and a shell never runs half a
@@ -81,6 +81,7 @@ if [ "$ACTION" = "help" ]; then
   echo ""
   echo "  (no option)       Keep the Dashboard on at all times, on your LAN or Tailscale"
   echo "                    address, behind a sign-in. A password is generated and shown once."
+  echo "                    If Hermes is missing, its official installer runs first."
   echo "                    A sign-in that already exists is kept as it is."
   echo "  --new-access      Make a new Dashboard password and end the sessions of the old one."
   echo "  --password-stdin  Take the password from the first line of standard input"
@@ -99,8 +100,9 @@ if [ "$ACTION" = "help" ]; then
   exit 0
 fi
 
-# The one line that installs Hermes. Nothing here runs it.
-OFFICIAL_INSTALL="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+# The only way Hermes is installed, and only when it is missing (install_hermes).
+OFFICIAL_INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
+OFFICIAL_INSTALL_FLAGS="--non-interactive --skip-browser --skip-computer-use"
 
 
 case "$(uname -s 2>/dev/null || echo unknown)" in
@@ -693,6 +695,18 @@ if [ "$ACTION" = "retire-bridge" ]; then
   exit "$retire_status_final"
 fi
 
+# Read-only: the same three traces retire_gateway_exposure looks for. Setup only
+# reports them at the end of a run; undoing them is always the user's call.
+gateway_exposure_present() {
+  if [ -f "$HH/console-services/hermes-gateway.sh" ] && \
+     grep -Eq '^export API_SERVER_(HOST|PORT)=' "$HH/console-services/hermes-gateway.sh" 2>/dev/null; then
+    return 0
+  fi
+  [ ! -f "$HOME/.config/systemd/user/hermes-gateway.service.d/10-hermes-console-network.conf" ] || return 0
+  [ ! -f "$HH/console-services/pairing.env" ] || return 0
+  return 1
+}
+
 # Undo what hermes-mobile-setup.sh added to the Gateway, and nothing else:
 #   - the API_SERVER_HOST / API_SERVER_PORT it exported in console-services/hermes-gateway.sh,
 #   - the same two variables in the systemd drop-in 10-hermes-console-network.conf,
@@ -880,6 +894,7 @@ show_port_owner() {
 
 # Hermes is looked for where its installers put it. A launcher only counts when
 # it answers; a stale shim of a half-finished uninstall must not become a service.
+# "find_hermes_launcher seen" only asks whether any launcher is there at all.
 find_hermes_launcher() {
   probe_try=1
   while [ "$probe_try" -le 3 ]; do
@@ -887,6 +902,7 @@ find_hermes_launcher() {
     for candidate in "$HH/hermes-agent/.hermes/bin/hermes" "$HH/hermes-agent/venv/bin/hermes" "$HH/bin/hermes" "$HOME/.local/bin/hermes"; do
       if [ -x "$candidate" ]; then
         found_any=1
+        [ "${1:-}" != "seen" ] || return 0
         if "$candidate" --version >/dev/null 2>&1; then
           printf '%s\n' "$candidate"
           return 0
@@ -957,13 +973,42 @@ if [ "$ACTION" = "remove" ]; then
   exit 0
 fi
 
+# The official installer updates and repairs whatever it finds, so it runs only
+# when there is no Hermes at all: not in the standard place, not on PATH.
+install_hermes() {
+  if ! command -v curl >/dev/null 2>&1 || ! command -v bash >/dev/null 2>&1; then
+    echo "ERROR: curl and bash are needed to run the official Hermes installer. This setup changed nothing." >&2
+    return 1
+  fi
+  install_file="$(mktemp "${TMPDIR:-/tmp}/hermes-install.XXXXXX")" || return 1
+  install_status=0
+  # shellcheck disable=SC2086  # the flags are a fixed list of words
+  { curl -fsSL "$OFFICIAL_INSTALL_URL" -o "$install_file" && bash "$install_file" $OFFICIAL_INSTALL_FLAGS; } </dev/null || install_status=$?
+  rm -f "$install_file"
+  return "$install_status"
+}
+
 HB="$(find_hermes_launcher || true)"
 if [ -z "$HB" ]; then
-  echo "Hermes Agent is not installed on this computer (nothing answered under $HH)." >&2
-  echo "This setup does not install it. Install Hermes with the official command, then run this again:" >&2
-  echo "  $OFFICIAL_INSTALL" >&2
-  echo "Nothing was changed." >&2
-  exit 1
+  if find_hermes_launcher seen; then
+    echo "Hermes is installed under $HH but does not answer. The official installer would repair or" >&2
+    echo "update it, so it was not run. Repair Hermes first, then run this again. Nothing was changed." >&2
+    exit 1
+  fi
+  hermes_elsewhere="$(command -v hermes 2>/dev/null || true)"
+  if [ -n "$hermes_elsewhere" ]; then
+    echo "Hermes is at $hermes_elsewhere, outside its standard place ($HH). Installing it again would" >&2
+    echo "make two copies, so nothing was run. Nothing was changed." >&2
+    exit 1
+  fi
+  echo "Hermes Agent is not installed on this computer: running its official installer."
+  install_rc=0
+  install_hermes || install_rc=$?
+  HB="$(find_hermes_launcher || true)"
+  if [ -z "$HB" ] || [ "$install_rc" -ne 0 ]; then
+    echo "The official Hermes installation did not finish. This setup changed nothing." >&2
+    exit 1
+  fi
 fi
 
 # Two interpreters, because Hermes does not guarantee one that does both.
@@ -2087,5 +2132,23 @@ if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>
   echo "  sudo firewall-cmd --reload"
 fi
 echo "Keep the password private: whoever has it can use your Hermes."
+
+# What the earlier Console setup (Console 1.2) left is reported, never removed
+# here: a phone still on Console 1.2 would stop working.
+old_gateway=0
+old_bridge=0
+if gateway_exposure_present; then old_gateway=1; fi
+if [ -n "$(bridge_leftovers)" ]; then old_bridge=1; fi
+if [ "$old_gateway" -eq 1 ] || [ "$old_bridge" -eq 1 ]; then
+  echo ""
+  echo "Left over from the earlier Console setup (Console 1.2):"
+  if [ "$old_gateway" -eq 1 ]; then
+    echo "  - The Gateway is still reachable over the network. To undo that, run this setup again with --retire-gateway-exposure"
+  fi
+  if [ "$old_bridge" -eq 1 ]; then
+    echo "  - The old Mobile Bridge is still installed. To remove it, run this setup again with --retire-bridge"
+  fi
+  echo "Nothing was changed: Console 1.2 needs them. Do it when every phone uses Console 1.3."
+fi
 }
 main "$@" --end-of-script

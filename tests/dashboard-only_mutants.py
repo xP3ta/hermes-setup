@@ -37,6 +37,8 @@ ADR = "RunnerAddressTests."
 RMV = "RemoveTests."
 RMS = "RemoveSystemdTests."
 TXT = "SetupTextTests."
+INS = "InstallIfMissingTests."
+OLD = "OldInstallNoticeTests."
 
 # id, what the guard is, (old, new[, all]), tests that must fail
 MUTANTS = [
@@ -89,9 +91,9 @@ MUTANTS = [
     ("M16", "a linked services/logs folder is refused",
      ('  if [ -L "$managed_dir" ]; then', "  if false; then"),
      [SET + "test_a_services_folder_that_is_a_link_is_refused"]),
-    ("M17", "without Hermes it says so and creates nothing",
+    ("M17", "without Hermes and without an installer it says so and creates nothing",
      ('if [ -z "$HB" ]; then', "if false; then"),
-     [SET + "test_without_hermes_it_says_which_official_command_installs_it_and_creates_nothing"]),
+     [SET + "test_without_hermes_and_without_a_working_installer_it_says_so_and_creates_nothing"]),
     ("M18", "Hermes' libraries must run",
      ("""if ! HERMES_HOME="$HH" "$HP" -c 'import hermes_cli.config, plugins.dashboard_auth.basic' >/dev/null 2>&1; then""", "if false; then"),
      [SET + "test_a_hermes_whose_libraries_cannot_run_is_refused_untouched"]),
@@ -315,6 +317,47 @@ MUTANTS = [
     ("M88", "the firewall line names the real network",
      ('  [ -n "$FIREWALL_NET" ] || FIREWALL_NET="<your network, in CIDR form>"\nfi', '  FIREWALL_NET="<your network>"\nfi'),
      [TXT + "test_an_active_firewall_gets_the_real_network_not_a_blank_to_fill"]),
+    ("M89", "install always: the official installer runs even when Hermes is there",
+     ('HB="$(find_hermes_launcher || true)"\nif [ -z "$HB" ]; then\n  if find_hermes_launcher seen; then', 'HB=""\nif [ -z "$HB" ]; then\n  if false; then'),
+     [INS + "test_with_hermes_present_the_official_installer_is_never_fetched"]),
+    ("M90", "the installer is not told to be non-interactive",
+     ('OFFICIAL_INSTALL_FLAGS="--non-interactive --skip-browser', 'OFFICIAL_INSTALL_FLAGS="--skip-browser'),
+     [INS + "test_without_hermes_the_official_installer_runs_once_with_the_exact_flags_and_setup_goes_on",
+      SRC + "test_hermes_is_installed_only_with_the_official_installer_and_its_exact_flags"]),
+    ("M91", "a launcher that does not answer is not repaired by the installer",
+     ('  if find_hermes_launcher seen; then\n    echo "Hermes is installed under', '  if false; then\n    echo "Hermes is installed under'),
+     [INS + "test_a_launcher_that_does_not_answer_is_never_fixed_by_running_the_installer"]),
+    ("M92", "a Hermes elsewhere on PATH stops the setup",
+     ('  if [ -n "$hermes_elsewhere" ]; then', '  if false; then'),
+     [INS + "test_a_hermes_outside_the_standard_place_stops_the_setup_without_installing"]),
+    ("M93", "an installation that put nothing in place is not noticed",
+     ('  if [ -z "$HB" ] || [ "$install_rc" -ne 0 ]; then', '  if false; then'),
+     [INS + "test_an_installer_that_fails_or_installs_nothing_ends_with_nothing_changed"]),
+    ("M94", "an installer that failed is trusted if Hermes appeared",
+     ('  if [ -z "$HB" ] || [ "$install_rc" -ne 0 ]; then', '  if [ -z "$HB" ]; then'),
+     [INS + "test_an_installer_that_fails_or_installs_nothing_ends_with_nothing_changed"]),
+    ("M95", "the installer is fetched without the curl failure flag",
+     ('curl -fsSL "$OFFICIAL_INSTALL_URL"', 'curl -sS "$OFFICIAL_INSTALL_URL"'),
+     [INS + "test_an_installer_that_fails_or_installs_nothing_ends_with_nothing_changed"]),
+    ("M96", "an exposed Gateway is not reported",
+     ('if gateway_exposure_present; then old_gateway=1; fi', 'if false; then old_gateway=1; fi'),
+     [OLD + "test_an_exposed_gateway_is_reported_with_the_command_and_left_alone",
+      OLD + "test_a_pairing_record_alone_counts_as_exposure"]),
+    ("M97", "the old Bridge is not reported",
+     ('if [ -n "$(bridge_leftovers)" ]; then old_bridge=1; fi', 'if false; then old_bridge=1; fi'),
+     [OLD + "test_the_old_bridge_is_reported_with_its_command_and_left_alone"]),
+    ("M98", "a pairing record alone is not exposure",
+     ('  [ ! -f "$HH/console-services/pairing.env" ] || return 0\n  return 1', '  return 1'),
+     [OLD + "test_a_pairing_record_alone_counts_as_exposure"]),
+    ("M99", "setup retires the old Bridge by itself",
+     ('if [ "$old_gateway" -eq 1 ] || [ "$old_bridge" -eq 1 ]; then\n  echo ""', 'if [ "$old_bridge" -eq 1 ]; then rm -f "$HH/hermes_bridge.py"; fi\nif [ "$old_gateway" -eq 1 ] || [ "$old_bridge" -eq 1 ]; then\n  echo ""'),
+     [OLD + "test_the_old_bridge_is_reported_with_its_command_and_left_alone"]),
+    ("M100", "setup retires the Gateway exposure by itself",
+     ('if [ "$old_gateway" -eq 1 ] || [ "$old_bridge" -eq 1 ]; then\n  echo ""', 'if [ "$old_gateway" -eq 1 ]; then rm -f "$HH/console-services/hermes-gateway.sh"; fi\nif [ "$old_gateway" -eq 1 ] || [ "$old_bridge" -eq 1 ]; then\n  echo ""'),
+     [OLD + "test_an_exposed_gateway_is_reported_with_the_command_and_left_alone"]),
+    ("M101", "a clean computer gets a notice",
+     ('if [ "$old_gateway" -eq 1 ] || [ "$old_bridge" -eq 1 ]; then\n  echo ""', 'if true; then\n  echo ""'),
+     [OLD + "test_a_clean_computer_gets_no_notice"]),
 ]
 
 

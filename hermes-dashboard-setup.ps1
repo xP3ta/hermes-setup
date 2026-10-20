@@ -1,10 +1,11 @@
 # Hermes Console - Dashboard-only setup for native Windows (PowerShell 5.1+).
 #
-# A thin complement to the official Hermes installer (install.ps1). It installs
-# nothing, downloads nothing and does not touch the Gateway. It does the one
-# thing the official installer leaves undone: it keeps the Dashboard on all the
-# time, on one LAN or Tailscale address, behind sign-in, and shows the generated
-# password once.
+# A thin complement to the official Hermes installer (install.ps1). If Hermes
+# is missing it runs the official installer and nothing else; if Hermes is there
+# it never runs it. It does not touch the Gateway. It does the one thing the
+# official installer leaves undone: it keeps the Dashboard on all the time, on
+# one LAN or Tailscale address, behind sign-in, and shows the generated password
+# once.
 #
 #   -NewAccess               make a new Dashboard password and end old sessions
 #   -PasswordStdin           take the password from the first line of standard
@@ -49,7 +50,8 @@ $ProgressPreference = "SilentlyContinue"
 # A typed [string] parameter turns $null into "", so "was it given" is asked of the binder.
 $script:PasswordWasGiven = $PSBoundParameters.ContainsKey("Password")
 
-$script:OfficialInstall = "iex (irm https://hermes-agent.nousresearch.com/install.ps1)"
+$script:OfficialInstallUrl = "https://hermes-agent.nousresearch.com/install.ps1"
+$script:OfficialInstallArguments = @("-NonInteractive", "-SkipBrowser", "-SkipComputerUse")
 $script:TaskName = "HermesConsole-Dashboard"
 $script:FirewallRuleName = "HermesConsole-Dashboard-Only"
 $script:FirewallDisplayName = "Hermes Console Dashboard (private network)"
@@ -332,7 +334,8 @@ function Invoke-NativeProcess {
 # Hermes is looked for where its installers put it (scripts/desktop-update/
 # runtime.ps1:51-53 and :72-86 in Hermes). A launcher only counts when it
 # answers: a stale shim of a half-finished uninstall must not become a service.
-function Find-HermesLauncher([string]$HermesHome) {
+# -SeenOnly only asks whether any launcher is there at all.
+function Find-HermesLauncher([string]$HermesHome, [switch]$SeenOnly) {
     $installRoot = Join-Path $HermesHome "hermes-agent"
     $candidates = @(
         @{ Path = (Join-Path $installRoot ".hermes\bin\hermes.exe"); Check = $false },
@@ -347,6 +350,7 @@ function Find-HermesLauncher([string]$HermesHome) {
         foreach ($candidate in $candidates) {
             if (-not (Test-Path -LiteralPath $candidate.Path -PathType Leaf)) { continue }
             $found = $true
+            if ($SeenOnly) { return $candidate.Path }
             $probe = Invoke-NativeProcess $candidate.Path @("--version") -TimeoutSeconds 60
             if ($probe.Code -ne 0) { continue }
             if ($candidate.Check) {
@@ -362,6 +366,24 @@ function Find-HermesLauncher([string]$HermesHome) {
         Start-Sleep -Seconds ($attempt * 2)
     }
     return $null
+}
+
+# The official installer updates and repairs whatever it finds, so it runs only
+# when there is no Hermes at all. It runs in a child PowerShell of its own, so an
+# exit in it cannot end this setup, and its exit code is the answer.
+function Install-Hermes {
+    $file = Join-Path ([IO.Path]::GetTempPath()) ("hermes-install-" + [Guid]::NewGuid().ToString("N") + ".ps1")
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $script:OfficialInstallUrl -OutFile $file
+        $shell = (Get-Process -Id $PID).Path
+        $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $file) + $script:OfficialInstallArguments
+        $run = Start-Process -FilePath $shell -ArgumentList $arguments -NoNewWindow -Wait -PassThru
+        return ($run.ExitCode -eq 0)
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Hermes publishes the command that starts its own libraries
@@ -1112,11 +1134,24 @@ function Invoke-DashboardSetup {
     Write-Step "Looking at this computer"
     $launcher = Find-HermesLauncher $HermesHome
     if (-not $launcher) {
-        Write-Problem "Hermes Agent is not installed on this computer (nothing answered under $HermesHome)."
-        Write-Problem "This setup does not install it. Install Hermes with the official command, then run this again:"
-        Write-Problem "  $script:OfficialInstall"
-        Write-Problem "Nothing was changed."
-        return 1
+        if (Find-HermesLauncher $HermesHome -SeenOnly) {
+            Write-Problem "Hermes is installed under $HermesHome but does not answer. The official installer would repair or"
+            Write-Problem "update it, so it was not run. Repair Hermes first, then run this again. Nothing was changed."
+            return 1
+        }
+        $elsewhere = Get-Command hermes -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($elsewhere) {
+            Write-Problem "Hermes is at $($elsewhere.Source), outside its standard place ($HermesHome). Installing it again would"
+            Write-Problem "make two copies, so nothing was run. Nothing was changed."
+            return 1
+        }
+        Write-Say "Hermes Agent is not installed on this computer: running its official installer."
+        $installed = Install-Hermes
+        $launcher = Find-HermesLauncher $HermesHome
+        if (-not $installed -or -not $launcher) {
+            Write-Problem "The official Hermes installation did not finish. This setup changed nothing."
+            return 1
+        }
     }
     $python = Get-HermesPythonCommand $launcher
 
@@ -1362,6 +1397,22 @@ function Invoke-DashboardSetup {
             Write-Say "also lets TCP $portNumber in on every address of this computer."
         }
         Write-Say "Keep the password private: whoever has it can use your Hermes."
+
+        # What the earlier Console setup (Console 1.2) left is reported, never removed
+        # here: a phone still on Console 1.2 would stop working.
+        $oldGateway = (Test-GatewayExposurePresent $HermesHome)
+        $oldBridge = (Test-BridgeLeftoversPresent $HermesHome)
+        if ($oldGateway -or $oldBridge) {
+            Write-Say ""
+            Write-Say "Left over from the earlier Console setup (Console 1.2):"
+            if ($oldGateway) {
+                Write-Say "  - The Gateway is still reachable over the network. To undo that, run this setup again with -RetireGatewayExposure"
+            }
+            if ($oldBridge) {
+                Write-Say "  - The old Mobile Bridge is still installed. To remove it, run this setup again with -RetireBridge"
+            }
+            Write-Say "Nothing was changed: Console 1.2 needs them. Do it when every phone uses Console 1.3."
+        }
         return 0
     } catch {
         Write-Problem "ERROR: $($_.Exception.Message)"
@@ -1487,6 +1538,31 @@ function Get-OldFirewallRules {
         $rules += $rule
     }
     return $rules
+}
+
+# Read-only: the traces Invoke-RetireGatewayExposure and Invoke-RetireBridge look
+# for in files. Setup only reports them at the end of a run.
+function Test-GatewayExposurePresent([string]$HermesHome) {
+    $services = Join-Path $HermesHome "console-services"
+    $runner = Join-Path $services "hermes-gateway.vbs"
+    if (Test-Path -LiteralPath $runner -PathType Leaf) {
+        if ((Read-TextFile $runner).Text -match '(?m)^\s*sh\.Environment\("Process"\)\("API_SERVER_(HOST|PORT)"\)\s*=') { return $true }
+    }
+    foreach ($name in @("pairing.json", "pairing-qr.png", "pairing-qr.txt")) {
+        if (Test-Path -LiteralPath (Join-Path $services $name)) { return $true }
+    }
+    return $false
+}
+
+function Test-BridgeLeftoversPresent([string]$HermesHome) {
+    $services = Join-Path $HermesHome "console-services"
+    $target = Join-Path $HermesHome "hermes_bridge.py"
+    foreach ($path in @($target, "$target.rollback", "$target.new", (Join-Path $HermesHome "bridge.env"),
+                        (Join-Path $HermesHome "bridge_token"), (Join-Path $services "hermes-bridge.vbs"),
+                        (Join-Path $services "restart-hermes-bridge.vbs"))) {
+        if (Test-Path -LiteralPath $path) { return $true }
+    }
+    return $false
 }
 
 function Invoke-RetireGatewayExposure {
