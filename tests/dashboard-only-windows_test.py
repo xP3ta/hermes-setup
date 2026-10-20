@@ -201,15 +201,22 @@ class SurfaceTests(unittest.TestCase):
         for fragment in ("hermes://pair", "qrencode", "qrcode", "pairing-qr", "pairing.json", "Write-PairingQr"):
             self.assertNotIn(fragment, self.outside_retire, fragment)
 
-    def test_it_never_installs_or_downloads_anything(self) -> None:
-        code = code_only(self.source).replace(OFFICIAL_INSTALL, "")
+    def test_hermes_is_installed_only_by_the_official_installer_and_only_in_one_place(self) -> None:
+        # S2b: the one download is Install-Hermes; nothing else fetches or installs.
+        function = re.search(r"^function Install-Hermes \{.*?^\}\n", self.source, re.M | re.S)
+        self.assertIsNotNone(function)
+        code = code_only(self.source.replace(function.group(0), ""))
         for fragment in ("Invoke-WebRequest", "Invoke-RestMethod", "DownloadString", "DownloadFile",
                          "Start-BitsTransfer", "WebClient", "git clone", "pip install", "irm ", "curl ",
                          "Install-Module", "winget", "choco "):
             self.assertNotIn(fragment, code, fragment)
+        body = code_only(function.group(0))
+        self.assertEqual(body.count("Invoke-WebRequest"), 1)
+        self.assertEqual(self.source.count("https://hermes-agent.nousresearch.com/install.ps1"), 1)
+        self.assertIn('@("-NonInteractive", "-SkipBrowser", "-SkipComputerUse")', self.source)
         urls = set(re.findall(r"https?://[^\s\"')]+", code))
-        # the one address the Dashboard is probed at, built from the address it just chose
-        self.assertEqual(urls, {"http://$($bind.Address"}, urls)
+        # the official installer, and the one address the Dashboard is probed at
+        self.assertEqual(urls, {"http://$($bind.Address", "https://hermes-agent.nousresearch.com/install.ps1"}, urls)
 
     def test_http_goes_only_to_the_address_it_just_chose(self) -> None:
         self.assertEqual(len(re.findall(r"\[Net\.HttpWebRequest\]::Create\(", self.source)), 1)
@@ -226,8 +233,12 @@ class SurfaceTests(unittest.TestCase):
 
     def test_it_does_not_ask_for_elevation_by_itself(self) -> None:
         code = code_only(self.source)
-        for fragment in ("-Verb RunAs", "RunAs", "Start-Process"):
+        for fragment in ("-Verb", "RunAs"):
             self.assertNotIn(fragment, code, fragment)
+        # The only process it starts is the official installer, in Install-Hermes.
+        function = re.search(r"^function Install-Hermes \{.*?^\}\n", self.source, re.M | re.S).group(0)
+        self.assertEqual(code.count("Start-Process"), 1)
+        self.assertIn("Start-Process", function)
 
 
 class PasswordHandlingTests(unittest.TestCase):
@@ -347,8 +358,22 @@ GUARDS: list[tuple[str, str, list[str]]] = [
      [r"\n {8}if \(\$task -and -not \(Test-DashboardTaskOwned \$task \$runner\)\) \{\s+throw"]),
     ("G21", "a port held by something that is not this Dashboard is refused",
      [r"if \(-not \(Test-PortHeldByOwnDashboard \$HermesHome \$portNumber \$runner\)\) \{[^}]*return 1"]),
-    ("G22", "without Hermes it stops, changes nothing and does not install it",
-     [r"if \(-not \$launcher\) \{[^}]*This setup does not install it[^}]*return 1"]),
+    ("G22", "without a launcher that answers, it looks before it installs anything",
+     [r"if \(-not \$launcher\) \{\s+if \(Find-HermesLauncher \$HermesHome -SeenOnly\)"]),
+    ("G75", "a launcher that is there but does not answer is never repaired by the installer",
+     [r"-SeenOnly\) \{[^}]*The official installer would repair or[^}]*return 1"]),
+    ("G76", "a Hermes found outside the standard place stops the setup without installing",
+     [r"Get-Command hermes -ErrorAction SilentlyContinue[^}]*if \(\$elsewhere\) \{[^}]*return 1"]),
+    ("G77", "the official installer runs only when nothing was found, and its result is checked",
+     [r"\$installed = Install-Hermes\s+\$launcher = Find-HermesLauncher \$HermesHome\s+if \(-not \$installed -or -not \$launcher\) \{[^}]*changed nothing[^}]*return 1"]),
+    ("G78", "the official installer gets exactly its non-interactive flags, in a child PowerShell",
+     [r'OfficialInstallArguments = @\("-NonInteractive", "-SkipBrowser", "-SkipComputerUse"\)',
+      r"\$arguments = @\(\"-NoProfile\", \"-ExecutionPolicy\", \"Bypass\", \"-File\", \$file\) \+ \$script:OfficialInstallArguments",
+      r"return \(\$run\.ExitCode -eq 0\)"]),
+    ("G79", "an old install is reported with the two commands and never retired by itself",
+     [r"Test-GatewayExposurePresent \$HermesHome\)\s+\$oldBridge = \(Test-BridgeLeftoversPresent",
+      r"run this setup again with -RetireGatewayExposure", r"run this setup again with -RetireBridge",
+      r"Nothing was changed: Console 1\.2 needs them"]),
     ("G23", "Hermes must be able to run its own configuration code",
      [r"if \(\$check\.Code -ne 0\) \{\s+throw \"Hermes cannot run its own configuration code"]),
     ("G24", "the runtime command Hermes publishes is checked before it is used",
@@ -473,6 +498,15 @@ def _make_guard_test(guard_id: str, description: str, patterns: list[str]):
             start = source.index("Start-ScheduledTask -TaskName $script:TaskName -TaskPath \"\\\"\n")
             self.assertLess(rule, start, description)
             return
+        if guard_id == "G77":
+            # one definition, one call, and the call comes after both looks.
+            self.assertEqual(len(re.findall(r"Install-Hermes\b", code_only(source))), 2, description)
+            self.assertLess(source.index("-SeenOnly)"), source.index("= Install-Hermes"), description)
+            self.assertLess(source.index("Get-Command hermes"), source.index("= Install-Hermes"), description)
+        if guard_id == "G79":
+            setup = re.search(r"^function Invoke-DashboardSetup \{.*?^\}\n", source, re.M | re.S).group(0)
+            for fragment in ("Invoke-RetireGatewayExposure", "Invoke-RetireBridge", "Remove-Item -LiteralPath (Join-Path $services"):
+                self.assertNotIn(fragment, code_only(setup).replace("Remove-Item -LiteralPath $work", ""), fragment)
         if guard_id == "G74":
             region = re.search(r"^function Invoke-RemoveDashboard.*?^}\n", source, re.M | re.S).group(0)
             body = code_only(region)

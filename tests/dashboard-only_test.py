@@ -435,11 +435,18 @@ class DashRig(rig.SetupRig):
         self.dash_helper = self.services / "dashboard-service.sh"
 
     def environment(self, **extra):
-        return super().environment(**{
+        env = super().environment(**{
             "HERMES_DASHBOARD_HOST": self.host,
             "MOCK_STATE": str(self.mock_state),
             **extra,
         })
+        if "PATH" not in extra:
+            # A `hermes` of the machine running the tests must never be found:
+            # the setup looks for Hermes on PATH too.
+            clean = [d for d in os.environ["PATH"].split(os.pathsep)
+                     if d and not os.access(os.path.join(d, "hermes"), os.X_OK)]
+            env["PATH"] = os.pathsep.join([str(self.mock_bin), *clean])
+        return env
 
     # -- driving the new script ------------------------------------------
 
@@ -606,7 +613,7 @@ class SourceContractTests(unittest.TestCase):
         cls.source = SCRIPT.read_text(encoding="utf-8")
         # The comment that explains the retire path belongs to it.
         match = re.search(
-            r"^# Undo what hermes-mobile-setup\.sh added.*?^retire_gateway_exposure\(\) \{\n.*?^\}\n",
+            r"^# Read-only: the same three traces.*?^retire_gateway_exposure\(\) \{\n.*?^\}\n",
             cls.source, re.M | re.S,
         )
         cls.outside_retire = cls.source.replace(match.group(0), "") if match else cls.source
@@ -619,9 +626,14 @@ class SourceContractTests(unittest.TestCase):
         for fragment in ("hermes://pair", "qrencode", "qrcode", "PAIRING_SCHEMA=2\\n"):
             self.assertNotIn(fragment, self.outside_retire)
 
-    def test_it_never_installs_hermes(self) -> None:
-        for fragment in ("| bash -s", "install.sh | bash", "run_hermes_installer", "--skip-setup", "git clone"):
-            self.assertNotIn(fragment, self.source.replace(OFFICIAL_INSTALL, ""))
+    def test_hermes_is_installed_only_with_the_official_installer_and_its_exact_flags(self) -> None:
+        # S2b: when Hermes is missing the one official command runs, nothing else.
+        for fragment in ("run_hermes_installer", "--skip-setup", "git clone", "pip install", "npm "):
+            self.assertNotIn(fragment, self.source)
+        self.assertEqual(self.source.count("https://hermes-agent.nousresearch.com/install.sh"), 1)
+        self.assertIn("--non-interactive --skip-browser --skip-computer-use", self.source)
+        self.assertNotIn("installs nothing", self.source)
+        self.assertNotIn("downloads nothing", self.source)
 
     def test_the_windows_script_it_points_at_exists(self) -> None:
         # The shell script names the PowerShell one; it must be there to be named.
@@ -700,7 +712,7 @@ class SetupTests(DashRig):
         self.assert_gateway_untouched()
         self.assertFalse((self.services / "pairing.env").exists())
         self.assertNotIn("hermes://pair", completed.stdout)
-        self.assertFalse((self.temp / "mock.curl").exists(), "the script downloaded something")
+        self.assertFalse((self.temp / "mock.curl").exists(), "the script downloaded something")  # Hermes was there
         self.assertEqual(list(self.runtime.glob("hermes-console-setup-*")), [])
         self.assertEqual(list(self.services.glob("setup-transaction.*")), [])
         runner = (self.services / "hermes-dashboard.sh").read_text()
@@ -825,14 +837,14 @@ class SetupTests(DashRig):
         self.assertFalse((self.services / "dashboard.pid").exists())
         self.assertEqual(self.basic().get("password_hash", ""), "")
 
-    def test_without_hermes_it_says_which_official_command_installs_it_and_creates_nothing(self) -> None:
+    def test_without_hermes_and_without_a_working_installer_it_says_so_and_creates_nothing(self) -> None:
         shutil.rmtree(self.hermes)
-        completed = self.dash()
+        completed = self.dash()  # the mocked curl fails: no network here
         self.assertEqual(completed.returncode, 1)
-        self.assertIn("not installed", completed.stdout + completed.stderr)
-        self.assertIn(OFFICIAL_INSTALL, completed.stdout + completed.stderr)
+        self.assertIn("did not finish", completed.stdout + completed.stderr)
+        self.assertIn("changed nothing", completed.stdout + completed.stderr)
         self.assertFalse(self.hermes.exists())
-        self.assertFalse((self.temp / "mock.curl").exists())
+        self.assertEqual(len(self.log("curl").splitlines()), 1)
 
     def test_a_setup_that_fails_gives_back_the_sign_in_that_was_there(self) -> None:
         (self.hermes / "config.json").write_text(json.dumps({"model": "kept"}), encoding="utf-8")
@@ -1582,6 +1594,189 @@ class RunnerAddressTests(AddressRig):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("no LAN or Tailscale address", completed.stderr)
         self.assertEqual(tree(self.hermes), before)
+
+
+OFFICIAL_URL = "https://hermes-agent.nousresearch.com/install.sh"
+OFFICIAL_FLAGS = "--non-interactive --skip-browser --skip-computer-use"
+# The official installer, reduced to what the script can observe: curl fetches
+# a bash script that records its flags and puts the stand-in launcher back.
+FAKE_CURL_INSTALLER = r"""#!/bin/sh
+printf '%s\n' "$*" >> "$MOCK_LOG.curl"
+all="$*"; out=""; url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in -o) out="$2"; shift ;; http*) url="$1" ;; esac
+  shift
+done
+[ "$url" = "https://hermes-agent.nousresearch.com/install.sh" ] || exit 97
+[ -z "${FAKE_CURL_FAILS:-}" ] || exit 22
+# An HTTP error page: curl -f refuses it; without -f the page would be written out.
+[ -z "${FAKE_CURL_404:-}" ] || case "$all" in *-fsSL*) exit 22 ;; esac
+body='#!/bin/bash
+printf "%s\n" "$*" >> "$MOCK_LOG.installer"
+if [ -n "${FAKE_INSTALLER_EXIT:-}" ]; then
+  [ -z "${FAKE_INSTALLER_RESTORE:-}" ] || mv "$FAKE_HIDDEN_LAUNCHER" "${FAKE_HIDDEN_LAUNCHER%.hidden}"
+  exit "$FAKE_INSTALLER_EXIT"
+fi
+[ -z "${FAKE_INSTALLER_NOOP:-}" ] || exit 0
+mv "$FAKE_HIDDEN_LAUNCHER" "${FAKE_HIDDEN_LAUNCHER%.hidden}"
+'
+if [ -n "$out" ]; then printf '%s' "$body" > "$out"; else printf '%s' "$body"; fi
+"""
+
+
+@unittest.skipUnless(LINUX, "drives the Linux managers")
+class InstallIfMissingTests(DashRig):
+    """S2b (design C.2): the official installer runs only when Hermes is missing."""
+
+    def hide_hermes(self) -> None:
+        launcher = self.hermes / "hermes-agent" / "venv" / "bin" / "hermes"
+        self.hidden = str(launcher) + ".hidden"
+        if launcher.exists():
+            launcher.rename(self.hidden)
+        curl = self.mock_bin / "curl"
+        curl.write_text(FAKE_CURL_INSTALLER, encoding="utf-8")
+        curl.chmod(0o700)
+
+    def install_run(self, **extra):
+        return self.dash(FAKE_HIDDEN_LAUNCHER=self.hidden, **extra)
+
+    def test_with_hermes_present_the_official_installer_is_never_fetched(self) -> None:
+        curl = self.mock_bin / "curl"
+        curl.write_text(FAKE_CURL_INSTALLER, encoding="utf-8")
+        completed = self.dash(FAKE_HIDDEN_LAUNCHER="/nonexistent.hidden")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertEqual(self.log("curl"), "", "curl was called although Hermes was there")
+        self.assertEqual(self.log("installer"), "")
+
+    def test_without_hermes_the_official_installer_runs_once_with_the_exact_flags_and_setup_goes_on(self) -> None:
+        self.hide_hermes()
+        completed = self.install_run()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        calls = self.log("curl").splitlines()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn(OFFICIAL_URL, calls[0])
+        self.assertEqual(self.log("installer").splitlines(), [OFFICIAL_FLAGS])
+        self.assertIn("Hermes Agent is not installed", completed.stdout)
+        self.assertEqual(self.sign_in(self.password_from(completed))[0], 200)
+
+    def test_an_installer_that_fails_or_installs_nothing_ends_with_nothing_changed(self) -> None:
+        for name, extra in (("exit 1", {"FAKE_INSTALLER_EXIT": "1"}),
+                            ("exit 1 after putting Hermes in place", {"FAKE_INSTALLER_EXIT": "1", "FAKE_INSTALLER_RESTORE": "1"}),
+                            ("no-op", {"FAKE_INSTALLER_NOOP": "1"}),
+                            ("download", {"FAKE_CURL_FAILS": "1"}),
+                            ("404 page", {"FAKE_CURL_404": "1"})):
+            with self.subTest(name):
+                self.hide_hermes()
+                completed = self.install_run(**extra)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("did not finish", completed.stdout + completed.stderr)
+                self.assertIn("changed nothing", completed.stdout + completed.stderr)
+                self.assertEqual(self.basic().get("password_hash", ""), "")
+                self.assertFalse(self.services.exists() and any(self.services.glob("dashboard*")))
+                self.assertTrue(self.refused())
+                self.assertEqual(list(self.runtime.glob("hermes-*")), [])
+                for leftover in (self.temp / "mock.curl", self.temp / "mock.installer"):
+                    leftover.unlink(missing_ok=True)
+
+    def test_a_hermes_outside_the_standard_place_stops_the_setup_without_installing(self) -> None:
+        self.hide_hermes()
+        elsewhere = self.temp / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "hermes").write_text("#!/bin/sh\necho Hermes Agent v9\n", encoding="utf-8")
+        (elsewhere / "hermes").chmod(0o700)
+        path = str(elsewhere) + os.pathsep + self.environment()["PATH"]
+        completed = self.install_run(PATH=path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(str(elsewhere / "hermes"), completed.stdout + completed.stderr)
+        self.assertIn("Nothing was changed", completed.stdout + completed.stderr)
+        self.assertEqual(self.log("curl"), "")
+        self.assertEqual(self.basic().get("password_hash", ""), "")
+
+    def test_a_launcher_that_does_not_answer_is_never_fixed_by_running_the_installer(self) -> None:
+        # The official installer repairs and updates: with something already
+        # there it is not ours to run.
+        self.hide_hermes()
+        pathlib.Path(self.hidden).rename(self.hidden[: -len(".hidden")])
+        launcher = self.hermes / "hermes-agent" / "venv" / "bin" / "hermes"
+        launcher.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        completed = self.install_run(HERMES_SETUP_PROBE_PAUSE="0")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Nothing was changed", completed.stdout + completed.stderr)
+        self.assertEqual(self.log("curl"), "")
+        self.assertEqual(self.log("installer"), "")
+
+    def test_the_remove_and_retire_actions_never_install_anything(self) -> None:
+        self.hide_hermes()
+        for action in ("--remove", "--retire-gateway-exposure", "--retire-bridge"):
+            completed = self.dash(action, FAKE_HIDDEN_LAUNCHER=self.hidden)
+            self.assertEqual(completed.returncode, 0, (action, completed.stdout[-800:], completed.stderr[-800:]))
+        self.assertEqual(self.log("curl"), "")
+
+
+@unittest.skipUnless(LINUX, "drives the Linux managers")
+class OldInstallNoticeTests(DashRig):
+    """S2b (design C.4): an old Console 1.2 setup is reported, never retired alone."""
+
+    def exposed(self, *, runner=True, pairing=False, bridge=False) -> dict:
+        self.services.mkdir(parents=True, exist_ok=True)
+        files = {}
+        if runner:
+            files[self.services / "hermes-gateway.sh"] = (
+                f"#!/bin/sh\nexport API_SERVER_HOST={self.host}\nexport API_SERVER_PORT=8642\nexec hermes gateway run\n")
+        if pairing:
+            files[self.services / "pairing.env"] = "PAIRING=1\n"
+        if bridge:
+            files[self.hermes / "hermes_bridge.py"] = "# old bridge\n"
+        for path, body in files.items():
+            path.write_text(body, encoding="utf-8")
+        return files
+
+    def notice(self, completed) -> str:
+        return completed.stdout
+
+    def test_an_exposed_gateway_is_reported_with_the_command_and_left_alone(self) -> None:
+        kept = self.exposed()
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        out = self.notice(completed)
+        self.assertIn("--retire-gateway-exposure", out)
+        self.assertNotIn("--retire-bridge", out)
+        self.assertIn("Console 1.2", out)
+        for path, body in kept.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), body)
+
+    def test_a_pairing_record_alone_counts_as_exposure(self) -> None:
+        self.exposed(runner=False, pairing=True)
+        self.assertIn("--retire-gateway-exposure", self.notice(self.dash()))
+
+    def test_the_old_bridge_is_reported_with_its_command_and_left_alone(self) -> None:
+        kept = self.exposed(runner=False, bridge=True)
+        out = self.notice(self.dash())
+        self.assertIn("--retire-bridge", out)
+        self.assertNotIn("--retire-gateway-exposure", out)
+        for path, body in kept.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), body)
+
+    def test_both_are_reported_together_and_the_new_access_run_reports_too(self) -> None:
+        self.exposed(bridge=True)
+        out = self.notice(self.dash("--new-access"))
+        self.assertIn("--retire-gateway-exposure", out)
+        self.assertIn("--retire-bridge", out)
+
+    def test_a_clean_computer_gets_no_notice(self) -> None:
+        out = self.notice(self.dash())
+        self.assertNotIn("--retire", out)
+        self.assertNotIn("Console 1.2", out)
+
+    def test_the_notice_asks_and_does_nothing_by_itself(self) -> None:
+        self.exposed(pairing=True, bridge=True)
+        before = tree(self.hermes)
+        completed = self.dash()
+        after = tree(self.hermes)
+        # Only the Dashboard's own files may differ.
+        gone = [item for item in before if item not in after]
+        self.assertEqual([item for item in gone if "dashboard" not in item[0] and "config" not in item[0]], [])
+        self.assertIn("nothing was changed", self.notice(completed).lower())
 
 
 @unittest.skipUnless(LINUX, "drives the Linux managers")

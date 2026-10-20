@@ -4,12 +4,13 @@ One-command installer that connects a self-hosted [Hermes Agent](https://hermes-
 
 ## Dashboard only (Console 1.3)
 
-Console 1.3 talks to the **Dashboard** and nothing else. For it, install Hermes with the **official installer** and then run the small complement below. It installs and downloads nothing, creates no API key, does not touch the Gateway and shows no pairing code:
+Console 1.3 talks to the **Dashboard** and nothing else. One command does it all: if Hermes is **missing** it runs the **official installer** (`--non-interactive --skip-browser --skip-computer-use`) and nothing else, and if Hermes is already there it **never** runs it. Then it keeps the Dashboard on. It creates no API key, does not touch the Gateway and shows no pairing code:
 
 ```sh
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive --skip-browser
 curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/hermes-dashboard-setup.sh | sh
 ```
+
+How it decides: Hermes counts as installed when its launcher is in the places the installers use (`~/.hermes/hermes-agent/...`, `~/.hermes/bin`, `~/.local/bin`) and answers. A launcher that is there but does not answer, or a `hermes` found elsewhere on `PATH`, stops the setup with nothing changed (the official installer would update or repair it, or make a second copy). If the official installation does not finish, the setup says so and changes nothing.
 
 The commands point at a reviewed release label (`setup-v1.6.0`), not at `main`: what you run is what was reviewed. The setup ends by printing three details: the **address**, the **user** and the **password**. In Console, choose **Type an address** and paste them.
 
@@ -27,22 +28,24 @@ The second command keeps the Dashboard on at all times (a user service that star
 - `--retire-gateway-exposure` undoes only what the earlier Console setup exposed on the Gateway: the network address and port (`API_SERVER_HOST` and `API_SERVER_PORT`, in the Gateway runner and in its systemd drop-in) and the pairing record. **Your `API_SERVER_KEY` is kept**: the earlier setup reuses a key that was already in `.env`, so it can belong to Open WebUI, a cron provider or another client of yours, and without a usable key Hermes does not start its API server at all. It does not stop the Gateway: it keeps listening as it was until the Gateway is restarted, and then Hermes' API server binds its default, this computer only (unless you set a host yourself).
 - `--retire-gateway-exposure --also-remove-api-key` also takes the `API_SERVER_KEY` line out of `.env`. Use it only when nothing else uses that key: after the Gateway's next restart Hermes does not start its API server, so a cron provider other than the built-in one, Open WebUI or any other client that depends on it stops working. The setup says so, and keeps a private copy of the removed line under `backups/gateway-exposure`. The option is refused with any other action.
 - `--retire-bridge` is the same cleanup of the old Mobile Bridge described under [Legacy](#legacy-bridge-era-installs).
-- Without `--non-interactive` the official installer asks for a model/provider and the Gateway. With it, the model/provider stays unset: choose it from the Dashboard (Console). On Windows, use the PowerShell version in the next subsection.
+- If the earlier Console setup (Console 1.2) left its Gateway exposure (network address and port, or pairing record) or the old Mobile Bridge, the setup **tells you at the end and names the two options, but changes nothing**: a phone still on Console 1.2 would stop working. Run them yourself when every phone uses Console 1.3.
+- The official installer runs with `--non-interactive`, so the model/provider stays unset: choose it from the Dashboard (Console). On Windows, use the PowerShell version in the next subsection.
 
-The all-in-one installer in the next section keeps working for Console 1.2.15 to 1.2.x.
+The all-in-one installer in the next section keeps working for Console 1.2.15 to 1.2.x: its address (`main/hermes-mobile-setup.*`) is frozen for those apps and goes away with Console 1.4. Console 1.3 uses the command above.
 
 
 ### Dashboard only on Windows (PowerShell)
 
 The same complement for native Windows (**Windows PowerShell 5.1 or newer**, not
-WSL; tried on Windows 11, see the end of this subsection). Install Hermes with its official installer, then run the complement; it
-installs and downloads nothing, creates no API key, does not touch the Gateway
-and shows no pairing code:
+WSL; tried on Windows 11, see the end of this subsection). One command: if Hermes is missing it runs the official installer
+(`-NonInteractive -SkipBrowser -SkipComputerUse`, in a PowerShell of its own) and nothing else; if Hermes is there it never runs it.
+It creates no API key, does not touch the Gateway and shows no pairing code:
 
 ```powershell
-& ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -NonInteractive -SkipBrowser
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/hermes-dashboard-setup.ps1)))
 ```
+
+Same rule as the shell version: a launcher that is there but does not answer, or a `hermes` found elsewhere on `PATH`, stops it with nothing changed. The Windows installer path is **not tried** on a clean machine yet. At the end it also tells you, without changing anything, if the earlier Console 1.2 setup left its Gateway exposure or the old Mobile Bridge (`-RetireGatewayExposure`, `-RetireBridge`).
 
 Or save it, read it, and run it from the file (needed for `-PasswordStdin`):
 
