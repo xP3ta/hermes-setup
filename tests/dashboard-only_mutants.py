@@ -311,7 +311,7 @@ MUTANTS = [
      ('echo "The first start can take a few minutes: Hermes builds its web pages once."', ':'),
      [TXT + "test_the_wait_is_announced_before_it_starts_and_the_end_speaks_console"]),
     ("M86", "the final text gives address, user and the Console steps",
-     ('      echo "In Console: Type an address -> paste these three details."', '      :'),
+     ('      echo "In Console: Connect manually -> paste these three details."', '      :'),
      [TXT + "test_the_wait_is_announced_before_it_starts_and_the_end_speaks_console"]),
     ("M87", "who already had access is told how to get a new one",
      ('echo "Forgot it? Run this again with --new-access: it makes a new password and signs out"', 'echo "Forgot it? Ask for a new one: it makes a new password and signs out"'),
@@ -455,6 +455,12 @@ MUTANTS = [
     ("M130", "bin/uv is no longer the first place",
      ('UV="$HH/bin/uv"\n    if [', 'UV=""\n    if ['),
      [RLQ + "test_the_old_place_still_comes_first"]),
+    ("M131", "no private address: the way to get one with Tailscale is not said",
+     ('  echo "Console connects through Tailscale. Install it here: curl -fsSL https://tailscale.com/install.sh | sh   then: sudo tailscale up" >&2\n', ''),
+     [ADR + "test_no_address_says_in_plain_words_how_to_get_one_with_tailscale"]),
+    ("M132", "no private address: the second step 'run this command again' is dropped",
+     ('Then run this same command again. ', 'Then carry on. '),
+     [ADR + "test_no_address_says_in_plain_words_how_to_get_one_with_tailscale"]),
 ]
 
 

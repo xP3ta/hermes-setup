@@ -473,8 +473,11 @@ function Select-BindAddress([string]$Chosen) {
         }
         return @{ Address = $lan[0].Address; Kind = "lan"; InterfaceIndex = $lan[0].InterfaceIndex; Described = "lan" }
     }
-    throw ("No LAN or Tailscale address was found, so there is nothing safe to listen on. " +
-        "Connect Tailscale or join the LAN, or choose one with -BindAddress. Nothing was changed.")
+    throw ("No LAN or Tailscale address was found: this machine has no private address (usual for a server on the internet).`n" +
+        "Console connects through Tailscale. Install it from https://tailscale.com/download/windows and sign in,`n" +
+        "and use the SAME Tailscale account on your phone.`n" +
+        "Then run this same command again. (Or choose a private address with -BindAddress.)`n" +
+        "Nothing was changed, and nothing was opened to the internet.")
 }
 
 # ---------------------------------------------------------------------------
@@ -1434,11 +1437,11 @@ function Invoke-DashboardSetup {
                 if ($newPassword) {
                     Write-Say "  password: $newPassword"
                     Write-Say ""
-                    Write-Say "In Console: Type an address -> paste these three details."
+                    Write-Say "In Console: Connect manually -> paste these three details."
                     Write-Say "This password is shown now, once, and is not saved anywhere in clear."
                 } else {
                     Write-Say "Your password is the one you gave on standard input (not shown, not saved in clear)."
-                    Write-Say "In Console: Type an address -> paste the address and the user, then type your password."
+                    Write-Say "In Console: Connect manually -> paste the address and the user, then type your password."
                 }
                 Write-Say "Forgot it later? Run this again with -NewAccess to make a new one."
             }
@@ -1446,7 +1449,7 @@ function Invoke-DashboardSetup {
                 Write-Say ""
                 Write-Say "This computer already had a sign-in, which is kept as it is. Its password is only"
                 Write-Say "stored scrambled, so this setup cannot show it: use the one you already have."
-                Write-Say "In Console: Type an address -> paste the address and the user, then type that password."
+                Write-Say "In Console: Connect manually -> paste the address and the user, then type that password."
                 Write-Say "Forgot it? Run this again with -NewAccess: it makes a new password and signs out"
                 Write-Say "everything that used the old one (the browser too)."
             }
@@ -1455,7 +1458,7 @@ function Invoke-DashboardSetup {
                 Write-Say "The password is the one written in your .env. No new sign-in was made and that file"
                 Write-Say "was not changed. A sign-in kept only in an external secret source (a secret manager)"
                 Write-Say "is not seen by this setup."
-                Write-Say "In Console: Type an address -> paste the address and the user, then type that password."
+                Write-Say "In Console: Connect manually -> paste the address and the user, then type that password."
             }
             "other" {
                 Write-Say ""
