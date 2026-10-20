@@ -2,6 +2,91 @@
 
 One-command installer that connects a self-hosted [Hermes Agent](https://hermes-agent.nousresearch.com) server to **Console** (the Android app). Needs Console 1.2.15 or newer on the phone. Help and guide: <https://hermes.xpetalab.dev>.
 
+## Dashboard only (Console 1.3)
+
+Console 1.3 is not released yet. With Console 1.2.15 use [Install](#install) below.
+
+Console 1.3 talks to the **Dashboard** and nothing else. One command does it all: if Hermes is **missing** it runs the **official installer** (`--non-interactive --skip-browser --skip-computer-use`) and nothing else, and if Hermes is already there it **never** runs it. That installer needs `git`: on Linux or macOS, if Hermes is missing and `git` is not installed, the setup runs nothing, changes nothing and prints the command to install it (for example `sudo apt-get install -y git`; on macOS `xcode-select --install`), then you run it again. It never installs `git` itself. Then it keeps the Dashboard on. It creates no API key, does not touch the Gateway and ends with a QR code that carries only the Dashboard sign-in:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.sh | sh
+```
+
+How it decides: Hermes counts as installed when its launcher is in the places the installers use (`~/.hermes/hermes-agent/...`, `~/.hermes/bin`, `~/.local/bin`) and answers. A launcher that is there but does not answer, or a `hermes` found elsewhere on `PATH`, stops the setup with nothing changed (the official installer would update or repair it, or make a second copy). If the official installation does not finish, the setup says so and changes nothing.
+
+The setup ends by printing three details: the **address**, the **user** and the **password**, and a **QR code**: scan it from Console and it is connected, nothing typed. Without a camera, choose **Connect manually** and paste the three details.
+
+The QR code (Console 1.3, also on Windows) is `hermes://pair?v=2&url=<Dashboard address>&user=<user>&pass=<password>` and nothing else: no Gateway token, host or port, and nothing is read from `.env`. When a sign-in already existed there is no password to show, so the code carries only `v=2`, the address and the user, and Console asks for the password once. It is drawn with what is already there, in this order, and nothing is installed for good: `qrencode`, the Python of Hermes if it has `qrcode`, or a throwaway `uv` environment (`qrcode==8.2`, discarded afterwards). The password goes to the drawer on standard input, never on a command line or in a file (on Windows the picture is not written to a file either); the code is shown once, in this terminal only, not saved, not logged and not printed as a link. If none of the three can draw it, the setup still succeeds and says to type the details. Whoever photographs the code has the password: run `--new-access` to change it. Console 1.2.x does not read this code (it shows "not a valid code").
+
+The setup keeps the Dashboard on at all times (a user service that starts with the machine and restarts itself: `systemd --user` on Linux, `launchd` on macOS), listening on **one** LAN or Tailscale address, behind a sign-in. It asks nothing: it picks the address (Tailscale first, then the private LAN) and shows the generated password **once**, at the end: four groups of five letters and digits without look-alikes (no `0`, `o`, `1`, `l`; about 100 bits), easy to read out and type on a phone. The address is worked out again every time the Dashboard starts, so a new DHCP address or a late Tailscale does not leave it dead (a line in `logs/dashboard.log` says when it changed; an address you chose with `HERMES_DASHBOARD_HOST` stays as chosen). Reserve the computer's address in your router anyway. The password is stored only as Hermes' own scrypt hash in `config.yaml`; it is never an argument of any command and never written in clear.
+
+- A sign-in that already exists (in `config.yaml`, in `.env` or another provider) is **kept as it is**; its password is stored scrambled, so the setup cannot show it: it prints the address and the user, and says so in plain words.
+- Forgot it? `curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.sh | sh -s -- --new-access` makes a new one and ends the sessions of the old one (the browser and Desktop too).
+- `--remove` stops the Dashboard and removes its service (the systemd unit, the launchd job or the portable runner). It does not touch `config.yaml` (the sign-in stays: `dashboard.basic_auth`), Hermes or the Gateway, and it is safe to repeat.
+- Piped from `curl`, the script is one function called on its last line, with an end marker: a download that stops half way runs nothing.
+- Choose the address or port: `HERMES_DASHBOARD_HOST=<private address>`, `HERMES_DASHBOARD_PORT=<port>`. Only a private LAN, Tailscale or unique-local address is accepted, never `0.0.0.0`.
+- A sign-in that exists only in an external secret source (a secret manager Hermes is set up to use) is not read by this setup, which looks at `config.yaml` and `.env`; if you have one, the new password is added next to it, and the setup says so.
+- If the earlier Console setup left `console-services/dashboard-login.json` (the Dashboard password in clear), the setup warns about it whenever it keeps that file, and deletes it when it makes a new sign-in.
+- The service restarts itself if the network is not up yet when the machine starts (no start-rate limit, so a slow Tailscale cannot leave it failed).
+- Your own password: save the script, then `sh hermes-dashboard-setup.sh --password-stdin < file` (the first line is the password).
+- `--retire-gateway-exposure` undoes only what the earlier Console setup exposed on the Gateway: the network address and port (`API_SERVER_HOST` and `API_SERVER_PORT`, in the Gateway runner and in its systemd drop-in) and the pairing record. **Your `API_SERVER_KEY` is kept**: the earlier setup reuses a key that was already in `.env`, so it can belong to Open WebUI, a cron provider or another client of yours, and without a usable key Hermes does not start its API server at all. It does not stop the Gateway: it keeps listening as it was until the Gateway is restarted, and then Hermes' API server binds its default, this computer only (unless you set a host yourself).
+- `--retire-gateway-exposure --also-remove-api-key` also takes the `API_SERVER_KEY` line out of `.env`. Use it only when nothing else uses that key: after the Gateway's next restart Hermes does not start its API server, so a cron provider other than the built-in one, Open WebUI or any other client that depends on it stops working. The setup says so, and keeps a private copy of the removed line under `backups/gateway-exposure`. The option is refused with any other action.
+- `--retire-bridge` is the same cleanup of the old Mobile Bridge described under [Legacy](#legacy-bridge-era-installs).
+- If the earlier Console setup (Console 1.2) left its Gateway exposure (network address and port, or pairing record) or the old Mobile Bridge, the setup **tells you at the end and names the two options, but changes nothing**: a phone still on Console 1.2 would stop working. Run them yourself when every phone uses Console 1.3.
+- The official installer runs with `--non-interactive`, so the model/provider stays unset: choose it from the Dashboard (Console). On Windows, use the PowerShell version in the next subsection.
+
+Tried on a clean Debian 13 (shell version): Hermes installed with the official installer, a repeat run with no call to the installer, a restart, `--new-access`, `--remove`, and the QR code drawn and decoded (`v=2`, `url`, `user`, `pass`; no token, host or port). **Not tried**: macOS and a real VPS.
+
+The all-in-one installer in the next section keeps working for Console 1.2.15 to 1.2.x: its address (`main/hermes-mobile-setup.*`) is frozen for those apps and goes away with Console 1.4. Console 1.3 uses the command above.
+
+
+### Hermes on an internet server (VPS)
+
+A server on the internet has no private address, so the setup stops with nothing changed and says so: it never opens a public address and never listens on `0.0.0.0`. Console connects through **Tailscale**:
+
+1. Install Tailscale on the server. Linux: `curl -fsSL https://tailscale.com/install.sh | sh`, then `sudo tailscale up`. macOS or Windows: <https://tailscale.com/download>, then connect.
+2. Install Tailscale on the phone and sign in with the **same** account.
+3. Run the same setup command again.
+
+The setup does not install or start Tailscale for you.
+
+### Dashboard only on Windows (PowerShell)
+
+The same complement for native Windows (**Windows PowerShell 5.1 or newer**, not
+WSL; tried on a clean Windows 11, see the end of this subsection). One command: if Hermes is missing it runs the official installer
+(`-NonInteractive -SkipBrowser -SkipComputerUse`, in a PowerShell of its own) and nothing else; if Hermes is there it never runs it.
+It creates no API key, does not touch the Gateway and ends with the same QR code (below):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.ps1)))
+```
+
+Same rule as the shell version: a launcher that is there but does not answer, or a `hermes` found elsewhere on `PATH`, stops it with nothing changed. At the end it also tells you, without changing anything, if the earlier Console 1.2 setup left its Gateway exposure or the old Mobile Bridge (`-RetireGatewayExposure`, `-RetireBridge`).
+
+Or save it, read it, and run it from the file (needed for `-PasswordStdin`):
+
+```powershell
+irm https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.ps1 -OutFile "$env:TEMP\hermes-dashboard-setup.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\hermes-dashboard-setup.ps1"
+```
+
+Run it from an **elevated** PowerShell (Run as administrator) so it can do the
+two things only an administrator can: start with the computer, and open the
+firewall for the Dashboard. Without elevation it still sets everything else up,
+says what it could not do, and prints the command for the firewall rule.
+
+- **Starts with the computer**: a Scheduled Task (`HermesConsole-Dashboard`) at startup, as you, with no stored password and nobody signed in. Not elevated, it starts when you sign in instead, and says so. A hidden runner starts the Dashboard again five seconds after it stops with an error.
+- **One address**: Tailscale first, then the private LAN address of the interface with the default route. `-BindAddress <address>` / `-Port <port>` (or `HERMES_DASHBOARD_HOST` / `HERMES_DASHBOARD_PORT`) choose them; only private IPv4 (10/8, 172.16/12, 192.168/16) or Tailscale (100.64/10) addresses of this computer are accepted, never `0.0.0.0`. A LAN address must be on a network Windows calls **Private**.
+- **One firewall rule of its own** (`HermesConsole-Dashboard-Only`): inbound TCP, that address and that port only, Private profile and the local subnet (Tailscale: its own range). Rules it did not make are never changed; a broader one that already lets the port in is reported.
+- **Sign-in** as in the shell version: a password is generated and shown **once**; only Hermes' scrypt hash is stored (`config.yaml`); a sign-in that already exists is kept. `-NewAccess` makes a new one and ends the old sessions. `-PasswordStdin` takes your own from the first line of standard input (`'my password' | powershell -NoProfile -ExecutionPolicy Bypass -File .\hermes-dashboard-setup.ps1 -PasswordStdin`). A password on the command line is refused.
+- **Checks like the app**: the status page answers, the protected pages refuse anyone who is not signed in, and the new password really signs in. If anything fails, the sign-in settings, the task, its runner and the firewall rule go back to what they were.
+- `-RetireGatewayExposure` undoes only what the earlier Windows setup added to the Gateway: `API_SERVER_HOST` and `API_SERVER_PORT` in `console-services\hermes-gateway.vbs`, the pairing record, and the Gateway's port in the firewall rules it made. **Your `API_SERVER_KEY` is kept**; `-RetireGatewayExposure -AlsoRemoveApiKey` also removes it (a private copy stays under `backups\gateway-exposure`) and says what that costs. The Gateway is not stopped and its task is not touched.
+- `-RetireBridge` removes the old Mobile Bridge, as under [Legacy](#legacy-bridge-era-installs). `-Help` lists the options.
+- `-Remove` takes it off the computer: it stops the Dashboard and removes its Scheduled Task, its runner and its own firewall rule (from a window that is not elevated it says the one command left for the rule). The sign-in stays in `config.yaml` (`dashboard.basic_auth`); Hermes and the Gateway are not touched. Safe to repeat.
+- If this computer's address changes, run the setup again: the firewall rule is made for the address, so on Windows the Dashboard does not follow a new address by itself (the shell version does).
+
+Not the same as the shell version: IPv4 only (no IPv6). Tried on a clean Windows 11 with Windows PowerShell 5.1: Hermes installed with the official installer, a repeat run with no call to the installer, a restart of the computer, `-NewAccess`, `-Remove`, and the QR code drawn and decoded (`v=2`, `url`, `user`, `pass`; no token, host or port). Tried earlier on Windows 11 with Hermes already installed: `-PasswordStdin` with a password that has non-ASCII characters, and a setup that fails half-way. **Not tried**: PowerShell 7, Windows 10, Windows Server, ARM64, Tailscale on Windows, a non-elevated run, an installation on a path with spaces, a Hermes home on another drive, the Windows "Public" network profile, an installation with no network, a real VPS.
+
 ## Install
 
 Linux, macOS and other Unix hosts:
@@ -307,7 +392,9 @@ journalctl --user -u hermes-gateway.service
 
 | File | What it is |
 |---|---|
-| `hermes-mobile-setup.sh` | The installer (readable top to bottom) |
+| `hermes-dashboard-setup.sh` | Dashboard-only complement to the official Hermes installer, for Console 1.3 (readable top to bottom) |
+| `hermes-dashboard-setup.ps1` | The same Dashboard-only complement for native Windows (PowerShell 5.1+) |
+| `hermes-mobile-setup.sh` | The all-in-one installer (readable top to bottom) |
 | `hermes-mobile-setup.ps1` | Native Windows installer |
 | `hermes-pair.sh` | Prints the pairing QR/link on demand (no reinstall) |
 | `hermes-pair.ps1` | Native Windows pairing QR/link |
@@ -328,4 +415,9 @@ python3 tests/review-unix-security.py     # contract suite
 python3 tests/no-bridge_test.py           # sign-in decision, code, --retire-bridge
 python3 tests/no-bridge-install_test.py   # a whole setup against a stand-in Hermes
 python3 tests/legacy-bridge-coexistence_test.py  # bridge-era installs: setup, show again, cleanup
+python3 tests/dashboard-only_test.py      # the Dashboard-only complement, its two cleanups
+python3 tests/dashboard-only_mutants.py   # one mutant per guard; every one must be killed
+python3 tests/dashboard-only-windows_test.py     # the Windows script: static contract (it READS the script)
+python3 tests/dashboard-only-windows_mutants.py  # one mutant per guard of the Windows script
+./tests/dashboard-only-windows.Tests.ps1         # on Windows PowerShell 5.1: functions, probe, clean-ups
 ```
