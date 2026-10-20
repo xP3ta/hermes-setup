@@ -2113,9 +2113,15 @@ q.print_ascii(invert=True)'
   elif "$VP" -I -c 'import qrcode' >/dev/null 2>&1 </dev/null && qr_try "$VP" -I -c "$QRPY"; then
     QR_DRAWN=1
   else
+    # uv: the old installer put it in bin/, the current one keeps it in tools/uv-<version>-<platform>/
+    # (the newest by version; only a file called uv in such a folder), else whatever is on PATH.
     UV="$HH/bin/uv"
-    [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
-    if [ -n "$UV" ] && qr_try "$UV" run --isolated --no-project --no-cache --with qrcode==8.2 python -c "$QRPY"; then
+    if [ ! -f "$UV" ] || [ ! -x "$UV" ]; then
+      UV="$(for found in "$HH"/tools/uv-*/uv; do [ -f "$found" ] && [ -x "$found" ] && printf '%s\n' "$found"; done | sort -V | tail -n 1)"
+    fi
+    [ -n "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
+    # The interpreter is the one this script already uses for Hermes ($VP: what hermes --print-runtime-command reports).
+    if [ -n "$UV" ] && qr_try "$UV" run --isolated --no-project --no-cache --python "$VP" --with qrcode==8.2 python -c "$QRPY"; then
       QR_DRAWN=1
     fi
   fi

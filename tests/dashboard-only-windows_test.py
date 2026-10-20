@@ -552,6 +552,13 @@ GUARDS: list[tuple[str, str, list[str]]] = [
      [r'@\("-t", "ANSIUTF8", "-l", "M"\)',
       r'@\("-I", "-c", "import qrcode"\)\)\.Code -eq 0',
       r'@\("run", "--isolated", "--no-project", "--no-cache", "--python", \$PythonPath,\s+"--with", "qrcode==8\.2", "python", "-c", \$drawer\)']),
+    ("G87", "uv is looked for in bin, then in tools\\uv-*\\uv.exe (newest version), then on PATH",
+     [r'function Find-Uv\(\[string\]\$HermesHome\)',
+      r'Join-Path \$HermesHome \"bin\\uv\.exe\"',
+      r'Get-ChildItem -LiteralPath \(Join-Path \$HermesHome \"tools\"\) -Directory -Filter \"uv-\*\"',
+      r'Join-Path \$folder\.FullName \"uv\.exe\"',
+      r'\[version\]\$Matches\[1\]', r'\$version -gt \$bestVersion', r'if \(\$best\) \{ return \$best \}', r'Get-Command uv',
+      r'\$uv = Find-Uv \$HermesHome']),
     ("G83", "if nothing draws the setup goes on and says what to type",
      [r'Write-Say "I could not draw the code here; type these three details in Console\."',
       r'Write-Say "I could not draw the code here; type the address and the user in Console, then the password\."\s+\}\s+return\s+\}']),
@@ -599,6 +606,11 @@ def _make_guard_test(guard_id: str, description: str, patterns: list[str]):
                                     f"{guard_id}: {line.strip()}")
             self.assertEqual(body.count("-InputText"), 2, description)
             return
+        if guard_id == "G87":
+            find = re.search(r"^function Find-Uv\(.*?^\}\n", source, re.M | re.S).group(0)
+            self.assertLess(find.index('"bin\\uv.exe"'), find.index('-Filter "uv-*"'), description)
+            self.assertLess(find.index('-Filter "uv-*"'), find.index("Get-Command uv"), description)
+            self.assertNotRegex(code_only(find), r'-Filter "(?!uv-\*")|"\*\.exe"|FullName \"(?!uv\.exe")', description)
         if guard_id == "G86":
             calls = [m.start() for m in re.finditer(r"Show-PairingCode -Base", source)]
             self.assertEqual(len(calls), 1, description)

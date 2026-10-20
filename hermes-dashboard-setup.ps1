@@ -1122,6 +1122,26 @@ function Invoke-QrDrawer([string]$Program, [string[]]$DrawerArguments, [string]$
     return ""
 }
 
+# uv: the old installer put it in bin\, the current one keeps it in tools\uv-<version>-<platform>\
+# (the newest by version; only a file called uv.exe in such a folder), else whatever is on PATH.
+function Find-Uv([string]$HermesHome) {
+    $uv = Join-Path $HermesHome "bin\uv.exe"
+    if (Test-Path -LiteralPath $uv -PathType Leaf) { return $uv }
+    $best = ""
+    $bestVersion = $null
+    $folders = @(Get-ChildItem -LiteralPath (Join-Path $HermesHome "tools") -Directory -Filter "uv-*" -ErrorAction SilentlyContinue)
+    foreach ($folder in $folders) {
+        $candidate = Join-Path $folder.FullName "uv.exe"
+        if ($folder.Name -notmatch '^uv-(\d+\.\d+(\.\d+){0,2})(-|$)' -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        $version = [version]$Matches[1]
+        if ($null -eq $bestVersion -or $version -gt $bestVersion) { $best = $candidate; $bestVersion = $version }
+    }
+    if ($best) { return $best }
+    $found = Get-Command uv -ErrorAction SilentlyContinue
+    if ($found) { return $found.Source }
+    return ""
+}
+
 function Get-QrDrawing([string]$Link, [string]$PythonPath, [string]$HermesHome) {
     $drawer = 'import sys, qrcode' + "`n" + 'sys.stdout.reconfigure(encoding="utf-8")' + "`n" +
         'q = qrcode.QRCode(border=1)' + "`n" + 'q.add_data(sys.stdin.read())' + "`n" + 'q.make()' + "`n" +
@@ -1135,12 +1155,7 @@ function Get-QrDrawing([string]$Link, [string]$PythonPath, [string]$HermesHome) 
         $art = Invoke-QrDrawer $PythonPath @("-I", "-c", $drawer) $Link
         if ($art) { return $art }
     }
-    $uv = Join-Path $HermesHome "bin\uv.exe"
-    if (-not (Test-Path -LiteralPath $uv)) {
-        $found = Get-Command uv -ErrorAction SilentlyContinue
-        $uv = ""
-        if ($found) { $uv = $found.Source }
-    }
+    $uv = Find-Uv $HermesHome
     if ($uv) {
         return (Invoke-QrDrawer $uv @("run", "--isolated", "--no-project", "--no-cache", "--python", $PythonPath,
             "--with", "qrcode==8.2", "python", "-c", $drawer) $Link)

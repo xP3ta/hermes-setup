@@ -240,6 +240,21 @@ public static extern System.IntPtr LocalFree(System.IntPtr hMem);
     $outDone = Invoke-RetireBridge $home3 6>&1 | Out-String
     Check "bridge: its files are removed" (@(Get-ChildItem $home3 -Recurse -File).Count -eq 0) $outDone
     Check "bridge: and it says what it did" ($outDone -match "stopped and removed")
+
+    # S2e: uv where the current official installer leaves it (hermes\tools\uv-<version>-<platform>\uv.exe)
+    $uvHome = Join-Path $work "uv-home"
+    foreach ($name in "uv-0.9.0-win32-x64", "uv-0.12.3-win32-x64", "uv-0.10.11-win32-x64") {
+        New-Item -ItemType Directory -Path (Join-Path $uvHome "tools\$name") -Force | Out-Null
+        Set-Content (Join-Path $uvHome "tools\$name\uv.exe") "x"
+    }
+    New-Item -ItemType Directory -Path (Join-Path $uvHome "tools\zz-other") -Force | Out-Null
+    Set-Content (Join-Path $uvHome "tools\zz-other\uv.exe") "x"
+    New-Item -ItemType Directory -Path (Join-Path $uvHome "tools\uv-0.99.0-win32-x64") -Force | Out-Null
+    Set-Content (Join-Path $uvHome "tools\uv-0.99.0-win32-x64\uv-helper.exe") "x"
+    Check "uv: the newest version under tools wins, by version and not by spelling" ((Find-Uv $uvHome) -eq (Join-Path $uvHome "tools\uv-0.12.3-win32-x64\uv.exe")) (Find-Uv $uvHome)
+    New-Item -ItemType Directory -Path (Join-Path $uvHome "bin") -Force | Out-Null
+    Set-Content (Join-Path $uvHome "bin\uv.exe") "x"
+    Check "uv: the old place still comes first" ((Find-Uv $uvHome) -eq (Join-Path $uvHome "bin\uv.exe"))
 } finally {
     Remove-Item Env:\HERMES_GATEWAY_PORT -ErrorAction SilentlyContinue
     cmd.exe /c rmdir "$work\junction" 2>$null | Out-Null

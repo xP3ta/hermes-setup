@@ -149,6 +149,14 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("Q10", "the code is drawn twice", "        $codePassword = \"\"\n        if (Test-Path", "        Show-PairingCode -Base $base -UserName $login.USER -CodePassword $codePassword -Python $python -HermesHome $HermesHome\n        $codePassword = \"\"\n        if (Test-Path", "test_G86_"),
     ("Q11", "an earlier sign-in gets a password in the code", "            $codePassword = $secret\n", "", "test_G84_"),
     ("Q12", "the builder is no longer the shell one", 'safe=""))\'', 'safe="x"))\'', "test_the_builder_is_python_and_the_same_as_the_shell_one"),
+    # S2e: uv where the current official installer leaves it
+    ("Q14", "uv is looked for only in bin", 'if ($best) { return $best }', 'if ($false) { return $best }', "test_G87_"),
+    ("Q15", "the oldest uv under tools is taken", '$version -gt $bestVersion', '$version -lt $bestVersion', "test_G87_"),
+    ("Q16", "uv versions are compared as text", '$version = [version]$Matches[1]', '$version = $Matches[1]', "test_G87_"),
+    ("Q17", "any uv-* folder program is taken", 'Join-Path $folder.FullName "uv.exe"', 'Join-Path $folder.FullName "*.exe"', "test_G87_"),
+    ("Q18", "any folder of tools is searched", '-Directory -Filter "uv-*"', '-Directory -Filter "*"', "test_G87_"),
+    ("Q19", "PATH comes before tools", '    $best = ""\n', '    $early = Get-Command uv -ErrorAction SilentlyContinue\n    if ($early) { return $early.Source }\n    $best = ""\n', "test_G87_"),
+    ("Q20", "uv no longer found by Find-Uv", '$uv = Find-Uv $HermesHome', '$uv = ""', "test_G87_"),
     ("Q13", "the password is not url-encoded", "u.urlencode(pairs, quote_via=u.quote, safe=\"\")", "\"&\".join(k + \"=\" + v for k, v in pairs)", "test_the_link_has_the_version"),
 ]
 

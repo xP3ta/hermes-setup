@@ -630,7 +630,7 @@ class SourceContractTests(unittest.TestCase):
             self.assertNotIn(fragment, self.outside_retire)
         # The drawing is the three ways of the public scripts, with nothing installed for good.
         for fragment in ("qrencode -t ANSIUTF8", "import qrcode",
-                         "run --isolated --no-project --no-cache --with qrcode==8.2"):
+                         "run --isolated --no-project --no-cache --python", "--with qrcode==8.2"):
             self.assertIn(fragment, self.outside_retire)
 
     def test_hermes_is_installed_only_with_the_official_installer_and_its_exact_flags(self) -> None:
@@ -2193,10 +2193,11 @@ class QrCodeTests(DashRig):
         self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
         self.assertIn("UV-DREW", completed.stdout)
         argv = (self.capture / "uv.argv").read_text().splitlines()
-        self.assertEqual(argv[:8], ["run", "--isolated", "--no-project", "--no-cache", "--with", "qrcode==8.2",
-                                    "python", "-c"], argv)
+        # S2e: uv runs the interpreter the setup itself uses for Hermes (here the venv one).
+        python = str(self.hermes / "hermes-agent" / "venv" / "bin" / "python3")
+        self.assertEqual(argv[:10], ["run", "--isolated", "--no-project", "--no-cache", "--python", python, "--with",
+                                     "qrcode==8.2", "python", "-c"], argv)
         self.assertNotIn("--project", argv)
-        self.assertNotIn("--python", argv)
 
     # T5
     def test_the_password_goes_to_the_drawer_on_stdin_never_on_the_command_line(self) -> None:
@@ -2250,6 +2251,144 @@ class QrCodeTests(DashRig):
         self.assertIn("did not refuse", completed.stdout + completed.stderr)
         self.assertNotIn(CODE_HEADING, completed.stdout)
         self.assertFalse((self.capture / "qrencode.argv").exists())
+
+
+@unittest.skipUnless(LINUX and shutil.which("zbarimg") and shutil.which("qrencode"), "needs zbarimg and qrencode")
+class RealLayoutQrTests(QrCodeTests):
+    """S2e: the QR on the layout the current official installer really leaves.
+
+    Measured on a clean Debian after the official installer: uv is
+    <home>/tools/uv-<version>-<platform>/uv (no <home>/bin/uv, none on PATH),
+    Python is <home>/tools/python-<version>-<platform>/bin/python and there is no
+    hermes-agent/venv; the launcher is hermes-agent/.hermes/bin/hermes. The
+    stand-in Hermes is the usual one, moved into exactly that shape; uv only writes
+    its argv down (and then draws with the real qrencode).
+    """
+
+    REAL_QRENCODE = shutil.which("qrencode")
+
+    def setUp(self) -> None:
+        super().setUp()
+        agent = self.hermes / "hermes-agent"
+        store = self.hermes / "tools" / "python-3.14.7+20260101-linux-x64"
+        store.parent.mkdir(parents=True)
+        (agent / "venv").rename(store)
+        real = store / "bin" / "python3"
+        self.runtime_python = store / "bin" / "python"
+        self.assertTrue(self.runtime_python.exists())  # a real interpreter, as in the managed Python of Hermes
+        old = store / "bin" / "hermes"
+        impl = self.hermes / "hermes-impl.py"
+        impl.write_text(old.read_text(encoding="utf-8").replace("#!" + str(agent / "venv" / "bin" / "python3"), "#!" + str(real)),
+                        encoding="utf-8")
+        impl.chmod(0o700)
+        old.unlink()
+        command = json.dumps([str(self.runtime_python), "-I", "-c",
+                              "import sys, runpy; runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"])
+        self.place(agent / ".hermes" / "bin" / "hermes",
+                   f'if [ "$1" = "--print-runtime-command" ]; then printf "%s\\n" \'{command}\'; exit 0; fi\n'
+                   f'exec "{real}" "{impl}" "$@"')
+        (self.home / ".local" / "bin").mkdir(parents=True, exist_ok=True)
+        (self.home / ".local" / "bin" / "hermes").symlink_to(agent / ".hermes" / "bin" / "hermes")
+        self.assertFalse((agent / "venv").exists())
+        self.assertFalse((self.hermes / "bin" / "uv").exists())
+
+    def place(self, path: pathlib.Path, body: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.unlink(missing_ok=True)
+        path.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+        path.chmod(0o700)
+
+    def uv(self, where: str, name: str = "uv", draws: bool = True) -> pathlib.Path:
+        """A uv that writes its argv down (and draws with the real qrencode, from standard input)."""
+        path = self.hermes / where / name
+        log = self.capture / (where.replace("/", "_") + ".argv")
+        self.place(path, f'for a in "$@"; do printf "%s\\n" "$a" >> "{log}"; done; : >> "{log}"\n'
+                         + (f'exec "{self.REAL_QRENCODE}" -t ANSIUTF8 -l M' if draws else "cat >/dev/null"))
+        return path
+
+    def argv_of(self, where: str) -> list[str]:
+        path = self.capture / (where.replace("/", "_") + ".argv")
+        return path.read_text().splitlines() if path.exists() else []
+
+    def no_qrencode(self) -> None:
+        self.recorder("qrencode", status=1)
+
+    def test_the_third_way_is_a_throwaway_uv_environment_with_the_pinned_library(self) -> None:
+        self.no_qrencode()
+        self.uv("tools/uv-0.12.3-linux-x64")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        argv = self.argv_of("tools/uv-0.12.3-linux-x64")
+        self.assertEqual(argv[:9], ["run", "--isolated", "--no-project", "--no-cache", "--python", str(self.runtime_python),
+                                    "--with", "qrcode==8.2", "python"], argv)
+
+    def test_the_second_way_is_the_python_of_hermes_when_it_has_qrcode(self) -> None:
+        self.no_qrencode()
+        self.uv("tools/uv-0.12.3-linux-x64")
+        site = next((self.hermes / "tools" / "python-3.14.7+20260101-linux-x64" / "lib").glob("python*/site-packages"))
+        (site / "qrcode.py").write_text(
+            "import sys\nclass QRCode:\n    def __init__(self, border=1): pass\n"
+            "    def add_data(self, data): self.data = data\n    def make(self): pass\n"
+            "    def print_ascii(self, invert=False): print('PYTHON-DREW ' + str(len(self.data)))\n", encoding="utf-8")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertIn("PYTHON-DREW", completed.stdout)
+        self.assertEqual(self.argv_of("tools/uv-0.12.3-linux-x64"), [], "uv ran although Python could draw")
+
+    def test_on_the_real_layout_the_code_is_drawn_by_uv_found_under_tools(self) -> None:
+        self.no_qrencode()
+        self.uv("tools/uv-0.12.3-linux-x64")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        password = self.password_from(completed)
+        self.assertNotIn("I could not draw the code here", completed.stdout)
+        self.assertEqual(self.decoded(completed), link_for(self.dashboard, "admin", password))
+        # Python of Hermes had no qrcode, so uv was chosen, with that same interpreter.
+        self.assertEqual(self.argv_of("tools/uv-0.12.3-linux-x64")[4:6], ["--python", str(self.runtime_python)])
+        self.assertNotIn(password, "".join(self.argv_of("tools/uv-0.12.3-linux-x64")))
+
+    def test_the_newest_uv_wins_by_version_not_by_spelling(self) -> None:
+        self.no_qrencode()
+        for version in ("0.9.0", "0.12.3", "0.10.11"):
+            self.uv(f"tools/uv-{version}-linux-x64")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertNotIn("I could not draw the code here", completed.stdout)
+        self.assertTrue(self.argv_of("tools/uv-0.12.3-linux-x64"))
+        self.assertEqual(self.argv_of("tools/uv-0.9.0-linux-x64"), [])
+        self.assertEqual(self.argv_of("tools/uv-0.10.11-linux-x64"), [])
+
+    def test_the_old_place_still_comes_first(self) -> None:
+        self.no_qrencode()
+        self.uv("bin")
+        self.uv("tools/uv-0.12.3-linux-x64")
+        completed = self.dash()
+        self.assertNotIn("I could not draw the code here", completed.stdout)
+        self.assertTrue(self.argv_of("bin"))
+        self.assertEqual(self.argv_of("tools/uv-0.12.3-linux-x64"), [])
+
+    def test_nothing_but_uv_is_ever_run_from_tools(self) -> None:
+        self.no_qrencode()
+        self.uv("tools/uv-0.12.3-linux-x64")
+        self.uv("tools/zz-other-tool")                    # an executable called uv in a folder that is not uv-*
+        self.uv("tools/uv-0.99.0-linux-x64", "uv-helper")  # a uv-* folder whose program is not called uv
+        self.uv("tools/uv-0.98.0-linux-x64", "uv.sh")
+        completed = self.dash()
+        self.assertNotIn("I could not draw the code here", completed.stdout)
+        self.assertTrue(self.argv_of("tools/uv-0.12.3-linux-x64"))
+        for decoy in ("tools/zz-other-tool", "tools/uv-0.99.0-linux-x64", "tools/uv-0.98.0-linux-x64"):
+            self.assertEqual(self.argv_of(decoy), [], decoy)
+
+    def test_without_any_uv_the_setup_still_succeeds_and_says_what_to_type(self) -> None:
+        self.no_qrencode()
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertIn("type these three details in Console.", completed.stdout)
+
+
+# Only the S2e tests are meant to run on the real layout; the S2d ones keep their own rig.
+for _name in [n for n in vars(QrCodeTests) if n.startswith("test_") and n not in vars(RealLayoutQrTests)]:
+    setattr(RealLayoutQrTests, _name, None)
 
 
 @unittest.skipUnless(LINUX, "drives the Linux managers")
