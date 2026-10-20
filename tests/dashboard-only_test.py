@@ -1636,6 +1636,12 @@ class InstallIfMissingTests(DashRig):
         curl = self.mock_bin / "curl"
         curl.write_text(FAKE_CURL_INSTALLER, encoding="utf-8")
         curl.chmod(0o700)
+        self.add_fake("git", "exit 0")
+
+    def add_fake(self, name: str, body: str) -> None:
+        path = self.mock_bin / name
+        path.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+        path.chmod(0o700)
 
     def install_run(self, **extra):
         return self.dash(FAKE_HIDDEN_LAUNCHER=self.hidden, **extra)
@@ -1704,6 +1710,63 @@ class InstallIfMissingTests(DashRig):
         self.assertIn("Nothing was changed", completed.stdout + completed.stderr)
         self.assertEqual(self.log("curl"), "")
         self.assertEqual(self.log("installer"), "")
+
+    def no_git_run(self, manager: str, *, root: bool = False, present: bool = False, **extra):
+        # PATH without git and without any real package manager: only the fake one.
+        self.hide_hermes()
+        (self.mock_bin / "git").unlink()
+        if present:
+            pathlib.Path(self.hidden).rename(self.hidden[: -len(".hidden")])
+        bare = self.temp / "bare-bin"
+        shutil.rmtree(bare, ignore_errors=True)
+        bare.mkdir()
+        skip = {"hermes", "git", "apt-get", "dnf", "yum", "pacman", "zypper", "apk", "xcode-select", "id"}
+        for folder in os.environ["PATH"].split(os.pathsep):
+            for entry in (os.scandir(folder) if os.path.isdir(folder) else ()):
+                if entry.name not in skip and not (bare / entry.name).exists():
+                    (bare / entry.name).symlink_to(entry.path)
+        for old in ("apt-get", "dnf", "yum", "pacman", "zypper", "apk"):
+            (self.mock_bin / old).unlink(missing_ok=True)
+        self.add_fake("id", "echo 0" if root else "echo 1000")
+        self.add_fake(manager, "exit 0")
+        if extra.pop("macos", False):
+            real = shutil.which("uname")
+            self.add_fake("uname", f'[ "$1" = "-s" ] && echo Darwin || exec {real} "$@"')
+        path = os.pathsep.join([str(self.mock_bin), str(bare)])
+        return self.install_run(PATH=path, **extra)
+
+    def test_without_git_and_without_hermes_it_names_the_command_and_runs_no_installer(self) -> None:
+        for manager, command in (("apt-get", "sudo apt-get install -y git"), ("dnf", "sudo dnf install -y git"),
+                                 ("yum", "sudo yum install -y git"), ("pacman", "sudo pacman -S --noconfirm git"),
+                                 ("zypper", "sudo zypper install -y git"), ("apk", "sudo apk add git")):
+            with self.subTest(manager):
+                completed = self.no_git_run(manager)
+                text = completed.stdout + completed.stderr
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(command, text)
+                self.assertIn("then run this setup again", text)
+                self.assertEqual(self.log("curl"), "")
+                self.assertEqual(self.log("installer"), "")
+                self.assertEqual(self.basic().get("password_hash", ""), "")
+
+    def test_without_git_the_command_has_no_sudo_for_root(self) -> None:
+        completed = self.no_git_run("apt-get", root=True)
+        text = completed.stdout + completed.stderr
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("  apt-get install -y git", text)
+        self.assertNotIn("sudo", text)
+
+    def test_without_git_on_macos_it_names_xcode_select(self) -> None:
+        completed = self.no_git_run("apt-get", macos=True)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("  xcode-select --install", completed.stdout + completed.stderr)
+        self.assertEqual(self.log("curl"), "")
+
+    def test_with_hermes_present_git_is_not_checked_and_setup_goes_on(self) -> None:
+        completed = self.no_git_run("apt-get", present=True)
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertNotIn("git", completed.stdout + completed.stderr)
+        self.assertEqual(self.log("curl"), "")
 
     def test_the_remove_and_retire_actions_never_install_anything(self) -> None:
         self.hide_hermes()

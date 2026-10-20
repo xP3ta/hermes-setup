@@ -4,7 +4,7 @@ One-command installer that connects a self-hosted [Hermes Agent](https://hermes-
 
 ## Dashboard only (Console 1.3)
 
-Console 1.3 talks to the **Dashboard** and nothing else. One command does it all: if Hermes is **missing** it runs the **official installer** (`--non-interactive --skip-browser --skip-computer-use`) and nothing else, and if Hermes is already there it **never** runs it. Then it keeps the Dashboard on. It creates no API key, does not touch the Gateway and shows no pairing code:
+Console 1.3 talks to the **Dashboard** and nothing else. One command does it all: if Hermes is **missing** it runs the **official installer** (`--non-interactive --skip-browser --skip-computer-use`) and nothing else, and if Hermes is already there it **never** runs it. That installer needs `git`: on Linux or macOS, if Hermes is missing and `git` is not installed, the setup runs nothing, changes nothing and prints the command to install it (for example `sudo apt-get install -y git`; on macOS `xcode-select --install`), then you run it again. It never installs `git` itself. Then it keeps the Dashboard on. It creates no API key, does not touch the Gateway and shows no pairing code:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/hermes-dashboard-setup.sh | sh
