@@ -31,6 +31,12 @@ SET = "SetupTests."
 SYS = "SystemdTests."
 RET = "RetireGatewayExposureTests."
 BRG = "RetireBridgeStillWorks."
+WRP = "WrapperTests."
+PWD = "PasswordShapeTests."
+ADR = "RunnerAddressTests."
+RMV = "RemoveTests."
+RMS = "RemoveSystemdTests."
+TXT = "SetupTextTests."
 
 # id, what the guard is, (old, new[, all]), tests that must fail
 MUTANTS = [
@@ -45,7 +51,8 @@ MUTANTS = [
      [OPT + "test_a_password_cannot_be_given_on_the_command_line"]),
     ("M04", "--password-stdin does not go with a retire action",
      ('    if [ "$PASSWORD_STDIN" -eq 1 ]; then\n      echo "--password-stdin only goes with setup or --new-access."', '    if false; then\n      echo "--password-stdin only goes with setup or --new-access."'),
-     [OPT + "test_a_password_option_with_a_retire_action_is_refused"]),
+     [OPT + "test_a_password_option_with_a_retire_action_is_refused",
+      RMV + "test_a_password_or_a_key_option_does_not_go_with_it"]),
     ("M05", "a piped script cannot also read the password from stdin",
      ('  if [ ! -f "$0" ]; then', "  if false; then"),
      [OPT + "test_a_script_piped_into_sh_cannot_also_read_a_password_from_stdin"]),
@@ -142,13 +149,13 @@ MUTANTS = [
      ('    if status not in (401, 403):\n        raise SystemExit("the Dashboard did not refuse', '    if False:\n        raise SystemExit("the Dashboard did not refuse'),
      [SET + "test_a_dashboard_that_does_not_protect_its_pages_is_not_accepted"]),
     ("M36", "the Dashboard listens on one address only",
-     ('dashboard --host "$BIND_HOST" --port', 'dashboard --host 0.0.0.0 --port'),
+     ('dashboard --host "$2" --port', 'dashboard --host 0.0.0.0 --port'),
      [SET + "test_a_hermes_without_a_sign_in_gets_the_dashboard_on_one_address_and_one_password"]),
     ("M37", "a process that is not the Dashboard is never signalled",
      ("if not recorded_start or not recorded_exe or start != recorded_start or exe != recorded_exe:", "if False:"),
      [SET + "test_a_dashboard_pid_that_is_now_another_process_is_never_signalled"]),
     ("M38", "the setup never touches the Gateway",
-     ('echo "Gateway: not touched"', 'echo "Gateway: not touched"\nexport API_SERVER_HOST="$BIND_HOST"'),
+     ('PORT="$DASHBOARD_PORT"\nLOG=', 'PORT="$DASHBOARD_PORT"\nexport API_SERVER_HOST="$PIN_HOST"\nLOG='),
      [SRC + "test_nothing_outside_the_retire_path_knows_the_api_server"]),
     ("M39", "a stale clear-text record goes with the new sign-in",
      ('  rm -f "$SERVICES/dashboard-login.json"', "  true"),
@@ -259,6 +266,55 @@ MUTANTS = [
      ("""grep -Eq '^export API_SERVER_(HOST|PORT)=' "$runner" """.rstrip(),
       """grep -q '^export API_SERVER_\\(HOST\\|PORT\\)=' "$runner" """.rstrip()),
      [SRC + "test_no_gnu_only_alternation_in_a_basic_regular_expression"]),
+    # S2a: the one-function wrapper, the password, the runner address, --remove, the texts.
+    ("M72", "a cut download runs nothing: the end marker is required",
+     ('if [ "${_hermes_last:-}" != "--end-of-script" ]; then', "if false; then"),
+     [WRP + "test_a_download_cut_anywhere_runs_nothing_and_changes_nothing"]),
+    ("M73", "the password has no look-alike symbols",
+     ('letters = "abcdefghijkmnpqrstuvwxyz23456789"', 'letters = "abcdefghijklmnopqrstuvwxyz234567"'),
+     [PWD + "test_four_groups_of_five_without_look_alikes"]),
+    ("M74", "the password is drawn with secrets",
+     ('"".join(secrets.choice(letters) for _ in range(5))', '"".join(__import__("random").choice(letters) for _ in range(5))'),
+     [PWD + "test_it_is_drawn_with_secrets_not_with_random"]),
+    ("M75", "the runner does not carry the address found at setup",
+     ('PIN="$PIN_HOST"', 'PIN="${BIND_HOST:-$PIN_HOST}"'),
+     [ADR + "test_the_runner_does_not_carry_the_address_it_found_at_setup"]),
+    ("M76", "an address chosen by hand stays chosen",
+     ('if [ -n "$PIN" ]; then echo "chosen $PIN"; return 0; fi', 'if false; then echo "chosen $PIN"; return 0; fi'),
+     [ADR + "test_an_address_chosen_by_hand_stays_chosen"]),
+    ("M77", "Tailscale comes before the LAN",
+     ('case "$found" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) echo "mesh $found"; return 0 ;; esac', 'case "$found" in x) ;; esac'),
+     [ADR + "test_it_follows_the_network_the_way_setup_chose_it"]),
+    ("M78", "with no address yet the runner waits instead of ending",
+     ('  [ -z "${2:-}" ] || break\n', '  break\n'),
+     [ADR + "test_with_no_address_yet_it_waits_and_says_so_once"]),
+    ("M79", "a changed address is logged",
+     ('then say "address changed: $before -> $2"; fi', 'then :; fi'),
+     [ADR + "test_a_changed_address_is_the_one_the_dashboard_starts_on_and_the_change_is_logged"]),
+    ("M80", "--remove keeps the sign-in (config.yaml is not ours to change)",
+     ('  echo "The Dashboard was stopped and its service removed."', '  rm -f "$HH/config.json"\n  echo "The Dashboard was stopped and its service removed."'),
+     [RMV + "test_it_removes_the_service_and_keeps_the_sign_in_and_the_gateway"]),
+    ("M81", "--remove stops the Dashboard before it deletes the service",
+     ('"$remove_python" "$DASH_HELPER" stop "$DASHBOARD_RUNNER" "$SERVICES" "$LOGS" || remove_rc=$?', 'true'),
+     [RMV + "test_it_removes_the_service_and_keeps_the_sign_in_and_the_gateway"]),
+    ("M82", "--remove has nothing to do on a computer that never had the Dashboard",
+     ('    if [ -e "$item" ] || [ -L "$item" ]; then found=1; fi', '    found=1'),
+     [RMV + "test_a_computer_that_never_had_the_dashboard_gets_nothing_created"]),
+    ("M83", "--remove takes the systemd unit away and reloads",
+     ('      rm -f "$DASH_UNIT"\n      systemctl --user daemon-reload >/dev/null 2>&1 || true', '      systemctl --user daemon-reload >/dev/null 2>&1 || true'),
+     [RMS + "test_the_unit_is_stopped_disabled_and_deleted"]),
+    ("M85", "the first start says it can take minutes before it waits",
+     ('echo "The first start can take a few minutes: Hermes builds its web pages once."', ':'),
+     [TXT + "test_the_wait_is_announced_before_it_starts_and_the_end_speaks_console"]),
+    ("M86", "the final text gives address, user and the Console steps",
+     ('      echo "In Console: Type an address -> paste these three details."', '      :'),
+     [TXT + "test_the_wait_is_announced_before_it_starts_and_the_end_speaks_console"]),
+    ("M87", "who already had access is told how to get a new one",
+     ('echo "Forgot it? Run this again with --new-access: it makes a new password and signs out"', 'echo "Forgot it? Ask for a new one: it makes a new password and signs out"'),
+     [TXT + "test_who_already_had_access_is_told_in_plain_words_and_offered_new_access"]),
+    ("M88", "the firewall line names the real network",
+     ('  [ -n "$FIREWALL_NET" ] || FIREWALL_NET="<your network, in CIDR form>"\nfi', '  FIREWALL_NET="<your network>"\nfi'),
+     [TXT + "test_an_active_firewall_gets_the_real_network_not_a_blank_to_fill"]),
 ]
 
 

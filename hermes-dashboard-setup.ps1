@@ -9,6 +9,8 @@
 #   -NewAccess               make a new Dashboard password and end old sessions
 #   -PasswordStdin           take the password from the first line of standard
 #                            input instead of generating one
+#   -Remove                  stop the Dashboard and take its service away; the
+#                            sign-in, Hermes and the Gateway are not touched
 #   -RetireGatewayExposure   undo what the earlier Console setup added to the
 #                            Gateway (its network address and port, its pairing
 #                            record and its firewall ports); the API key is kept
@@ -33,6 +35,7 @@ param(
     [switch]$RetireGatewayExposure,
     [switch]$AlsoRemoveApiKey,
     [switch]$RetireBridge,
+    [switch]$Remove,
     [switch]$Help,
     [string]$BindAddress = "",
     [string]$Port = "",
@@ -75,6 +78,8 @@ function Show-Usage {
     Write-Say "  -BindAddress <address>    the one private LAN or Tailscale address to listen on"
     Write-Say "                            (or HERMES_DASHBOARD_HOST)."
     Write-Say "  -Port <port>              the TCP port (or HERMES_DASHBOARD_PORT), 9119 by default."
+    Write-Say "  -Remove                   stop the Dashboard and take its service away. Your"
+    Write-Say "                            Dashboard sign-in, Hermes and the Gateway are not touched."
     Write-Say "  -RetireGatewayExposure    undo what the earlier Console setup added to the"
     Write-Say "                            Gateway: its network address and port, its pairing"
     Write-Say "                            record and the firewall port it opened. Your API key"
@@ -98,7 +103,7 @@ function Show-Usage {
 function Get-RequestedAction {
     param(
         [bool]$NewAccess, [bool]$PasswordStdin, [bool]$RetireGatewayExposure,
-        [bool]$AlsoRemoveApiKey, [bool]$RetireBridge, [bool]$Help,
+        [bool]$AlsoRemoveApiKey, [bool]$RetireBridge, [bool]$Remove, [bool]$Help,
         [bool]$PasswordGiven, [int]$UnexpectedCount
     )
     if ($PasswordGiven) {
@@ -112,6 +117,7 @@ function Get-RequestedAction {
     if ($NewAccess) { $chosen += "new-access" }
     if ($RetireGatewayExposure) { $chosen += "retire-gateway-exposure" }
     if ($RetireBridge) { $chosen += "retire-bridge" }
+    if ($Remove) { $chosen += "remove" }
     if ($Help) { $chosen += "help" }
     if ($chosen.Count -gt 1) {
         throw ("Choose one action at a time: " + ($chosen -join ", ") + " were all given.")
@@ -913,7 +919,15 @@ else:
 from plugins.dashboard_auth.basic import hash_password
 
 previous = {key: basic.get(key) for key in ("username", "password_hash", "password", "secret")}
-password = password_given or secrets.token_urlsafe(24)
+
+
+def new_password():
+    # Four groups of five from 32 symbols (no 0, o, 1, l): 100 bits a person can read out and type.
+    letters = "abcdefghijkmnpqrstuvwxyz23456789"
+    return "-".join("".join(secrets.choice(letters) for _ in range(5)) for _ in range(4))
+
+
+password = password_given or new_password()
 username = str(basic.get("username") or "").strip() or env.get("USERNAME") or "admin"
 basic["username"] = username
 basic["password_hash"] = hash_password(password)
@@ -1211,6 +1225,7 @@ function Invoke-DashboardSetup {
         }
 
         Write-Step "Starting the Dashboard in the background"
+        Write-Say "The first start can take a few minutes: Hermes builds its web pages once."
         $t.TaskTouched = $true
         if ($task) { [void](Stop-DashboardTask $HermesHome $portNumber $runner) }
         $mode = Register-DashboardTask $HermesHome $runner
@@ -1274,35 +1289,46 @@ function Invoke-DashboardSetup {
         Write-Say ""
         Write-Say "== DASHBOARD READY =="
         Write-Say ""
-        Write-Say "Dashboard: $base"
-        Write-Say "Gateway:   not touched"
+        if ($login.STATE -eq "other") {
+            Write-Say "Address: $base"
+        } else {
+            Write-Say "To connect Console to this computer you need:"
+            Write-Say "  address:  $base"
+            Write-Say "  user:     $($login.USER)"
+        }
         switch ($login.STATE) {
             "created" {
                 Write-Say ""
-                Write-Say "Sign in with:"
-                Write-Say "  user:     $($login.USER)"
                 if ($newPassword) {
                     Write-Say "  password: $newPassword"
-                    Write-Say "This password is shown now and is not saved anywhere in clear."
-                    Write-Say "Forgot it later? Run this again with -NewAccess to make a new one."
+                    Write-Say ""
+                    Write-Say "In Console: Type an address -> paste these three details."
+                    Write-Say "This password is shown now, once, and is not saved anywhere in clear."
                 } else {
-                    Write-Say "  password: as you gave it on standard input (not shown, not saved in clear)"
+                    Write-Say "Your password is the one you gave on standard input (not shown, not saved in clear)."
+                    Write-Say "In Console: Type an address -> paste the address and the user, then type your password."
                 }
+                Write-Say "Forgot it later? Run this again with -NewAccess to make a new one."
             }
             "existing" {
                 Write-Say ""
-                Write-Say "The sign-in you already had was kept (user: $($login.USER)); no password is shown."
-                Write-Say "Forgot it? Run this again with -NewAccess to make a new one."
+                Write-Say "This computer already had a sign-in, which is kept as it is. Its password is only"
+                Write-Say "stored scrambled, so this setup cannot show it: use the one you already have."
+                Write-Say "In Console: Type an address -> paste the address and the user, then type that password."
+                Write-Say "Forgot it? Run this again with -NewAccess: it makes a new password and signs out"
+                Write-Say "everything that used the old one (the browser too)."
             }
             "pinned" {
                 Write-Say ""
-                Write-Say "The sign-in written in your .env was kept as it is (user: $($login.USER))."
-                Write-Say "A sign-in kept only in an external secret source (a secret manager) is not seen by this setup."
+                Write-Say "The password is the one written in your .env. No new sign-in was made and that file"
+                Write-Say "was not changed. A sign-in kept only in an external secret source (a secret manager)"
+                Write-Say "is not seen by this setup."
+                Write-Say "In Console: Type an address -> paste the address and the user, then type that password."
             }
             "other" {
                 Write-Say ""
-                Write-Say "Another sign-in provider is configured for this Dashboard. No new sign-in was made"
-                Write-Say "and its configuration was not changed."
+                Write-Say "Another sign-in provider is configured for this Dashboard, so this setup made no"
+                Write-Say "sign-in and changed no configuration. Use that provider's sign-in in Console."
             }
         }
         if (Test-Path -LiteralPath (Join-Path $services "dashboard-login.json")) {
@@ -1318,6 +1344,12 @@ function Invoke-DashboardSetup {
             Write-Say "from an elevated (administrator) PowerShell to start it with the computer."
         }
         Write-Say "Address: $($bind.Address) ($($bind.Kind)); only this address listens."
+        if ($bind.Kind -eq "mesh") {
+            Write-Say "Only devices signed in to your Tailscale can reach it: the phone needs Tailscale too."
+        } else {
+            Write-Say "The phone must be on this same network. Reserve this address for the computer in your"
+            Write-Say "router, or run this setup again if it changes: the Windows Firewall rule is made for it."
+        }
         if ($firewall -eq "needs-administrator") {
             Write-Say ""
             Write-Say "If the app cannot connect, allow the port from an elevated PowerShell (this window is not):"
@@ -1343,6 +1375,51 @@ function Invoke-DashboardSetup {
         }
         $script:Txn = $null
     }
+}
+
+# ---------------------------------------------------------------------------
+# -Remove: the Dashboard service and nothing else
+# ---------------------------------------------------------------------------
+# Stops the Dashboard, then takes away its Scheduled Task, its runner and its own
+# firewall rule. The sign-in stays in config.yaml; Hermes and the Gateway are not
+# touched. Safe to repeat.
+function Invoke-RemoveDashboard([string]$HermesHome) {
+    $runner = Join-Path (Join-Path $HermesHome "console-services") "hermes-dashboard.vbs"
+    $task = Get-DashboardTask
+    if ($task -and -not (Test-DashboardTaskOwned $task $runner)) {
+        throw ("A Scheduled Task named $script:TaskName exists but does not run this home's Dashboard runner " +
+            "($runner). Nothing was changed.")
+    }
+    $hadRunner = Test-Path -LiteralPath $runner
+    $rule = Get-NetFirewallRule -Name $script:FirewallRuleName -ErrorAction SilentlyContinue
+    if (-not $task -and -not $hadRunner -and -not $rule) {
+        Write-Say "Nothing to remove: this computer has no Dashboard service from this setup."
+        return 0
+    }
+    Write-Step "Removing the Dashboard service"
+    $portNumber = 9119
+    if ($hadRunner) {
+        $found = [regex]::Match([IO.File]::ReadAllText($runner, [Text.Encoding]::Unicode), '--port (\d{1,5})')
+        if ($found.Success) { $portNumber = [int]$found.Groups[1].Value }
+    }
+    if (-not (Stop-DashboardTask $HermesHome $portNumber $runner)) {
+        throw "The Dashboard could not be stopped, so nothing was deleted."
+    }
+    if (Get-DashboardTask) { Unregister-ScheduledTask -TaskName $script:TaskName -TaskPath "\" -Confirm:$false -ErrorAction Stop }
+    if ($hadRunner) { Remove-Item -LiteralPath $runner -Force }
+    if ($rule) {
+        if (Test-CurrentProcessAdministrator) {
+            Remove-NetFirewallRule -Name $script:FirewallRuleName -ErrorAction Stop
+        } else {
+            Write-Say "The Windows Firewall rule was left (this window is not elevated). From an elevated PowerShell:"
+            Write-Say "  Remove-NetFirewallRule -Name $script:FirewallRuleName"
+        }
+    }
+    Write-Say "The Dashboard was stopped and its service removed."
+    Write-Say "Kept as it was: your Hermes, the Gateway and the Dashboard sign-in"
+    Write-Say "(dashboard.basic_auth in $HermesHome\config.yaml). To remove the sign-in too, delete"
+    Write-Say "that block from config.yaml. Run this setup again, without -Remove, to bring the Dashboard back."
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1618,7 +1695,7 @@ function Invoke-Main {
     try {
         $action = Get-RequestedAction -NewAccess $NewAccess.IsPresent -PasswordStdin $PasswordStdin.IsPresent `
             -RetireGatewayExposure $RetireGatewayExposure.IsPresent -AlsoRemoveApiKey $AlsoRemoveApiKey.IsPresent `
-            -RetireBridge $RetireBridge.IsPresent -Help $Help.IsPresent `
+            -RetireBridge $RetireBridge.IsPresent -Remove $Remove.IsPresent -Help $Help.IsPresent `
             -PasswordGiven $script:PasswordWasGiven -UnexpectedCount @($Unexpected).Count
         if ($action -eq "help") { Show-Usage; return 0 }
         Assert-WindowsPlatform
@@ -1626,6 +1703,7 @@ function Invoke-Main {
         $lock = Enter-SetupLock
         switch ($action) {
             "retire-bridge" { return (Get-ExitCode (Invoke-RetireBridge $hermesHome)) }
+            "remove" { return (Get-ExitCode (Invoke-RemoveDashboard $hermesHome)) }
             "retire-gateway-exposure" {
                 return (Get-ExitCode (Invoke-RetireGatewayExposure -HermesHome $hermesHome -AlsoRemoveKey $AlsoRemoveApiKey.IsPresent))
             }

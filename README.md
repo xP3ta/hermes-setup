@@ -8,13 +8,17 @@ Console 1.3 talks to the **Dashboard** and nothing else. For it, install Hermes 
 
 ```sh
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive --skip-browser
-curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.sh | sh
+curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/hermes-dashboard-setup.sh | sh
 ```
 
-The second command keeps the Dashboard on at all times (a user service that starts with the machine and restarts itself: `systemd --user` on Linux, `launchd` on macOS), listening on **one** LAN or Tailscale address, behind a sign-in. It asks nothing: it picks the address (Tailscale first, then the private LAN) and shows the generated password **once**, at the end. The password is stored only as Hermes' own scrypt hash in `config.yaml`; it is never an argument of any command and never written in clear.
+The commands point at a reviewed release label (`setup-v1.6.0`), not at `main`: what you run is what was reviewed. The setup ends by printing three details: the **address**, the **user** and the **password**. In Console, choose **Type an address** and paste them.
 
-- A sign-in that already exists (in `config.yaml`, in `.env` or another provider) is **kept as it is**; no password is shown.
-- Forgot it? `... | sh -s -- --new-access` makes a new one and ends the sessions of the old one.
+The second command keeps the Dashboard on at all times (a user service that starts with the machine and restarts itself: `systemd --user` on Linux, `launchd` on macOS), listening on **one** LAN or Tailscale address, behind a sign-in. It asks nothing: it picks the address (Tailscale first, then the private LAN) and shows the generated password **once**, at the end: four groups of five letters and digits without look-alikes (no `0`, `o`, `1`, `l`; about 100 bits), easy to read out and type on a phone. The address is worked out again every time the Dashboard starts, so a new DHCP address or a late Tailscale does not leave it dead (a line in `logs/dashboard.log` says when it changed; an address you chose with `HERMES_DASHBOARD_HOST` stays as chosen). Reserve the computer's address in your router anyway. The password is stored only as Hermes' own scrypt hash in `config.yaml`; it is never an argument of any command and never written in clear.
+
+- A sign-in that already exists (in `config.yaml`, in `.env` or another provider) is **kept as it is**; its password is stored scrambled, so the setup cannot show it: it prints the address and the user, and says so in plain words.
+- Forgot it? `curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/hermes-dashboard-setup.sh | sh -s -- --new-access` makes a new one and ends the sessions of the old one (the browser and Desktop too).
+- `--remove` stops the Dashboard and removes its service (the systemd unit, the launchd job or the portable runner). It does not touch `config.yaml` (the sign-in stays: `dashboard.basic_auth`), Hermes or the Gateway, and it is safe to repeat.
+- Piped from `curl`, the script is one function called on its last line, with an end marker: a download that stops half way runs nothing.
 - Choose the address or port: `HERMES_DASHBOARD_HOST=<private address>`, `HERMES_DASHBOARD_PORT=<port>`. Only a private LAN, Tailscale or unique-local address is accepted, never `0.0.0.0`.
 - A sign-in that exists only in an external secret source (a secret manager Hermes is set up to use) is not read by this setup, which looks at `config.yaml` and `.env`; if you have one, the new password is added next to it, and the setup says so.
 - If the earlier Console setup left `console-services/dashboard-login.json` (the Dashboard password in clear), the setup warns about it whenever it keeps that file, and deletes it when it makes a new sign-in.
@@ -37,13 +41,13 @@ and shows no pairing code:
 
 ```powershell
 & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -NonInteractive -SkipBrowser
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.ps1)))
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/hermes-dashboard-setup.ps1)))
 ```
 
 Or save it, read it, and run it from the file (needed for `-PasswordStdin`):
 
 ```powershell
-irm https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.ps1 -OutFile "$env:TEMP\hermes-dashboard-setup.ps1"
+irm https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/hermes-dashboard-setup.ps1 -OutFile "$env:TEMP\hermes-dashboard-setup.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\hermes-dashboard-setup.ps1"
 ```
 
@@ -59,7 +63,8 @@ says what it could not do, and prints the command for the firewall rule.
 - **Checks like the app**: the status page answers, the protected pages refuse anyone who is not signed in, and the new password really signs in. If anything fails, the sign-in settings, the task, its runner and the firewall rule go back to what they were.
 - `-RetireGatewayExposure` undoes only what the earlier Windows setup added to the Gateway: `API_SERVER_HOST` and `API_SERVER_PORT` in `console-services\hermes-gateway.vbs`, the pairing record, and the Gateway's port in the firewall rules it made. **Your `API_SERVER_KEY` is kept**; `-RetireGatewayExposure -AlsoRemoveApiKey` also removes it (a private copy stays under `backups\gateway-exposure`) and says what that costs. The Gateway is not stopped and its task is not touched.
 - `-RetireBridge` removes the old Mobile Bridge, as under [Legacy](#legacy-bridge-era-installs). `-Help` lists the options.
-- To take it off a computer: stop the running Dashboard (Task Manager: the `wscript.exe`, `hermes.exe` and `python.exe` that run `dashboard`), then from an elevated PowerShell `Unregister-ScheduledTask -TaskName HermesConsole-Dashboard -Confirm:$false`, `Remove-NetFirewallRule -Name HermesConsole-Dashboard-Only` and delete `console-services\hermes-dashboard.vbs`. The sign-in stays in `config.yaml` (`dashboard.basic_auth`).
+- `-Remove` takes it off the computer: it stops the Dashboard and removes its Scheduled Task, its runner and its own firewall rule (from a window that is not elevated it says the one command left for the rule). The sign-in stays in `config.yaml` (`dashboard.basic_auth`); Hermes and the Gateway are not touched. Safe to repeat.
+- If this computer's address changes, run the setup again: the firewall rule is made for the address, so on Windows the Dashboard does not follow a new address by itself (the shell version does).
 
 Not the same as the shell version: IPv4 only (no IPv6). Tried on Windows 11 Pro 25H2 (build 26200, Spanish) with Windows PowerShell 5.1 and Hermes 0.21.7: a first setup, a repeat, `-NewAccess`, `-PasswordStdin` with a password that has non-ASCII characters, a restart of the computer with nobody signed in, both clean-ups, and a setup that fails half-way. **Not tried**: Windows 10, Server, ARM64, PowerShell 7, Tailscale, a non-elevated run, an installation on a path with spaces, a Hermes home on another drive.
 

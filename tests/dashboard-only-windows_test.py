@@ -344,7 +344,7 @@ GUARDS: list[tuple[str, str, list[str]]] = [
     ("G19", "the port must be a TCP port",
      [r"\$parsed -lt 1 -or \$parsed -gt 65535\) \{\s+throw"]),
     ("G20", "a Scheduled Task that is not this home's is refused",
-     [r"-not \(Test-DashboardTaskOwned \$task \$runner\)\) \{\s+throw"]),
+     [r"\n {8}if \(\$task -and -not \(Test-DashboardTaskOwned \$task \$runner\)\) \{\s+throw"]),
     ("G21", "a port held by something that is not this Dashboard is refused",
      [r"if \(-not \(Test-PortHeldByOwnDashboard \$HermesHome \$portNumber \$runner\)\) \{[^}]*return 1"]),
     ("G22", "without Hermes it stops, changes nothing and does not install it",
@@ -444,6 +444,22 @@ GUARDS: list[tuple[str, str, list[str]]] = [
      [r"function Write-Problem\(\[string\]\$Message\) \{ try \{ \[Console\]::Error\.WriteLine\(\$Message\) \} catch \{ \}"]),
     ("G65", "the wait goes on only while the log grows",
      [r"if \(\$size -le \$lastSize\) \{ break \}"]),
+    ("G67", "-Remove is an action of its own",
+     [r'if \(\$Remove\) \{ \$chosen \+= "remove" \}', r'"remove" \{ return \(Get-ExitCode \(Invoke-RemoveDashboard']),
+    ("G68", "-Remove stops the Dashboard before it deletes anything",
+     [r'if \(-not \(Stop-DashboardTask \$HermesHome \$portNumber \$runner\)\) \{\s+throw "The Dashboard could not be stopped, so nothing was deleted\."']),
+    ("G69", "-Remove refuses a Scheduled Task that is not this home's",
+     [r'\$task = Get-DashboardTask\n    if \(\$task -and -not \(Test-DashboardTaskOwned \$task \$runner\)\) \{\n        throw \("A Scheduled Task']),
+    ("G70", "-Remove on a computer that never had the Dashboard does nothing",
+     [r'if \(-not \$task -and -not \$hadRunner -and -not \$rule\) \{\s+Write-Say "Nothing to remove']),
+    ("G71", "the first start is announced before the wait",
+     [r'Write-Step "Starting the Dashboard in the background"\s+Write-Say "The first start can take a few minutes']),
+    ("G72", "who already had access is told in plain words and offered -NewAccess",
+     [r'(?s)"existing" \{.*?stored scrambled, so this setup cannot show it.*?Run this again with -NewAccess: it makes a new password']),
+    ("G73", "the final text gives address, user and the Console steps",
+     [r'  address:  \$base', r'In Console: Type an address -> paste these three details\.']),
+    ("G74", "-Remove does not touch the sign-in, the Gateway or Hermes",
+     []),
     ("G66", "setup and rollback agree on the process tree of the old task",
      [r"\$t\.TaskTouched = \$true\s+if \(\$task\) \{ \[void\]\(Stop-DashboardTask"]),
 ]
@@ -456,6 +472,14 @@ def _make_guard_test(guard_id: str, description: str, patterns: list[str]):
             rule = source.index("New-DashboardRule $want")
             start = source.index("Start-ScheduledTask -TaskName $script:TaskName -TaskPath \"\\\"\n")
             self.assertLess(rule, start, description)
+            return
+        if guard_id == "G74":
+            region = re.search(r"^function Invoke-RemoveDashboard.*?^}\n", source, re.M | re.S).group(0)
+            body = code_only(region)
+            for fragment in ("Invoke-HermesPython", "Find-HermesLauncher", "WriteAllText", "WriteAllBytes", "Set-Content",
+                             "Out-File", "API_SERVER", "gateway", 'Join-Path $HermesHome "config', '".env"'):
+                self.assertNotIn(fragment, body, f"{guard_id}: {fragment}")
+            self.assertEqual(body.count("Remove-Item"), 1, description)
             return
         if guard_id == "G44":
             source = here_string(source, "$script:AuthSource")
