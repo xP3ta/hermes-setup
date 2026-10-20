@@ -40,6 +40,7 @@ TXT = "SetupTextTests."
 INS = "InstallIfMissingTests."
 OLD = "OldInstallNoticeTests."
 QRC = "QrCodeTests."
+RLQ = "RealLayoutQrTests."
 
 # id, what the guard is, (old, new[, all]), tests that must fail
 MUTANTS = [
@@ -413,7 +414,7 @@ MUTANTS = [
      ('elif "$VP" -I -c \'import qrcode\' >/dev/null 2>&1 </dev/null && qr_try "$VP" -I -c "$QRPY"; then', 'elif false; then'),
      [QRC + "test_the_second_way_is_the_python_of_hermes_when_it_has_qrcode"]),
     ("M118", "uv keeps its environment and cache",
-     ("--isolated --no-project --no-cache --with qrcode==8.2", "--with qrcode==8.2"),
+     ("--isolated --no-project --no-cache --python", "--no-project --python"),
      [QRC + "test_the_third_way_is_a_throwaway_uv_environment_with_the_pinned_library"]),
     ("M119", "uv takes the newest library, not the pinned one",
      ("--with qrcode==8.2", "--with qrcode"),
@@ -428,6 +429,32 @@ MUTANTS = [
     ("M122", "the code is drawn even when the setup failed its checks",
      ('echo "ERROR: the Dashboard is running but failed its checks." >&2', 'echo "ERROR: the Dashboard is running but failed its checks." >&2; echo "== SCAN THIS CODE WITH CONSOLE =="'),
      [QRC + "test_a_setup_that_fails_draws_no_code"]),
+    # S2e: the layout the current official installer really leaves
+    ("M123", "uv is looked for only in bin/",
+     ('if [ ! -f "$UV" ] || [ ! -x "$UV" ]; then', "if false; then"),
+     [RLQ + "test_on_the_real_layout_the_code_is_drawn_by_uv_found_under_tools"]),
+    ("M124", "the oldest uv under tools is taken",
+     ("sort -V | tail -n 1", "sort -V | head -n 1"),
+     [RLQ + "test_the_newest_uv_wins_by_version_not_by_spelling"]),
+    ("M125", "uv versions are sorted as text, not as versions",
+     ("sort -V | tail -n 1", "sort | tail -n 1"),
+     [RLQ + "test_the_newest_uv_wins_by_version_not_by_spelling"]),
+    ("M126", "the glob runs anything called uv under tools",
+     ('"$HH"/tools/uv-*/uv; do', '"$HH"/tools/*/uv; do'),
+     [RLQ + "test_nothing_but_uv_is_ever_run_from_tools"]),
+    ("M127", "the glob runs any program of a uv-* folder",
+     ('"$HH"/tools/uv-*/uv; do', '"$HH"/tools/uv-*/*; do'),
+     [RLQ + "test_nothing_but_uv_is_ever_run_from_tools"]),
+    ("M128", "uv does not get the interpreter of Hermes",
+     ('--no-cache --python "$VP" --with', "--no-cache --with"),
+     [RLQ + "test_the_third_way_is_a_throwaway_uv_environment_with_the_pinned_library",
+      QRC + "test_the_third_way_is_a_throwaway_uv_environment_with_the_pinned_library"]),
+    ("M129", "uv gets another interpreter than the one setup uses",
+     ('--no-cache --python "$VP" --with', "--no-cache --python python3 --with"),
+     [RLQ + "test_the_third_way_is_a_throwaway_uv_environment_with_the_pinned_library"]),
+    ("M130", "bin/uv is no longer the first place",
+     ('UV="$HH/bin/uv"\n    if [', 'UV=""\n    if ['),
+     [RLQ + "test_the_old_place_still_comes_first"]),
 ]
 
 
