@@ -693,7 +693,7 @@ class SetupTests(DashRig):
         password = self.password_from(completed)
         self.assertIn("  user:     admin", completed.stdout)
         self.assertIn(f"  address:  {self.dashboard}", completed.stdout)
-        self.assertIn("In Console: Type an address -> paste these three details.", completed.stdout)
+        self.assertIn("In Console: Connect manually -> paste these three details.", completed.stdout)
         self.assertNotIn("Gateway: not touched", completed.stdout)  # S1-6: jargon
         self.assertRegex(password, PASSWORD_SHAPE)
         # Shown once, and only in the output.
@@ -1602,6 +1602,23 @@ class RunnerAddressTests(AddressRig):
         self.assertIn("no LAN or Tailscale address", completed.stderr)
         self.assertEqual(tree(self.hermes), before)
 
+    def test_no_address_says_in_plain_words_how_to_get_one_with_tailscale(self) -> None:
+        self.ip_says()
+        before = tree(self.hermes)
+        completed = self.dash(HERMES_DASHBOARD_HOST="", MOCK_IP_FILE=str(self.ip_file))
+        self.assertNotEqual(completed.returncode, 0)
+        lines = [line for line in completed.stderr.splitlines() if line.strip()]
+        self.assertLessEqual(len(lines), 6, completed.stderr)
+        for fragment in ("Tailscale", "curl -fsSL https://tailscale.com/install.sh | sh", "sudo tailscale up",
+                         "SAME", "run this same command again", "usual for a server on the internet"):
+            self.assertIn(fragment, completed.stderr)
+        self.assertEqual(tree(self.hermes), before)
+        # Only said: the script never runs or fetches Tailscale itself.
+        source = SCRIPT.read_text(encoding="utf-8")
+        for line in source.splitlines():
+            if "tailscale.com/install.sh" in line:
+                self.assertTrue(line.lstrip().startswith('echo "'), line)
+
 
 OFFICIAL_URL = "https://hermes-agent.nousresearch.com/install.sh"
 OFFICIAL_FLAGS = "--non-interactive --skip-browser --skip-computer-use"
@@ -1945,7 +1962,7 @@ class SetupTextTests(AddressRig):
         self.assertIn("first start can take a few minutes", out.lower())
         self.assertLess(out.lower().index("first start can take a few minutes"), out.index("Dashboard answers at"))
         ready = out[out.index("DASHBOARD READY"):]
-        for line in (f"  address:  {self.dashboard}", "  user:     admin", "In Console: Type an address -> paste these three details."):
+        for line in (f"  address:  {self.dashboard}", "  user:     admin", "In Console: Connect manually -> paste these three details."):
             self.assertIn(line, ready)
         self.assertNotIn("Gateway: not touched", out)
 
@@ -2389,6 +2406,15 @@ class RealLayoutQrTests(QrCodeTests):
 # Only the S2e tests are meant to run on the real layout; the S2d ones keep their own rig.
 for _name in [n for n in vars(QrCodeTests) if n.startswith("test_") and n not in vars(RealLayoutQrTests)]:
     setattr(RealLayoutQrTests, _name, None)
+
+
+class AppWordingTests(unittest.TestCase):
+    """The text names what Console 1.3 shows: Connect manually."""
+
+    def test_the_old_entry_name_is_gone_from_the_script_and_the_readme(self) -> None:
+        for path in (SCRIPT, ROOT / "README.md"):
+            self.assertNotIn("Type an address", path.read_text(encoding="utf-8"), path.name)
+        self.assertIn("In Console: Connect manually -> paste", SCRIPT.read_text(encoding="utf-8"))
 
 
 @unittest.skipUnless(LINUX, "drives the Linux managers")

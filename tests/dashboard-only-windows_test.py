@@ -219,7 +219,7 @@ class SurfaceTests(unittest.TestCase):
         self.assertIn('@("-NonInteractive", "-SkipBrowser", "-SkipComputerUse")', self.source)
         urls = set(re.findall(r"https?://[^\s\"')]+", code))
         # the official installer, and the one address the Dashboard is probed at
-        self.assertEqual(urls, {"http://$($bind.Address", "https://hermes-agent.nousresearch.com/install.ps1"}, urls)
+        self.assertEqual(urls, {"http://$($bind.Address", "https://hermes-agent.nousresearch.com/install.ps1", "https://tailscale.com/download/windows"}, urls)
 
     def test_http_goes_only_to_the_address_it_just_chose(self) -> None:
         self.assertEqual(len(re.findall(r"\[Net\.HttpWebRequest\]::Create\(", self.source)), 1)
@@ -539,7 +539,7 @@ GUARDS: list[tuple[str, str, list[str]]] = [
     ("G72", "who already had access is told in plain words and offered -NewAccess",
      [r'(?s)"existing" \{.*?stored scrambled, so this setup cannot show it.*?Run this again with -NewAccess: it makes a new password']),
     ("G73", "the final text gives address, user and the Console steps",
-     [r'  address:  \$base', r'In Console: Type an address -> paste these three details\.']),
+     [r'  address:  \$base', r'In Console: Connect manually -> paste these three details\.']),
     ("G74", "-Remove does not touch the sign-in, the Gateway or Hermes",
      []),
     ("G80", "the QR link is v=2 with url, user and pass, and nothing of the Gateway",
@@ -570,6 +570,11 @@ GUARDS: list[tuple[str, str, list[str]]] = [
      []),
     ("G86", "the code is drawn once, after the credentials and before the leftovers warning",
      []),
+    ("G88", "no private address: Tailscale is named, with where to get it and the same account",
+     [r'throw \(\"No LAN or Tailscale address was found: this machine has no private address \(usual for a server on the internet\)\.`n\" \+',
+      r'Install it from https://tailscale\.com/download/windows and sign in', r'SAME Tailscale account on your phone',
+      r'Then run this same command again\.']),
+    ("G89", "the old entry name of the app is gone", []),
     ("G66", "setup and rollback agree on the process tree of the old task",
      [r"\$t\.TaskTouched = \$true\s+if \(\$task\) \{ \[void\]\(Stop-DashboardTask"]),
 ]
@@ -618,6 +623,16 @@ def _make_guard_test(guard_id: str, description: str, patterns: list[str]):
             self.assertGreater(calls[0], source.index('Write-Say "sign-in and changed no configuration.'), description)
             self.assertLess(calls[0], source.index('Write-Say "WARNING: $services'), description)
             return
+        if guard_id == "G89":
+            for path in (SCRIPT, SCRIPT.parent / "README.md"):
+                self.assertNotIn("Type an address", path.read_text(encoding="utf-8"), path.name)
+            self.assertIn("In Console: Connect manually -> paste", source)
+            return
+        if guard_id == "G88":
+            body = re.search(r'throw \(\"No LAN or Tailscale.*?\)\n\}', source, re.S).group(0)
+            self.assertLessEqual(body.count("`n") + 1, 6, description)
+            self.assertNotRegex(code_only(source), r'(?i)(Start-Process|Invoke-Expression|iex|winget|choco)[^\n]*tailscale', description)
+            self.assertNotIn("0.0.0.0", body, description)
         if guard_id == "G74":
             region = re.search(r"^function Invoke-RemoveDashboard.*?^}\n", source, re.M | re.S).group(0)
             body = code_only(region)

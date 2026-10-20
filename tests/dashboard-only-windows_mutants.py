@@ -158,6 +158,9 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("Q19", "PATH comes before tools", '    $best = ""\n', '    $early = Get-Command uv -ErrorAction SilentlyContinue\n    if ($early) { return $early.Source }\n    $best = ""\n', "test_G87_"),
     ("Q20", "uv no longer found by Find-Uv", '$uv = Find-Uv $HermesHome', '$uv = ""', "test_G87_"),
     ("Q13", "the password is not url-encoded", "u.urlencode(pairs, quote_via=u.quote, safe=\"\")", "\"&\".join(k + \"=\" + v for k, v in pairs)", "test_the_link_has_the_version"),
+    ("Q21", "no private address: Tailscale is no longer named", 'Console connects through Tailscale. Install it from https://tailscale.com/download/windows and sign in,`n', '', "test_G88_"),
+    ("Q22", "no private address: 'run this command again' is dropped", 'Then run this same command again.', 'Then carry on.', "test_G88_"),
+    ("Q23", "the old entry name comes back", 'In Console: Connect manually -> paste the address and the user, then type your password.', 'In Console: Type an address -> paste the address and the user, then type your password.', "test_G89_"),
 ]
 
 def run_suite(script: pathlib.Path) -> tuple[int, str]:

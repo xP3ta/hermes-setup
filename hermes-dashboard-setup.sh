@@ -1196,9 +1196,11 @@ PICKED="$(sh "$WORK/hermes-dashboard.sh" --print-address || true)"
 NETWORK_KIND="${PICKED%% *}"
 BIND_HOST="${PICKED#* }"
 if [ -z "$BIND_HOST" ]; then
-  echo "ERROR: no LAN or Tailscale address was found, so there is nothing safe to listen on." >&2
-  echo "Connect Tailscale or join the LAN, or choose one: HERMES_DASHBOARD_HOST=<private address>." >&2
-  echo "Nothing was changed." >&2
+  echo "ERROR: no LAN or Tailscale address was found: this machine has no private address (usual for a server on the internet)." >&2
+  echo "Console connects through Tailscale. Install it here: curl -fsSL https://tailscale.com/install.sh | sh   then: sudo tailscale up" >&2
+  echo "On macOS or Windows, install it from https://tailscale.com/download. On your phone, use the SAME Tailscale account." >&2
+  echo "Then run this same command again. (Or choose a private address: HERMES_DASHBOARD_HOST=<private address>.)" >&2
+  echo "Nothing was changed, and nothing was opened to the internet." >&2
   exit 1
 fi
 if ! valid_dashboard_address "$BIND_HOST"; then
@@ -2161,12 +2163,12 @@ case "$LOGIN_STATE" in
     if [ -n "$NEW_PASSWORD" ]; then
       echo "  password: $NEW_PASSWORD"
       echo ""
-      echo "In Console: Type an address -> paste these three details."
+      echo "In Console: Connect manually -> paste these three details."
       echo "This password is shown now, once, and is not saved anywhere in clear."
     else
       echo ""
       echo "Your password is the one you gave on standard input (not shown, not saved in clear)."
-      echo "In Console: Type an address -> paste the address and the user, then type your password."
+      echo "In Console: Connect manually -> paste the address and the user, then type your password."
     fi
     echo "Forgot it later? Run this again with --new-access to make a new one."
     echo "A sign-in kept only in an external secret source (a secret manager Hermes is set up"
@@ -2176,7 +2178,7 @@ case "$LOGIN_STATE" in
     echo ""
     echo "This computer already had a sign-in, which is kept as it is. Its password is only"
     echo "stored scrambled, so this setup cannot show it: use the one you already have."
-    echo "In Console: Type an address -> paste the address and the user, then type that password."
+    echo "In Console: Connect manually -> paste the address and the user, then type that password."
     echo "Forgot it? Run this again with --new-access: it makes a new password and signs out"
     echo "everything that used the old one (the browser too)."
     ;;
@@ -2184,7 +2186,7 @@ case "$LOGIN_STATE" in
     echo ""
     echo "The password is the one written in $HH/.env (the lines that start with"
     echo "HERMES_DASHBOARD_BASIC_AUTH_). No new sign-in was made and that file was not changed."
-    echo "In Console: Type an address -> paste the address and the user, then type that password."
+    echo "In Console: Connect manually -> paste the address and the user, then type that password."
     ;;
   other)
     echo ""
