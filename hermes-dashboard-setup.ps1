@@ -4,8 +4,8 @@
 # is missing it runs the official installer and nothing else; if Hermes is there
 # it never runs it. It does not touch the Gateway. It does the one thing the
 # official installer leaves undone: it keeps the Dashboard on all the time, on
-# one LAN or Tailscale address, behind sign-in, and shows the generated password
-# once.
+# one LAN or Tailscale address, behind sign-in, shows the generated password
+# once and draws a QR code that Console scans to connect (Dashboard sign-in only).
 #
 #   -NewAccess               make a new Dashboard password and end old sessions
 #   -PasswordStdin           take the password from the first line of standard
@@ -69,6 +69,7 @@ function Show-Usage {
     Write-Say "Run it AFTER the official Hermes installer. It installs nothing: it keeps the"
     Write-Say "Hermes Dashboard on all the time, on one LAN or Tailscale address, behind a"
     Write-Say "password, and shows the generated password once. It does not touch the Gateway."
+    Write-Say "It ends with a QR code for Console (nothing is installed to draw it)."
     Write-Say ""
     Write-Say "  (no option)               set up, or repair, the Dashboard. A sign-in that"
     Write-Say "                            already exists is kept as it is."
@@ -1106,6 +1107,85 @@ function Show-DashboardFailure([string]$Base, [int]$PortNumber, [string]$LogPath
     }
 }
 
+# The QR Console scans: hermes://pair with v=2, url, user and, when this run made
+# the password, pass. Only the Dashboard sign-in goes in; no Gateway key, host or
+# port is read or written. The password reaches the builder and the drawer on
+# standard input: never on a command line, never in a file, and the picture is
+# not written to a file either: it comes back as text and goes to this window
+# once. Drawing uses what is there, in this order, and leaves nothing behind:
+# qrencode, the Python of Hermes if it has qrcode, a throwaway uv environment.
+function Invoke-QrDrawer([string]$Program, [string[]]$DrawerArguments, [string]$Link) {
+    try {
+        $result = Invoke-NativeProcess $Program $DrawerArguments -InputText $Link -TimeoutSeconds 120
+        if ($result.Code -eq 0 -and $result.Out.Trim()) { return $result.Out.TrimEnd() }
+    } catch { }
+    return ""
+}
+
+function Get-QrDrawing([string]$Link, [string]$PythonPath, [string]$HermesHome) {
+    $drawer = 'import sys, qrcode' + "`n" + 'sys.stdout.reconfigure(encoding="utf-8")' + "`n" +
+        'q = qrcode.QRCode(border=1)' + "`n" + 'q.add_data(sys.stdin.read())' + "`n" + 'q.make()' + "`n" +
+        'q.print_ascii(invert=True)'
+    $qrencode = Get-Command qrencode -ErrorAction SilentlyContinue
+    if ($qrencode) {
+        $art = Invoke-QrDrawer $qrencode.Source @("-t", "ANSIUTF8", "-l", "M") $Link
+        if ($art) { return $art }
+    }
+    if ((Invoke-NativeProcess $PythonPath @("-I", "-c", "import qrcode")).Code -eq 0) {
+        $art = Invoke-QrDrawer $PythonPath @("-I", "-c", $drawer) $Link
+        if ($art) { return $art }
+    }
+    $uv = Join-Path $HermesHome "bin\uv.exe"
+    if (-not (Test-Path -LiteralPath $uv)) {
+        $found = Get-Command uv -ErrorAction SilentlyContinue
+        $uv = ""
+        if ($found) { $uv = $found.Source }
+    }
+    if ($uv) {
+        return (Invoke-QrDrawer $uv @("run", "--isolated", "--no-project", "--no-cache", "--python", $PythonPath,
+            "--with", "qrcode==8.2", "python", "-c", $drawer) $Link)
+    }
+    return ""
+}
+
+function Show-PairingCode {
+    param([string]$Base, [string]$UserName, [string]$CodePassword, $Python, [string]$HermesHome)
+    $builder = 'import sys, urllib.parse as u' + "`n" +
+        'url, user, secret = (sys.stdin.buffer.readline().decode("utf-8").rstrip("\r\n") for _ in range(3))' + "`n" +
+        'pairs = [("v", "2"), ("url", url), ("user", user)] + ([("pass", secret)] if secret else [])' + "`n" +
+        'print("hermes://pair?" + u.urlencode(pairs, quote_via=u.quote, safe=""))'
+    $art = ""
+    try {
+        $made = Invoke-NativeProcess $Python.Python @("-I", "-c", $builder) `
+            -InputText ($Base + "`n" + $UserName + "`n" + $CodePassword + "`n")
+        $link = ""
+        if ($made.Code -eq 0) { $link = $made.Out.Trim() }
+        if ($link) { $art = Get-QrDrawing $link $Python.Python $HermesHome }
+    } catch { $art = "" }
+    Write-Say ""
+    if (-not $art) {
+        if ($CodePassword) {
+            Write-Say "I could not draw the code here; type these three details in Console."
+        } else {
+            Write-Say "I could not draw the code here; type the address and the user in Console, then the password."
+        }
+        return
+    }
+    $before = $null
+    try { $before = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+    Write-Say "== SCAN THIS CODE WITH CONSOLE =="
+    Write-Say ""
+    Write-Say $art
+    Write-Say ""
+    if ($CodePassword) {
+        Write-Say "Scan it from Console. It carries the password: keep it off photos and shared screens."
+        Write-Say "It is drawn here once and is not saved."
+    } else {
+        Write-Say "Scan it from Console: it carries the address and the user; Console asks for the password once."
+    }
+    try { if ($before) { [Console]::OutputEncoding = $before } } catch { }
+}
+
 # ---------------------------------------------------------------------------
 # Setup and -NewAccess
 # ---------------------------------------------------------------------------
@@ -1298,9 +1378,11 @@ function Invoke-DashboardSetup {
 
         Write-Step "Checking the Dashboard like the app will"
         $verified = 0
+        $codePassword = ""
         if ($login.STATE -eq "created") {
             $secret = $newPassword
             if (-not $secret) { $secret = $givenPassword }
+            $codePassword = $secret
             $verified = Test-DashboardAnswers -Base $base -Mode "login" -UserName $login.USER -PasswordText $secret
         } else {
             $verified = Test-DashboardAnswers -Base $base -Mode "refuse"
@@ -1366,6 +1448,10 @@ function Invoke-DashboardSetup {
                 Write-Say "sign-in and changed no configuration. Use that provider's sign-in in Console."
             }
         }
+        if ($login.STATE -ne "other" -and $login.USER) {
+            Show-PairingCode -Base $base -UserName $login.USER -CodePassword $codePassword -Python $python -HermesHome $HermesHome
+        }
+        $codePassword = ""
         if (Test-Path -LiteralPath (Join-Path $services "dashboard-login.json")) {
             Write-Say ""
             Write-Say "WARNING: $services\dashboard-login.json still holds the Dashboard password"

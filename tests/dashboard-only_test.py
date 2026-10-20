@@ -4,8 +4,8 @@ installer (hermes-dashboard-setup.sh).
 
 It does the one thing the official installer does not: leave the Dashboard on
 all the time, bound to one LAN/Tailscale address, behind a sign-in. It never
-installs Hermes, never touches the Gateway, never creates an API key and never
-prints a pairing code.
+touches the Gateway and never creates an API key. It ends with a QR code that
+carries only the Dashboard sign-in (S2d).
 
 Everything runs against disposable homes. Hermes is the stand-in of
 no-bridge-install_test.py, extended with the three official calls the script
@@ -622,9 +622,16 @@ class SourceContractTests(unittest.TestCase):
         for fragment in ("API_SERVER", "gateway run", "hermes-gateway"):
             self.assertNotIn(fragment, self.outside_retire.replace("hermes-gateway.service.d", ""), fragment)
 
-    def test_no_pairing_code_and_no_qr(self) -> None:
-        for fragment in ("hermes://pair", "qrencode", "qrcode", "PAIRING_SCHEMA=2\\n"):
+    def test_the_only_code_is_the_dashboard_one_and_it_never_names_the_gateway(self) -> None:
+        # S2d: one QR with v=2, url, user (and pass); no old pairing record, no Gateway field.
+        self.assertEqual(self.outside_retire.count("hermes://pair?"), 1)
+        for fragment in ("PAIRING_SCHEMA", "pairing.env", "dash_user", "dash_pass", "API_SERVER", '("token"',
+                         "&token=", "&host=", "&port=", "print_ascii(out="):
             self.assertNotIn(fragment, self.outside_retire)
+        # The drawing is the three ways of the public scripts, with nothing installed for good.
+        for fragment in ("qrencode -t ANSIUTF8", "import qrcode",
+                         "run --isolated --no-project --no-cache --with qrcode==8.2"):
+            self.assertIn(fragment, self.outside_retire)
 
     def test_hermes_is_installed_only_with_the_official_installer_and_its_exact_flags(self) -> None:
         # S2b: when Hermes is missing the one official command runs, nothing else.
@@ -1964,6 +1971,285 @@ class SetupTextTests(AddressRig):
         self.assertNotIn("<your network>", out)
         self.assertIn(f'address="{network}" port port="{self.dashboard_port}" protocol="tcp" accept', out)
         self.assertIn("firewall-cmd --reload", out)
+
+
+# ---------------------------------------------------------------------------
+# S2d: the QR that Console scans
+# ---------------------------------------------------------------------------
+
+def _png(rows):
+    """A grey PNG of rows (lists of 0 dark / 255 light), enlarged and with a quiet zone."""
+    import struct
+    import zlib
+    scale, quiet = 6, 4
+    width = len(rows[0]) + 2 * quiet
+    grid = [[255] * width for _ in range(quiet)] + [[255] * quiet + r + [255] * quiet for r in rows] \
+        + [[255] * width for _ in range(quiet)]
+    raw = b""
+    for line in grid:
+        data = bytes(v for v in line for _ in range(scale))
+        raw += (b"\x00" + data) * scale
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    header = struct.pack(">IIBBBBB", width * scale, len(grid) * scale, 8, 0, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+HALF_BLOCKS = {" ": (0, 0), "\u00a0": (0, 0), "\u2580": (1, 0), "\u2584": (0, 1), "\u2588": (1, 1)}
+CODE_HEADING = "== SCAN THIS CODE WITH CONSOLE =="
+
+
+def decode_terminal_code(stdout: str, directory: pathlib.Path) -> str:
+    """Rebuild the picture from the glyphs the terminal got and read it with zbarimg.
+
+    qrencode draws light modules as full blocks, the Python library the other way
+    round: both are tried. Returns the decoded text, or "" when nothing decodes.
+    """
+    if CODE_HEADING not in stdout:
+        return ""
+    lines = []
+    for line in stdout.split(CODE_HEADING, 1)[1].splitlines():
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        if line and all(ch in HALF_BLOCKS for ch in line):
+            lines.append(line)
+        elif lines:
+            break
+    width = max((len(line) for line in lines), default=0)
+    for light in (1, 0):
+        rows = []
+        for line in lines:
+            line = line.ljust(width)
+            for half in (0, 1):
+                rows.append([255 if HALF_BLOCKS[ch][half] == light else 0 for ch in line])
+        if not rows:
+            return ""
+        picture = directory / f"code-{light}.png"
+        picture.write_bytes(_png(rows))
+        read = subprocess.run(["zbarimg", "-q", "--raw", str(picture)], text=True, capture_output=True, timeout=60)
+        if read.returncode == 0 and read.stdout.strip():
+            return read.stdout.strip()
+    return ""
+
+
+def link_for(base, user, password=None):
+    import urllib.parse
+    link = "hermes://pair?v=2&url=" + urllib.parse.quote(base, safe="") + "&user=" + urllib.parse.quote(user, safe="")
+    return link + ("&pass=" + urllib.parse.quote(password, safe="") if password is not None else "")
+
+
+@unittest.skipUnless(LINUX and shutil.which("zbarimg") and shutil.which("qrencode"), "needs zbarimg and qrencode")
+class QrCodeTests(DashRig):
+    """S2d: the setup ends with one QR that carries the Dashboard sign-in and nothing of the Gateway."""
+
+    CANARY = "CANARY-gateway-key-0f3a9c"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.capture = self.temp / "capture"
+        self.capture.mkdir()
+        # The rig's qrencode is a stand-in that prints a marker; here the real one draws.
+        (self.mock_bin / "qrencode").unlink(missing_ok=True)
+        (self.mock_bin / "qrencode").symlink_to(shutil.which("qrencode"))
+
+    def gateway_secrets_in_env(self) -> None:
+        # API_SERVER_KEY must never reach the code; the fixture is a real-looking .env.
+        (self.hermes / ".env").write_text(
+            f"API_SERVER_KEY={self.CANARY}\nAPI_SERVER_PORT=8642\nAPI_SERVER_HOST=127.0.0.1\n", encoding="utf-8")
+
+    def fake(self, name: str, body: str) -> None:
+        path = self.mock_bin / name
+        path.unlink(missing_ok=True)  # never write through the symbolic link to the real qrencode
+        path.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+        path.chmod(0o700)
+
+    def recorder(self, name: str, *, status: int, say: str = "") -> None:
+        """A drawer that writes down its argv and its standard input and then ends with status."""
+        log = self.capture / (name + ".argv")
+        stdin = self.capture / (name + ".stdin")
+        self.fake(name, f'for a in "$@"; do printf "%s\\n" "$a" >> "{log}"; done; : >> "{log}"\n'
+                        f'cat >> "{stdin}"\n{"echo " + say if say else ":"}\nexit {status}')
+
+    def decoded(self, completed) -> str:
+        return decode_terminal_code(completed.stdout, self.capture)
+
+    def fields(self, payload):
+        import urllib.parse
+        self.assertTrue(payload.startswith("hermes://pair?"), payload)
+        return urllib.parse.parse_qsl(payload.split("?", 1)[1], keep_blank_values=True, strict_parsing=True)
+
+    # T1
+    def test_the_code_carries_version_address_user_and_password_and_nothing_of_the_gateway(self) -> None:
+        self.gateway_secrets_in_env()
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        password = self.password_from(completed)
+        payload = self.decoded(completed)
+        self.assertEqual(payload, link_for(self.dashboard, "admin", password))
+        self.assertEqual([k for k, _ in self.fields(payload)], ["v", "url", "user", "pass"])
+        self.assertEqual(dict(self.fields(payload))["v"], "2")
+        # the Dashboard port may by chance spell 8642: look at what is left without the address
+        rest = payload.replace(link_for(self.dashboard, "admin").split("&user=")[0], "").lower()
+        for fragment in (self.CANARY.lower(), "canary", "token", "8642", "port=", "host=", "api_server", "key"):
+            self.assertNotIn(fragment, rest, fragment)
+        # the password is also in the text exactly once, the link nowhere in the text
+        self.assertEqual(completed.stdout.count(password), 1)
+        self.assertNotIn("hermes://", completed.stdout)
+        self.assertNotIn(self.CANARY, completed.stdout + completed.stderr)
+        self.assertIn("Scan it from Console", completed.stdout)
+
+    # T2
+    def test_with_an_earlier_sign_in_the_code_has_address_and_user_but_no_password(self) -> None:
+        first = self.dash()
+        password = self.password_from(first)
+        second = self.dash()
+        self.assertEqual(second.returncode, 0, second.stdout[-2000:] + second.stderr[-2000:])
+        payload = self.decoded(second)
+        self.assertEqual(payload, link_for(self.dashboard, "admin"))
+        self.assertEqual([k for k, _ in self.fields(payload)], ["v", "url", "user"])
+        self.assertNotIn(password, payload)
+        self.assertNotIn("pass", payload.replace("hermes://pair", ""))
+
+    def test_a_sign_in_pinned_in_env_gets_a_code_without_its_password(self) -> None:
+        (self.hermes / ".env").write_text(
+            'HERMES_DASHBOARD_BASIC_AUTH_USERNAME=owner\nHERMES_DASHBOARD_BASIC_AUTH_PASSWORD="from env 9x"\n',
+            encoding="utf-8")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        payload = self.decoded(completed)
+        self.assertEqual(payload, link_for(self.dashboard, "owner"))
+        self.assertNotIn("from", payload)
+
+    def test_another_provider_has_no_user_to_put_in_a_code_so_none_is_drawn(self) -> None:
+        (self.hermes / "config.json").write_text(
+            json.dumps({"dashboard": {"oauth": {"client_id": "abc"}}}, sort_keys=True), encoding="utf-8")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertNotIn(CODE_HEADING, completed.stdout)
+        self.assertNotIn("hermes://", completed.stdout)
+
+    def test_new_access_draws_the_new_password_and_the_old_one_is_not_in_it(self) -> None:
+        old = self.password_from(self.dash())
+        completed = self.dash("--new-access")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        new = self.password_from(completed)
+        payload = self.decoded(completed)
+        self.assertEqual(payload, link_for(self.dashboard, "admin", new))
+        self.assertNotIn(old, payload)
+        self.assertEqual(self.sign_in(old)[0], 401)
+
+    def test_a_password_given_on_stdin_is_in_the_code_with_symbols_encoded(self) -> None:
+        given = "my pass&word=%1+x"
+        completed = self.dash("--password-stdin", stdin=given + "\n")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        payload = self.decoded(completed)
+        self.assertEqual(payload, link_for(self.dashboard, "admin", given))
+        self.assertEqual(dict(self.fields(payload))["pass"], given)
+        self.assertNotIn(given, completed.stdout)
+
+    # T3
+    def test_when_no_way_of_drawing_works_the_setup_still_succeeds_and_says_what_to_type(self) -> None:
+        self.recorder("qrencode", status=1)
+        self.recorder("uv", status=1)
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        password = self.password_from(completed)
+        self.assertIn("I could not draw the code here; type these three details in Console.", completed.stdout)
+        self.assertIn(f"  address:  {self.dashboard}", completed.stdout)
+        self.assertIn("  user:     admin", completed.stdout)
+        self.assertNotIn(CODE_HEADING, completed.stdout)
+        self.assertEqual(self.sign_in(password)[0], 200)
+        # the three ways were really tried, in this order, and in the end nothing was left behind
+        self.assertTrue((self.capture / "qrencode.argv").exists())
+        self.assertTrue((self.capture / "uv.argv").exists())
+
+    def test_without_a_password_the_failure_message_asks_for_the_two_details(self) -> None:
+        self.password_from(self.dash())
+        self.recorder("qrencode", status=1)
+        self.recorder("uv", status=1)
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertIn("I could not draw the code here; type the address and the user in Console,", completed.stdout)
+
+    def test_the_second_way_is_the_python_of_hermes_when_it_has_qrcode(self) -> None:
+        self.recorder("qrencode", status=1)
+        self.recorder("uv", status=0, say="UV-DREW")
+        site = pathlib.Path(subprocess.run(
+            [str(self.hermes / "hermes-agent" / "venv" / "bin" / "python3"), "-c",
+             "import site; print(site.getsitepackages()[0])"], text=True, capture_output=True, check=True).stdout.strip())
+        (site / "qrcode.py").write_text(
+            "import sys\nclass QRCode:\n    def __init__(self, border=1): pass\n"
+            "    def add_data(self, data): self.data = data\n    def make(self): pass\n"
+            "    def print_ascii(self, invert=False): print('PYTHON-DREW ' + str(len(self.data)))\n", encoding="utf-8")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertIn("PYTHON-DREW", completed.stdout)
+        self.assertNotIn("UV-DREW", completed.stdout)
+        self.assertFalse((self.capture / "uv.argv").exists(), "uv ran although Python could draw")
+
+    def test_the_third_way_is_a_throwaway_uv_environment_with_the_pinned_library(self) -> None:
+        self.recorder("qrencode", status=1)
+        self.recorder("uv", status=0, say="UV-DREW")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertIn("UV-DREW", completed.stdout)
+        argv = (self.capture / "uv.argv").read_text().splitlines()
+        self.assertEqual(argv[:8], ["run", "--isolated", "--no-project", "--no-cache", "--with", "qrcode==8.2",
+                                    "python", "-c"], argv)
+        self.assertNotIn("--project", argv)
+        self.assertNotIn("--python", argv)
+
+    # T5
+    def test_the_password_goes_to_the_drawer_on_stdin_never_on_the_command_line(self) -> None:
+        password_run = self.dash()  # a first run only to learn the shape; the real run follows with new access
+        self.password_from(password_run)
+        for name in ("qrencode", "uv"):
+            self.recorder(name, status=1)
+        completed = self.dash("--new-access")
+        password = self.password_from(completed)
+        for name in ("qrencode", "uv"):
+            argv = (self.capture / (name + ".argv")).read_text()
+            self.assertNotIn(password, argv, name)
+            self.assertNotIn("hermes://", argv, name)
+            self.assertNotIn("pass=", argv, name)
+        self.assertIn(password, (self.capture / "qrencode.stdin").read_text())
+        self.assertIn(password, (self.capture / "uv.stdin").read_text())
+
+    def test_nothing_of_the_code_or_the_password_is_left_on_disk_or_in_the_logs(self) -> None:
+        self.gateway_secrets_in_env()
+        completed = self.dash()
+        password = self.password_from(completed)
+        self.assertNotIn(password.encode(), self.everything_on_disk())
+        for path in self.runtime.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(password.encode(), path.read_bytes(), str(path))
+        self.assertEqual(list(self.runtime.glob("*")), [])
+        self.assertEqual(list(self.home.rglob("*.png")), [])
+        for trail in ("python", "hermes", "systemctl", "ufw", "curl"):
+            self.assertNotIn(password, self.log(trail), trail)
+        self.assertNotIn("hermes://", self.everything_on_disk().decode("utf-8", "replace"))
+
+    def test_the_code_is_drawn_once(self) -> None:
+        completed = self.dash()
+        self.assertEqual(completed.stdout.count(CODE_HEADING), 1)
+
+    # T6
+    def test_no_code_is_drawn_for_help_for_remove_or_for_a_refused_option(self) -> None:
+        self.recorder("qrencode", status=0, say="DREW")
+        for arguments in (("--help",), ("--remove",), ("--retire-gateway-exposure",), ("--nonsense",)):
+            with self.subTest(arguments):
+                completed = self.dash(*arguments)
+                self.assertNotIn(CODE_HEADING, completed.stdout)
+                self.assertNotIn("DREW", completed.stdout)
+                self.assertNotIn("hermes://", completed.stdout + completed.stderr)
+        self.assertFalse((self.capture / "qrencode.argv").exists(), "a drawer ran")
+
+    def test_a_setup_that_fails_draws_no_code(self) -> None:
+        self.recorder("qrencode", status=0, say="DREW")
+        completed = self.dash(STANDIN_OPEN_DASHBOARD="1")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("did not refuse", completed.stdout + completed.stderr)
+        self.assertNotIn(CODE_HEADING, completed.stdout)
+        self.assertFalse((self.capture / "qrencode.argv").exists())
 
 
 @unittest.skipUnless(LINUX, "drives the Linux managers")

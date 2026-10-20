@@ -39,6 +39,7 @@ RMS = "RemoveSystemdTests."
 TXT = "SetupTextTests."
 INS = "InstallIfMissingTests."
 OLD = "OldInstallNoticeTests."
+QRC = "QrCodeTests."
 
 # id, what the guard is, (old, new[, all]), tests that must fail
 MUTANTS = [
@@ -376,6 +377,57 @@ MUTANTS = [
     ("M107", "macOS gets a package-manager command",
      ('git_cmd="xcode-select --install"', 'git_cmd="brew install git"'),
      [INS + "test_without_git_on_macos_it_names_xcode_select"]),
+    # S2d: the QR that Console scans
+    ("M108", "the link goes to the drawer on its command line",
+     ('QR_ART="$(printf \'%s\' "$QR_LINK" | "$@" 2>/dev/null)"', 'QR_ART="$(printf \'%s\' "$QR_LINK" | "$@" "$QR_LINK" 2>/dev/null)"'),
+     [QRC + "test_the_password_goes_to_the_drawer_on_stdin_never_on_the_command_line"]),
+    ("M109", "the Gateway key from .env goes into the code",
+     ('pairs = [("v", "2"), ("url", url), ("user", user)]',
+      'pairs = [("v", "2"), ("url", url), ("user", user), ("token", open(__import__("os").path.expanduser("~/.hermes/.env")).read().split("API_SERVER_KEY=")[1].split()[0])]'),
+     [QRC + "test_the_code_carries_version_address_user_and_password_and_nothing_of_the_gateway"]),
+    ("M110", "a Gateway port goes into the code",
+     ('pairs = [("v", "2"), ("url", url), ("user", user)]', 'pairs = [("v", "2"), ("url", url), ("user", user), ("port", "8642")]'),
+     [QRC + "test_the_code_carries_version_address_user_and_password_and_nothing_of_the_gateway"]),
+    ("M111", "the old version-1 format",
+     ('pairs = [("v", "2"), ', 'pairs = [("v", "1"), '),
+     [QRC + "test_the_code_carries_version_address_user_and_password_and_nothing_of_the_gateway"]),
+    ("M112", "a failed drawing ends the setup with an error",
+     ('      echo "I could not draw the code here; type these three details in Console."\n',
+      '      echo "I could not draw the code here; type these three details in Console."; exit 1\n'),
+     [QRC + "test_when_no_way_of_drawing_works_the_setup_still_succeeds_and_says_what_to_type"]),
+    ("M113", "the code is also kept in a file",
+     ('  QR_ART=""\n  QR_LINK=""\n}', '  printf \'%s\' "$QR_LINK" > "$HH/pairing-link.txt"\n  QR_ART=""\n  QR_LINK=""\n}'),
+     [QRC + "test_nothing_of_the_code_or_the_password_is_left_on_disk_or_in_the_logs"]),
+    ("M114", "the link is printed as text as well",
+     ('    printf \'%s\\n\' "$QR_ART"\n', '    printf \'%s\\n\' "$QR_ART"\n    echo "Link: $QR_LINK"\n'),
+     [QRC + "test_the_code_carries_version_address_user_and_password_and_nothing_of_the_gateway"]),
+    ("M115", "a code is drawn for another provider too",
+     ('if [ "$LOGIN_STATE" != "other" ] && [ -n "$LOGIN_USER" ]; then\n  draw_pairing_code', 'if true; then\n  draw_pairing_code'),
+     [QRC + "test_another_provider_has_no_user_to_put_in_a_code_so_none_is_drawn"]),
+    ("M116", "an earlier sign-in gets a password in the code",
+     ('[ "$LOGIN_STATE" != "created" ] || QR_PASS="${NEW_PASSWORD:-$DASH_PASSWORD}"',
+      'QR_PASS="${NEW_PASSWORD:-$DASH_PASSWORD}"; [ -n "$QR_PASS" ] || QR_PASS="x"'),
+     [QRC + "test_with_an_earlier_sign_in_the_code_has_address_and_user_but_no_password",
+      QRC + "test_a_sign_in_pinned_in_env_gets_a_code_without_its_password"]),
+    ("M117", "the Python of Hermes is never tried",
+     ('elif "$VP" -I -c \'import qrcode\' >/dev/null 2>&1 </dev/null && qr_try "$VP" -I -c "$QRPY"; then', 'elif false; then'),
+     [QRC + "test_the_second_way_is_the_python_of_hermes_when_it_has_qrcode"]),
+    ("M118", "uv keeps its environment and cache",
+     ("--isolated --no-project --no-cache --with qrcode==8.2", "--with qrcode==8.2"),
+     [QRC + "test_the_third_way_is_a_throwaway_uv_environment_with_the_pinned_library"]),
+    ("M119", "uv takes the newest library, not the pinned one",
+     ("--with qrcode==8.2", "--with qrcode"),
+     [QRC + "test_the_third_way_is_a_throwaway_uv_environment_with_the_pinned_library"]),
+    ("M120", "the password is not url-encoded",
+     ('print("hermes://pair?" + u.urlencode(pairs, quote_via=u.quote, safe=""))',
+      'print("hermes://pair?" + "&".join(k + "=" + v for k, v in pairs))'),
+     [QRC + "test_a_password_given_on_stdin_is_in_the_code_with_symbols_encoded"]),
+    ("M121", "the code is drawn twice",
+     ('  draw_pairing_code\nfi', '  draw_pairing_code\n  draw_pairing_code\nfi'),
+     [QRC + "test_the_code_is_drawn_once"]),
+    ("M122", "the code is drawn even when the setup failed its checks",
+     ('echo "ERROR: the Dashboard is running but failed its checks." >&2', 'echo "ERROR: the Dashboard is running but failed its checks." >&2; echo "== SCAN THIS CODE WITH CONSOLE =="'),
+     [QRC + "test_a_setup_that_fails_draws_no_code"]),
 ]
 
 

@@ -5,7 +5,7 @@ There is no PowerShell on the machines that run this suite (Linux CI, the
 maintainer's computers), so this file can NOT run the script. It reads it. What
 it proves is what a reader can prove from the text: the file is plain ASCII with
 no byte-order mark, its brackets and quotes balance, it keeps clear of the
-Gateway, the API key, the pairing code, downloads and personal data, each guard
+Gateway, the API key, the old pairing record, downloads and personal data, each guard
 that protects the user is written where it must be, and the Python it embeds is
 the same Python hermes-dashboard-setup.sh already tests against Hermes.
 
@@ -197,8 +197,11 @@ class SurfaceTests(unittest.TestCase):
         for fragment in ("Invoke-HermesPython", "Find-HermesLauncher", "hermes.exe", "Invoke-NativeProcess"):
             self.assertNotIn(fragment, code_only(self.retire), fragment)
 
-    def test_no_pairing_code_and_no_qr_outside_the_retire_path(self) -> None:
-        for fragment in ("hermes://pair", "qrencode", "qrcode", "pairing-qr", "pairing.json", "Write-PairingQr"):
+    def test_the_only_code_is_the_dashboard_one_and_it_never_names_the_gateway(self) -> None:
+        # S2d: one QR with v=2, url, user (and pass); no old pairing record, no Gateway field.
+        self.assertEqual(code_only(self.outside_retire).count("hermes://pair"), 1)
+        for fragment in ("pairing-qr", "pairing.json", "Write-PairingQr", "Render-Qr", "dash_user", "dash_pass",
+                         "PAIRING", '("token"', "token=", "host=", "port="):
             self.assertNotIn(fragment, self.outside_retire, fragment)
 
     def test_hermes_is_installed_only_by_the_official_installer_and_only_in_one_place(self) -> None:
@@ -258,6 +261,7 @@ class PasswordHandlingTests(unittest.TestCase):
         allowed = (
             "$givenPassword = $null", "$givenPassword = Read-PasswordFromStdin", '$stdinText = $givenPassword + "`n"',
             "$newPassword = ", "$secret = $newPassword", "if (-not $secret) { $secret = $givenPassword }",
+            "$codePassword = $secret",
             "-PasswordText $secret", "Write-Say \"  password: $newPassword\"", "if ($newPassword) {",
         )
         for number, line in enumerate(self.code.splitlines(), 1):
@@ -303,6 +307,59 @@ class EmbeddedPythonTests(unittest.TestCase):
         self.assertEqual(len(different), 1, different)
         self.assertIn("sys.stdin.buffer.readline().decode(\"utf-8\")", different[0][0])
         self.assertIn("sys.stdin.readline()", different[0][1])
+
+
+def sh_pairing_builder(sh: str) -> str:
+    match = re.search(r"\| \"\$VP\" -I -c '(import sys, urllib\.parse as u\n.*?)' 2>/dev/null\)\"", sh, re.S)
+    assert match, "the pairing builder is missing from the shell script"
+    return match.group(1)
+
+
+def ps1_pairing_builder(source: str) -> str:
+    block = re.search(r"\$builder = (.*?)\n    \$art = \"\"", source, re.S)
+    assert block, "the pairing builder is missing from the PowerShell script"
+    pieces = re.findall(r"'((?:[^']|'')*)'|\"(`n)\"", block.group(1))
+    return "".join("\n" if newline else text.replace("''", "'") for text, newline in pieces)
+
+
+class PairingCodeTextTests(unittest.TestCase):
+    """S2d: the code Console scans is built by the same Python in both scripts, and it is right."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = SCRIPT.read_text(encoding="ascii")
+        cls.sh = SH_SCRIPT.read_text(encoding="utf-8")
+        cls.builder = ps1_pairing_builder(cls.source)
+
+    def build(self, *lines: str, builder=None) -> str:
+        import subprocess
+        import sys
+        data = ("\n".join(lines) + "\n").encode("utf-8")
+        done = subprocess.run([sys.executable, "-I", "-c", builder or self.builder], input=data,
+                              capture_output=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        return done.stdout.decode("utf-8").strip()
+
+    def test_the_builder_is_python_and_the_same_as_the_shell_one(self) -> None:
+        ast.parse(self.builder)
+        self.assertEqual(self.builder, sh_pairing_builder(self.sh))
+
+    def test_the_link_has_the_version_the_address_the_user_and_the_password_in_this_order(self) -> None:
+        link = self.build("http://192.0.2.7:9119", "admin", "abcde-fghij-klmno-pqrst")
+        self.assertEqual(link, "hermes://pair?v=2&url=http%3A%2F%2F192.0.2.7%3A9119&user=admin"
+                               "&pass=abcde-fghij-klmno-pqrst")
+
+    def test_without_a_password_there_is_no_pass(self) -> None:
+        link = self.build("http://192.0.2.7:9119", "admin", "")
+        self.assertEqual(link, "hermes://pair?v=2&url=http%3A%2F%2F192.0.2.7%3A9119&user=admin")
+
+    def test_symbols_and_accents_are_encoded_as_utf8(self) -> None:
+        link = self.build("http://192.0.2.7:9119", "an\u00eda", "p&w=%1 \u00f1")
+        self.assertIn("&user=an%C3%ADa&pass=p%26w%3D%251%20%C3%B1", link)
+
+    def test_nothing_of_the_gateway_can_be_in_it(self) -> None:
+        for fragment in ("token", "host=", "port=", "API_SERVER", "env"):
+            self.assertNotIn(fragment, self.builder, fragment)
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +542,27 @@ GUARDS: list[tuple[str, str, list[str]]] = [
      [r'  address:  \$base', r'In Console: Type an address -> paste these three details\.']),
     ("G74", "-Remove does not touch the sign-in, the Gateway or Hermes",
      []),
+    ("G80", "the QR link is v=2 with url, user and pass, and nothing of the Gateway",
+     [r'pairs = \[\("v", "2"\), \("url", url\), \("user", user\)\] \+ \(\[\("pass", secret\)\] if secret else \[\]\)',
+      r'print\("hermes://pair\?" \+ u\.urlencode\(pairs, quote_via=u\.quote, safe=""\)\)']),
+    ("G81", "the link and the password go to the drawers on standard input only",
+     [r'-InputText \(\$Base \+ "`n" \+ \$UserName \+ "`n" \+ \$CodePassword \+ "`n"\)',
+      r'-InputText \$Link -TimeoutSeconds 120']),
+    ("G82", "the three ways of drawing, in order, with the pinned throwaway uv environment",
+     [r'@\("-t", "ANSIUTF8", "-l", "M"\)',
+      r'@\("-I", "-c", "import qrcode"\)\)\.Code -eq 0',
+      r'@\("run", "--isolated", "--no-project", "--no-cache", "--python", \$PythonPath,\s+"--with", "qrcode==8\.2", "python", "-c", \$drawer\)']),
+    ("G83", "if nothing draws the setup goes on and says what to type",
+     [r'Write-Say "I could not draw the code here; type these three details in Console\."',
+      r'Write-Say "I could not draw the code here; type the address and the user in Console, then the password\."\s+\}\s+return\s+\}']),
+    ("G84", "a code only for a sign-in with a user, and the password only when this run made it",
+     [r'if \(\$login\.STATE -ne "other" -and \$login\.USER\) \{\s+Show-PairingCode',
+      r'\$secret = \$newPassword\s+if \(-not \$secret\) \{ \$secret = \$givenPassword \}\s+\$codePassword = \$secret',
+      r'\$codePassword = ""\s+if \(\$login\.STATE -eq "created"\)']),
+    ("G85", "the password never reaches a command line, a file or a temporary picture",
+     []),
+    ("G86", "the code is drawn once, after the credentials and before the leftovers warning",
+     []),
     ("G66", "setup and rollback agree on the process tree of the old task",
      [r"\$t\.TaskTouched = \$true\s+if \(\$task\) \{ \[void\]\(Stop-DashboardTask"]),
 ]
@@ -507,6 +585,27 @@ def _make_guard_test(guard_id: str, description: str, patterns: list[str]):
             setup = re.search(r"^function Invoke-DashboardSetup \{.*?^\}\n", source, re.M | re.S).group(0)
             for fragment in ("Invoke-RetireGatewayExposure", "Invoke-RetireBridge", "Remove-Item -LiteralPath (Join-Path $services"):
                 self.assertNotIn(fragment, code_only(setup).replace("Remove-Item -LiteralPath $work", ""), fragment)
+        if guard_id == "G85":
+            region = "\n".join(re.search(r"^function " + name + r".*?^\}\n", source, re.M | re.S).group(0)
+                               for name in ("Invoke-QrDrawer", "Get-QrDrawing", "Show-PairingCode"))
+            body = code_only(region)
+            for fragment in ("Set-Content", "Out-File", "Add-Content", "GetTempPath", "GetTempFileName", "WriteAllText",
+                             "WriteAllBytes", "[IO.File]", "New-Item", "Start-Transcript", "-Environment", " > ", ">>",
+                             "$env:", "EnvironmentVariables", "Write-Output $Link", "Write-Say $link", "Write-Host $link"):
+                self.assertNotIn(fragment, body, f"{guard_id}: {fragment}")
+            for line in body.splitlines():
+                if "$CodePassword" in line:
+                    self.assertTrue("-InputText" in line or line.strip().startswith(("param(", "if ($CodePassword) {")),
+                                    f"{guard_id}: {line.strip()}")
+            self.assertEqual(body.count("-InputText"), 2, description)
+            return
+        if guard_id == "G86":
+            calls = [m.start() for m in re.finditer(r"Show-PairingCode -Base", source)]
+            self.assertEqual(len(calls), 1, description)
+            self.assertEqual(len(re.findall(r"Show-PairingCode\b", code_only(source))), 2, description)
+            self.assertGreater(calls[0], source.index('Write-Say "sign-in and changed no configuration.'), description)
+            self.assertLess(calls[0], source.index('Write-Say "WARNING: $services'), description)
+            return
         if guard_id == "G74":
             region = re.search(r"^function Invoke-RemoveDashboard.*?^}\n", source, re.M | re.S).group(0)
             body = code_only(region)
