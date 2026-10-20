@@ -43,6 +43,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = pathlib.Path(os.environ.get("DASHBOARD_ONLY_SCRIPT") or ROOT / "hermes-dashboard-setup.sh")
 OLD_SETUP = ROOT / "hermes-mobile-setup.sh"
 OFFICIAL_INSTALL = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+# S1-2: four groups of five from 32 symbols (no 0, o, 1, l): 100 bits.
+PASSWORD_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+PASSWORD_SHAPE = r"^[" + PASSWORD_ALPHABET + r"]{5}(-[" + PASSWORD_ALPHABET + r"]{5}){3}$"
 
 
 def _load(name: str, filename: str):
@@ -670,8 +673,10 @@ class SetupTests(DashRig):
         self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
         password = self.password_from(completed)
         self.assertIn("  user:     admin", completed.stdout)
-        self.assertIn(f"Dashboard: {self.dashboard}", completed.stdout)
-        self.assertIn("Gateway: not touched", completed.stdout)
+        self.assertIn(f"  address:  {self.dashboard}", completed.stdout)
+        self.assertIn("In Console: Type an address -> paste these three details.", completed.stdout)
+        self.assertNotIn("Gateway: not touched", completed.stdout)  # S1-6: jargon
+        self.assertRegex(password, PASSWORD_SHAPE)
         # Shown once, and only in the output.
         self.assertEqual(completed.stdout.count(password), 1)
         self.assertNotIn(password, completed.stderr)
@@ -699,7 +704,7 @@ class SetupTests(DashRig):
         self.assertEqual(list(self.runtime.glob("hermes-console-setup-*")), [])
         self.assertEqual(list(self.services.glob("setup-transaction.*")), [])
         runner = (self.services / "hermes-dashboard.sh").read_text()
-        self.assertIn(f'--host "{self.host}" --port "{self.dashboard_port}"', runner)
+        self.assertIn(f'PIN="{self.host}"', runner)  # chosen by hand: stays as chosen
         self.assertNotIn("0.0.0.0", runner)
         self.assertEqual(stat.S_IMODE((self.services / "hermes-dashboard.sh").stat().st_mode), 0o700)
 
@@ -1375,7 +1380,7 @@ class RetireGatewayExposureTests(DashRig):
         self.assertIn("kept as it is", completed.stdout)
         self.assertNotIn("  password:", completed.stdout)
         self.assertEqual(self.sign_in(old_password)[0], 200)
-        self.assertIn(f'--host "{self.host}"', (self.services / "hermes-dashboard.sh").read_text())
+        self.assertIn(f'PIN="{self.host}"', (self.services / "hermes-dashboard.sh").read_text())
         self.assertTrue(self.refused(host="127.0.0.1"))
         # The Gateway is the user's: same process, same runner, same key.
         self.assertEqual((self.services / "gateway.pid").read_text(), gateway_pid)
@@ -1393,6 +1398,314 @@ class RetireBridgeStillWorks(units.RetireBridgeTests):
         previous = units.SETUP
         units.SETUP = SCRIPT
         self.addCleanup(setattr, units, "SETUP", previous)
+
+
+@unittest.skipUnless(LINUX, "drives the Linux managers")
+class WrapperTests(unittest.TestCase):
+    """curl | sh: a download that stops half way must not run half a script."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = SCRIPT.read_bytes()
+        cls.source = cls.raw.decode("utf-8")
+
+    def test_everything_runs_from_one_function_called_on_the_last_line(self) -> None:
+        lines = [line for line in self.source.splitlines() if line.strip()]
+        self.assertEqual(lines[-1], 'main "$@" --end-of-script')
+        self.assertEqual(lines[-2], "}")
+        code = [line for line in lines if not line.startswith("#")]
+        self.assertEqual(code[0], "main() {", "nothing but the comment may run before main")
+
+    def run_piped(self, data: bytes, *arguments):
+        with tempfile.TemporaryDirectory(prefix="hermes-dash-cut-") as raw:
+            home = pathlib.Path(raw) / "home"
+            home.mkdir()
+            completed = subprocess.run(
+                ["sh", "-s", "--", *arguments], input=data, capture_output=True, timeout=30,
+                env={**os.environ, "HOME": str(home), "XDG_RUNTIME_DIR": raw, "TMPDIR": raw},
+            )
+            return completed, sorted(item.name for item in pathlib.Path(raw).iterdir())
+
+    def test_a_download_cut_anywhere_runs_nothing_and_changes_nothing(self) -> None:
+        size = len(self.raw)
+        cuts = {size * n // 40 for n in range(1, 40)}
+        cuts |= set(range(self.raw.rindex(b"\nmain"), size - 1))  # every cut inside the last line
+        for cut in sorted(cuts):
+            with self.subTest(bytes=cut):
+                completed, left = self.run_piped(self.raw[:cut])
+                self.assertEqual(completed.stdout, b"", "a cut script printed: " + completed.stdout[:200].decode())
+                self.assertEqual(left, ["home"], "a cut script left something behind")
+
+    def test_the_whole_script_piped_into_sh_still_takes_its_options(self) -> None:
+        completed, left = self.run_piped(self.raw, "--help")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"--new-access", completed.stdout)
+        self.assertEqual(left, ["home"])
+
+
+@unittest.skipUnless(LINUX, "drives the Linux managers")
+class PasswordShapeTests(unittest.TestCase):
+    """S1-2: a password a person can read out and type on a phone."""
+
+    def generator(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        match = re.search(r"^def new_password\(\):\n(?:    .*\n)+", source, re.M)
+        self.assertIsNotNone(match, "the sign-in code has no new_password()")
+        scope = {"secrets": __import__("secrets")}
+        exec(match.group(0), scope)  # the function itself, as Hermes will run it
+        return scope["new_password"]
+
+    def test_four_groups_of_five_without_look_alikes(self) -> None:
+        make = self.generator()
+        seen = [make() for _ in range(3000)]
+        for password in seen:
+            self.assertRegex(password, PASSWORD_SHAPE)
+        self.assertEqual(len(set(seen)), len(seen))
+        used = set("".join(seen).replace("-", ""))
+        self.assertEqual(used, set(PASSWORD_ALPHABET), "every symbol is used, and only those")
+        for ambiguous in "01lo":
+            self.assertNotIn(ambiguous, used)
+
+    def test_it_is_about_a_hundred_bits(self) -> None:
+        import math
+        self.assertGreaterEqual(20 * math.log2(len(PASSWORD_ALPHABET)), 98)
+
+    def test_it_is_drawn_with_secrets_not_with_random(self) -> None:
+        body = re.search(r"^def new_password\(\):\n(?:    .*\n)+", SCRIPT.read_text(encoding="utf-8"), re.M).group(0)
+        self.assertIn("secrets.choice", body)
+        self.assertNotIn("random.", body)
+
+
+class AddressRig(DashRig):
+    """Adds an `ip` whose answer the test decides, and a runner it can run."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ip_file = self.temp / "ip-says"
+        real = shutil.which("ip") or "/bin/true"
+        (self.mock_bin / "ip").write_text(
+            f'#!/bin/sh\nif [ -n "${{MOCK_IP_FILE:-}}" ]; then cat "$MOCK_IP_FILE"; exit 0; fi\nexec {real} "$@"\n',
+            encoding="utf-8")
+        (self.mock_bin / "ip").chmod(0o700)
+        self.runner = self.services / "hermes-dashboard.sh"
+        self.dash_log = self.hermes / "logs" / "dashboard.log"
+
+    def ip_says(self, *entries) -> None:
+        # `ip -o -4 addr show`: index, interface, family, address/prefix, ...
+        lines = []
+        for entry in entries:
+            name, address = entry if isinstance(entry, tuple) else ("eth0", entry)
+            lines.append(f"2: {name}    inet {address} brd 10.255.255.255 scope global {name}")
+        self.ip_file.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+    def tailscale_says(self, address) -> None:
+        body = f"#!/bin/sh\necho {address}\n" if address else "#!/bin/sh\nexit 1\n"
+        (self.mock_bin / "tailscale").write_text(body, encoding="utf-8")
+        (self.mock_bin / "tailscale").chmod(0o700)
+
+    def setup_unpinned(self):
+        self.ip_says(f"{self.host}/24")
+        completed = self.dash(HERMES_DASHBOARD_HOST="", MOCK_IP_FILE=str(self.ip_file))
+        self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
+        return completed
+
+    def runner_says(self):
+        done = subprocess.run([str(self.runner), "--print-address"], text=True, capture_output=True, timeout=30,
+                              env=self.environment(MOCK_IP_FILE=str(self.ip_file)), stdin=subprocess.DEVNULL)
+        return done.stdout.strip()
+
+    def run_runner_for(self, seconds):
+        process = subprocess.Popen([str(self.runner)], env=self.environment(MOCK_IP_FILE=str(self.ip_file)),
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        try:
+            return process.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            return None
+
+
+@unittest.skipUnless(LINUX, "drives the Linux managers")
+class RunnerAddressTests(AddressRig):
+    """S1-1: the address is worked out again every time the Dashboard starts."""
+
+    def test_the_runner_does_not_carry_the_address_it_found_at_setup(self) -> None:
+        self.setup_unpinned()
+        text = self.runner.read_text()
+        self.assertNotIn(self.host, text)
+        self.assertIn('PIN=""', text)
+        self.assertEqual(self.runner_says(), f"lan {self.host}")
+
+    def test_it_follows_the_network_the_way_setup_chose_it(self) -> None:
+        self.setup_unpinned()
+        self.ip_says("10.77.0.9/24")
+        self.assertEqual(self.runner_says(), "lan 10.77.0.9")
+        self.ip_says(("docker0", "172.17.0.1/16"), "10.77.0.9/24", "100.101.1.2/32")
+        self.assertEqual(self.runner_says(), "mesh 100.101.1.2")
+        self.tailscale_says("100.99.98.97")
+        self.assertEqual(self.runner_says(), "mesh 100.99.98.97")
+        self.tailscale_says("")
+        self.ip_says("8.8.8.8/24", ("docker0", "172.17.0.1/16"))
+        self.assertEqual(self.runner_says(), "", "a public or a container address is never chosen")
+
+    def test_a_changed_address_is_the_one_the_dashboard_starts_on_and_the_change_is_logged(self) -> None:
+        self.setup_unpinned()
+        for address in ("10.77.0.8", "10.77.0.9", "10.77.0.9"):
+            self.ip_says(f"{address}/24")
+            self.run_runner_for(20)  # the stand-in cannot bind it and ends; what it was told is what counts
+        started = [line for line in self.log("hermes").splitlines() if line.startswith("dashboard ")]
+        self.assertEqual([line.split()[2] for line in started[-3:]], ["10.77.0.8", "10.77.0.9", "10.77.0.9"])
+        text = self.dash_log.read_text()
+        self.assertIn(f"address changed: {self.host} -> 10.77.0.8", text)
+        self.assertIn("address changed: 10.77.0.8 -> 10.77.0.9", text)
+        self.assertEqual(text.count("address changed"), 2, "an unchanged address is not news")
+
+    def test_with_no_address_yet_it_waits_and_says_so_once(self) -> None:
+        self.setup_unpinned()
+        self.ip_says()
+        before = self.log("hermes").count("dashboard ")
+        self.assertIsNone(self.run_runner_for(3), "it must keep waiting, not exit and be restarted in a loop")
+        self.assertEqual(self.log("hermes").count("dashboard "), before)
+        self.assertEqual(self.dash_log.read_text().count("waiting for a LAN or Tailscale address"), 1)
+
+    def test_an_address_chosen_by_hand_stays_chosen(self) -> None:
+        completed = self.dash(MOCK_IP_FILE=str(self.ip_file))
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.ip_says("10.77.0.9/24")
+        self.assertEqual(self.runner_says(), f"chosen {self.host}")
+
+    def test_no_address_at_setup_still_stops_with_nothing_changed(self) -> None:
+        self.ip_says()
+        before = tree(self.hermes)
+        completed = self.dash(HERMES_DASHBOARD_HOST="", MOCK_IP_FILE=str(self.ip_file))
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("no LAN or Tailscale address", completed.stderr)
+        self.assertEqual(tree(self.hermes), before)
+
+
+@unittest.skipUnless(LINUX, "drives the Linux managers")
+class RemoveTests(DashRig):
+    """S1-3: take the Dashboard service away and leave everything else alone."""
+
+    def kept(self):
+        env = self.hermes / ".env"
+        return (self.config(), env.read_bytes() if env.exists() else b"")
+
+    def test_it_removes_the_service_and_keeps_the_sign_in_and_the_gateway(self) -> None:
+        self.dash()
+        before = self.kept()
+        completed = self.dash("--remove")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        self.assertTrue(self.refused(host=self.host), "the Dashboard still answers")
+        for name in ("hermes-dashboard.sh", "dashboard-service.py", "dashboard.pid", "dashboard.start",
+                     "dashboard.exe", "dashboard.address"):
+            self.assertFalse((self.services / name).exists(), name)
+        self.assertEqual(self.kept(), before, "config and .env are not ours to change")
+        self.assertTrue(self.basic().get("password_hash"), "the sign-in stays")
+        self.assert_gateway_untouched()
+        out = completed.stdout
+        self.assertIn("config.yaml", out)
+        self.assertIn("dashboard.basic_auth", out)
+        self.assertEqual(list(self.services.glob("setup-transaction.*")), [])
+
+    def test_twice_is_the_same_as_once(self) -> None:
+        self.dash()
+        self.dash("--remove")
+        after_first = tree(self.hermes)
+        completed = self.dash("--remove")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Nothing to remove", completed.stdout)
+        self.assertEqual(tree(self.hermes), after_first)
+
+    def test_a_computer_that_never_had_the_dashboard_gets_nothing_created(self) -> None:
+        before = tree(self.hermes)
+        completed = self.dash("--remove")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Nothing to remove", completed.stdout)
+        self.assertEqual(tree(self.hermes), before)
+
+    def test_it_does_not_need_hermes_to_be_there(self) -> None:
+        shutil.rmtree(self.hermes / "hermes-agent")
+        completed = self.dash("--remove")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+    def test_a_password_or_a_key_option_does_not_go_with_it(self) -> None:
+        for extra in ("--password-stdin", "--also-remove-api-key"):
+            completed = self.dash("--remove", extra)
+            self.assertEqual(completed.returncode, 2, extra)
+
+    def test_the_help_lists_it(self) -> None:
+        self.assertIn("--remove", self.dash("--help").stdout)
+
+
+@unittest.skipUnless(LINUX, "drives the Linux managers")
+class RemoveSystemdTests(DashRig):
+    def setUp(self) -> None:
+        super().setUp()
+        self.use_systemd()
+        self.unit = self.home / ".config" / "systemd" / "user" / "hermes-dashboard.service"
+
+    def test_the_unit_is_stopped_disabled_and_deleted(self) -> None:
+        self.dash()
+        self.assertTrue(self.unit.exists())
+        before = self.basic()
+        completed = self.dash("--remove")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        calls = self.log("systemctl")
+        self.assertIn("--user disable", calls)
+        self.assertIn("--user daemon-reload", calls.split("--user disable", 1)[1])
+        self.assertFalse(self.unit.exists())
+        self.assertTrue(self.refused(host=self.host))
+        self.assertEqual(self.basic(), before)
+        self.assertNotIn("hermes-gateway", calls)
+        self.assertEqual(self.dash("--remove").returncode, 0)
+
+    def test_a_unit_of_another_home_is_not_ours_to_remove(self) -> None:
+        self.dash()
+        text = self.unit.read_text().replace(str(self.hermes), str(self.temp / "other-home"))
+        self.unit.write_text(text)
+        completed = self.dash("--remove")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(self.unit.exists())
+
+
+@unittest.skipUnless(LINUX, "drives the Linux managers")
+class SetupTextTests(AddressRig):
+    """S1-4, S1-5 and S1-6: what the person reads."""
+
+    def test_the_wait_is_announced_before_it_starts_and_the_end_speaks_console(self) -> None:
+        completed = self.dash()
+        out = completed.stdout
+        self.assertIn("first start can take a few minutes", out.lower())
+        self.assertLess(out.lower().index("first start can take a few minutes"), out.index("Dashboard answers at"))
+        ready = out[out.index("DASHBOARD READY"):]
+        for line in (f"  address:  {self.dashboard}", "  user:     admin", "In Console: Type an address -> paste these three details."):
+            self.assertIn(line, ready)
+        self.assertNotIn("Gateway: not touched", out)
+
+    def test_who_already_had_access_is_told_in_plain_words_and_offered_new_access(self) -> None:
+        self.dash()
+        again = self.dash().stdout
+        ready = again[again.index("DASHBOARD READY"):]
+        self.assertIn(f"  address:  {self.dashboard}", ready)
+        self.assertIn("this setup cannot show it", ready)
+        self.assertIn("--new-access", ready)
+        self.assertNotIn("password:", ready)
+
+    def test_an_active_firewall_gets_the_real_network_not_a_blank_to_fill(self) -> None:
+        import ipaddress
+        network = ipaddress.ip_interface(f"{self.host}/24").network
+        self.ip_says(f"{self.host}/24")
+        for name, body in (("firewall-cmd", "#!/bin/sh\nexit 0\n"),):
+            (self.mock_bin / name).write_text(body, encoding="utf-8")
+            (self.mock_bin / name).chmod(0o700)
+        completed = self.dash(MOCK_IP_FILE=str(self.ip_file))
+        self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        out = completed.stdout
+        self.assertNotIn("<your network>", out)
+        self.assertIn(f'address="{network}" port port="{self.dashboard_port}" protocol="tcp" accept', out)
+        self.assertIn("firewall-cmd --reload", out)
 
 
 @unittest.skipUnless(LINUX, "drives the Linux managers")

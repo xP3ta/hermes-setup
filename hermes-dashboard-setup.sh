@@ -7,6 +7,17 @@
 # official installer leaves undone: it keeps the Dashboard on all the time, on
 # one LAN or Tailscale address, behind a sign-in, and shows the generated
 # password once.
+
+# Everything below is one function, called on the last line. A download that
+# stops half way (curl | sh) ends inside it, and a shell never runs half a
+# function; the call also carries an end marker, so a cut inside the last line
+# runs nothing either. The body is not indented, to keep the change reviewable.
+main() {
+for _hermes_last in "$@"; do :; done
+if [ "${_hermes_last:-}" != "--end-of-script" ]; then
+  echo "This script was cut short before its end, so nothing was run." >&2
+  exit 1
+fi
 set -eu
 
 # What to do. Piped from curl, an option goes after "sh -s --":
@@ -18,7 +29,9 @@ ALSO_REMOVE_KEY=0
 for _hermes_arg in "$@"; do
   _hermes_next=""
   case "$_hermes_arg" in
+    --end-of-script) ;;
     --new-access) _hermes_next="new-access" ;;
+    --remove) _hermes_next="remove" ;;
     --retire-gateway-exposure) _hermes_next="retire-gateway-exposure" ;;
     --retire-bridge) _hermes_next="retire-bridge" ;;
     -h|--help) _hermes_next="help" ;;
@@ -52,7 +65,7 @@ if [ "$ALSO_REMOVE_KEY" -eq 1 ] && [ "$ACTION" != "retire-gateway-exposure" ]; t
 fi
 case "$ACTION" in
   setup|new-access) ;;
-  retire-gateway-exposure|retire-bridge|help)
+  retire-gateway-exposure|retire-bridge|remove|help)
     if [ "$PASSWORD_STDIN" -eq 1 ]; then
       echo "--password-stdin only goes with setup or --new-access."
       exit 2
@@ -72,6 +85,8 @@ if [ "$ACTION" = "help" ]; then
   echo "  --new-access      Make a new Dashboard password and end the sessions of the old one."
   echo "  --password-stdin  Take the password from the first line of standard input"
   echo "                    instead of generating one (run the saved script, not a pipe)."
+  echo "  --remove          Stop the Dashboard and take its service away. Your Dashboard"
+  echo "                    sign-in, Hermes and the Gateway are not touched."
   echo "  --retire-gateway-exposure"
   echo "                    Undo what the earlier Console setup added to the Gateway:"
   echo "                    its network address and port and its pairing record. Your"
@@ -886,9 +901,61 @@ find_hermes_launcher() {
   return 1
 }
 
+# --remove: the Dashboard service and nothing else. The sign-in stays in
+# config.yaml, and Hermes and the Gateway are not touched. Safe to repeat.
+remove_dashboard() {
+  found=0
+  for item in "$DASHBOARD_RUNNER" "$DASH_HELPER" "$SERVICES/dashboard.pid" "$SERVICES/dashboard.start" \
+              "$SERVICES/dashboard.exe" "$SERVICES/dashboard.address" "$DASH_UNIT" "$DASH_PLIST"; do
+    if [ -e "$item" ] || [ -L "$item" ]; then found=1; fi
+  done
+  if [ "$found" -eq 0 ]; then
+    echo "Nothing to remove: this computer has no Dashboard service from this setup."
+    return 0
+  fi
+  step "Removing the Dashboard service"
+  case "$SERVICE_MANAGER" in
+    systemd)
+      systemctl --user disable --now hermes-dashboard >/dev/null 2>&1 || true
+      if systemctl --user is-active --quiet hermes-dashboard 2>/dev/null; then
+        echo "ERROR: systemd could not stop the Dashboard. Nothing was deleted." >&2
+        return 1
+      fi
+      rm -f "$DASH_UNIT"
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      ;;
+    launchd)
+      launchctl bootout "gui/$(id -u)/$DASH_LABEL" >/dev/null 2>&1 || true
+      rm -f "$DASH_PLIST"
+      ;;
+  esac
+  if [ -f "$DASH_HELPER" ]; then
+    remove_python="$(ownership_python)"
+    remove_rc=1
+    if [ -n "$remove_python" ]; then
+      remove_rc=0
+      "$remove_python" "$DASH_HELPER" stop "$DASHBOARD_RUNNER" "$SERVICES" "$LOGS" || remove_rc=$?
+    fi
+    if [ "$remove_rc" -ne 0 ]; then
+      echo "ERROR: the Dashboard could not be stopped safely (it may not be the one this setup started). Nothing was deleted." >&2
+      return 1
+    fi
+  fi
+  rm -f "$DASHBOARD_RUNNER" "$DASH_HELPER" "$SERVICES/dashboard.pid" "$SERVICES/dashboard.start" \
+        "$SERVICES/dashboard.exe" "$SERVICES/dashboard.address"
+  echo "The Dashboard was stopped and its service removed."
+  echo "Kept as it was: your Hermes, the Gateway and the Dashboard sign-in"
+  echo "(dashboard.basic_auth in $HH/config.yaml). To remove the sign-in too, delete"
+  echo "that block from config.yaml. Run this setup again, without --remove, to bring the Dashboard back."
+}
+
 step "Looking at this computer"
 select_service_manager
 preflight_service_ownership
+if [ "$ACTION" = "remove" ]; then
+  remove_dashboard
+  exit 0
+fi
 
 HB="$(find_hermes_launcher || true)"
 if [ -z "$HB" ]; then
@@ -966,43 +1033,21 @@ if ! HERMES_HOME="$HH" "$HP" -c 'import hermes_cli.config, plugins.dashboard_aut
 fi
 
 # ---- the address the Dashboard listens on ----------------------------------
-# Mesh VPN (Tailscale / CGNAT) first, then private LAN. Never a public address,
-# never 0.0.0.0: the Dashboard is bound to exactly one address.
-IPS=""
-if command -v ip >/dev/null 2>&1; then
-  IPS="$(ip -o -4 addr show 2>/dev/null | awk '$2 !~ /^(lo|docker|br-|veth|virbr|podman|cni|lxc)/ {if ($4 !~ /^(127\.|169\.254\.)/) print $4}' || true)"
-elif command -v ifconfig >/dev/null 2>&1; then
-  IPS="$(ifconfig 2>/dev/null | awk '/^[[:alnum:]]/ {iface=$1; sub(":$","",iface)} /inet / && iface !~ /^(lo|bridge|vmenet|docker|utun|awdl|llw)/ {ip=$2; sub(/^addr:/,"",ip); if (ip !~ /^(127\.|169\.254\.)/) print ip "/"}' || true)"
-elif command -v hostname >/dev/null 2>&1; then
-  IPS="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -Ev '^(127\.|169\.254\.)' | sed 's|$|/|' || true)"
-fi
-BIND_HOST="${HERMES_DASHBOARD_HOST:-}"
-NETWORK_KIND="chosen"
-if [ -z "$BIND_HOST" ]; then
-  BIND_HOST="$(tailscale ip -4 2>/dev/null | head -1 || true)"
-  if [ -n "$BIND_HOST" ]; then
-    NETWORK_KIND="mesh"
-  else
-    candidate="$(printf '%s\n' "$IPS" | grep -E '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' | head -1 || true)"
-    if [ -n "$candidate" ]; then
-      BIND_HOST="${candidate%%/*}"
-      NETWORK_KIND="mesh"
-    else
-      candidate="$(printf '%s\n' "$IPS" | grep -E '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' | head -1 || true)"
-      if [ -n "$candidate" ]; then
-        BIND_HOST="${candidate%%/*}"
-        NETWORK_KIND="lan"
-      fi
-    fi
-  fi
-fi
-if [ -z "$BIND_HOST" ]; then
-  echo "ERROR: no LAN or Tailscale address was found, so there is nothing safe to listen on." >&2
-  echo "Connect Tailscale or join the LAN, or choose one: HERMES_DASHBOARD_HOST=<private address>." >&2
-  echo "Nothing was changed." >&2
+# One address, never a public one and never 0.0.0.0: Tailscale (mesh VPN) first,
+# then the private LAN. The service runner works it out again at every start
+# (an address that changes with DHCP or a late Tailscale would otherwise leave
+# the Dashboard dead), so this run asks that same runner, written to the private
+# working folder first, which address it would use now.
+DASHBOARD_PORT="${HERMES_DASHBOARD_PORT:-9119}"
+case "$DASHBOARD_PORT" in
+  *[!0-9]*|'') echo "ERROR: HERMES_DASHBOARD_PORT must be a TCP port. Nothing was changed." >&2; exit 1 ;;
+esac
+if [ "$DASHBOARD_PORT" -lt 1 ] || [ "$DASHBOARD_PORT" -gt 65535 ]; then
+  echo "ERROR: HERMES_DASHBOARD_PORT is out of range. Nothing was changed." >&2
   exit 1
 fi
-if ! "$VP" -I - "$BIND_HOST" <<'PY_HOST'
+valid_dashboard_address() {
+  "$VP" -I - "$1" <<'PY_HOST'
 import ipaddress, sys
 
 try:
@@ -1014,23 +1059,82 @@ ula = ip.version == 6 and ip in ipaddress.ip_network("fc00::/7")
 private = ip.version == 4 and ip.is_private and not ip.is_loopback and not ip.is_link_local
 raise SystemExit(0 if (private or cgnat or ula) and not ip.is_unspecified else 1)
 PY_HOST
-then
+}
+PIN_HOST="${HERMES_DASHBOARD_HOST:-}"
+if [ -n "$PIN_HOST" ] && ! valid_dashboard_address "$PIN_HOST"; then
   echo "ERROR: HERMES_DASHBOARD_HOST must be one private LAN, Tailscale or unique-local address (not 0.0.0.0, loopback or a public one)." >&2
   echo "Nothing was changed." >&2
+  exit 1
+fi
+write_dashboard_runner() {
+  cat > "$1" <<EOF
+#!/bin/sh
+export HERMES_HOME="$HH"
+# systemd and launchd do not inherit the user's PATH: add the node Hermes manages
+# and the usual Homebrew locations so the Dashboard can build its web UI.
+export PATH="$HH/node/bin:$HH/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH"
+cd "$HH"
+HB="$HB"
+PORT="$DASHBOARD_PORT"
+LOG="$LOGS/dashboard.log"
+LAST="$SERVICES/dashboard.address"
+# An address chosen by hand (HERMES_DASHBOARD_HOST at setup) stays as chosen.
+PIN="$PIN_HOST"
+EOF
+  cat >> "$1" <<'EOF'
+# Prints "<kind> <address>", or nothing when there is no private address now.
+pick_address() {
+  if [ -n "$PIN" ]; then echo "chosen $PIN"; return 0; fi
+  found="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+  case "$found" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) echo "mesh $found"; return 0 ;; esac
+  ips=""
+  if command -v ip >/dev/null 2>&1; then
+    ips="$(ip -o -4 addr show 2>/dev/null | awk '$2 !~ /^(lo|docker|br-|veth|virbr|podman|cni|lxc)/ {if ($4 !~ /^(127\.|169\.254\.)/) print $4}' || true)"
+  elif command -v ifconfig >/dev/null 2>&1; then
+    ips="$(ifconfig 2>/dev/null | awk '/^[[:alnum:]]/ {iface=$1; sub(":$","",iface)} /inet / && iface !~ /^(lo|bridge|vmenet|docker|utun|awdl|llw)/ {ip=$2; sub(/^addr:/,"",ip); if (ip !~ /^(127\.|169\.254\.)/) print ip "/"}' || true)"
+  elif command -v hostname >/dev/null 2>&1; then
+    ips="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -Ev '^(127\.|169\.254\.)' | sed 's|$|/|' || true)"
+  fi
+  found="$(printf '%s\n' "$ips" | grep -E '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' | head -1 || true)"
+  if [ -n "$found" ]; then echo "mesh ${found%%/*}"; return 0; fi
+  found="$(printf '%s\n' "$ips" | grep -E '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' | head -1 || true)"
+  if [ -n "$found" ]; then echo "lan ${found%%/*}"; fi
+  return 0
+}
+if [ "${1:-}" = "--print-address" ]; then pick_address; exit 0; fi
+say() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG"; }
+told=0
+while :; do
+  set -- $(pick_address)
+  [ -z "${2:-}" ] || break
+  [ "$told" -eq 1 ] || say "waiting for a LAN or Tailscale address"
+  told=1
+  sleep 5
+done
+before="$(cat "$LAST" 2>/dev/null || true)"
+if [ -n "$before" ] && [ "$before" != "$2" ]; then say "address changed: $before -> $2"; fi
+printf '%s\n' "$2" > "$LAST"
+exec "$HB" dashboard --host "$2" --port "$PORT" --no-open >> "$LOG" 2>&1
+EOF
+}
+write_dashboard_runner "$WORK/hermes-dashboard.sh"
+PICKED="$(sh "$WORK/hermes-dashboard.sh" --print-address || true)"
+NETWORK_KIND="${PICKED%% *}"
+BIND_HOST="${PICKED#* }"
+if [ -z "$BIND_HOST" ]; then
+  echo "ERROR: no LAN or Tailscale address was found, so there is nothing safe to listen on." >&2
+  echo "Connect Tailscale or join the LAN, or choose one: HERMES_DASHBOARD_HOST=<private address>." >&2
+  echo "Nothing was changed." >&2
+  exit 1
+fi
+if ! valid_dashboard_address "$BIND_HOST"; then
+  echo "ERROR: the address found ($BIND_HOST) is not a private LAN, Tailscale or unique-local one. Nothing was changed." >&2
   exit 1
 fi
 case "$BIND_HOST" in
   *:*) BASE_HOST="[$BIND_HOST]" ;;
   *) BASE_HOST="$BIND_HOST" ;;
 esac
-DASHBOARD_PORT="${HERMES_DASHBOARD_PORT:-9119}"
-case "$DASHBOARD_PORT" in
-  *[!0-9]*|'') echo "ERROR: HERMES_DASHBOARD_PORT must be a TCP port. Nothing was changed." >&2; exit 1 ;;
-esac
-if [ "$DASHBOARD_PORT" -lt 1 ] || [ "$DASHBOARD_PORT" -gt 65535 ]; then
-  echo "ERROR: HERMES_DASHBOARD_PORT is out of range. Nothing was changed." >&2
-  exit 1
-fi
 DASHBOARD_BASE="http://$BASE_HOST:$DASHBOARD_PORT"
 
 # ---- service helpers --------------------------------------------------------
@@ -1502,7 +1606,15 @@ else:
 from plugins.dashboard_auth.basic import hash_password
 
 previous = {key: basic.get(key) for key in ("username", "password_hash", "password", "secret")}
-password = password_given or secrets.token_urlsafe(24)
+
+
+def new_password():
+    # Four groups of five from 32 symbols (no 0, o, 1, l): 100 bits a person can read out and type.
+    letters = "abcdefghijkmnpqrstuvwxyz23456789"
+    return "-".join("".join(secrets.choice(letters) for _ in range(5)) for _ in range(4))
+
+
+password = password_given or new_password()
 username = str(basic.get("username") or "").strip() or env.get("USERNAME") or "admin"
 basic["username"] = username
 basic["password_hash"] = hash_password(password)
@@ -1708,15 +1820,7 @@ case "$LOGIN_STATE" in
 esac
 
 step "Writing the Dashboard service"
-cat > "$DASHBOARD_RUNNER.new" <<EOF
-#!/bin/sh
-export HERMES_HOME="$HH"
-# systemd and launchd do not inherit the user's PATH: add the node Hermes manages
-# and the usual Homebrew locations so the Dashboard can build its web UI.
-export PATH="$HH/node/bin:$HH/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH"
-cd "$HH"
-exec "$HB" dashboard --host "$BIND_HOST" --port "$DASHBOARD_PORT" --no-open >> "$LOGS/dashboard.log" 2>&1
-EOF
+write_dashboard_runner "$DASHBOARD_RUNNER.new"
 chmod 700 "$DASHBOARD_RUNNER.new"
 mv "$DASHBOARD_RUNNER.new" "$DASHBOARD_RUNNER"
 
@@ -1818,6 +1922,7 @@ PY
 }
 
 step "Starting the Dashboard in the background"
+echo "The first start can take a few minutes: Hermes builds its web pages once."
 SERVICE_LIFECYCLE_TOUCHED=1
 case "$SERVICE_MANAGER" in
   systemd)
@@ -1905,38 +2010,47 @@ if [ "$LOGIN_STATE" = "created" ]; then
 fi
 
 printf '\n== DASHBOARD READY ==\n\n'
-echo "Dashboard: $DASHBOARD_BASE"
-echo "Gateway: not touched"
+if [ "$LOGIN_STATE" = "other" ]; then
+  echo "Address: $DASHBOARD_BASE"
+else
+  echo "To connect Console to this computer you need:"
+  echo "  address:  $DASHBOARD_BASE"
+  echo "  user:     $LOGIN_USER"
+fi
 case "$LOGIN_STATE" in
   created)
-    echo ""
-    echo "Sign in with:"
-    echo "  user:     $LOGIN_USER"
     if [ -n "$NEW_PASSWORD" ]; then
       echo "  password: $NEW_PASSWORD"
-      echo "This password is shown now and is not saved anywhere in clear."
-      echo "Forgot it later? Run this again with --new-access to make a new one."
+      echo ""
+      echo "In Console: Type an address -> paste these three details."
+      echo "This password is shown now, once, and is not saved anywhere in clear."
     else
-      echo "  password: as you gave it on standard input (not shown, not saved in clear)"
+      echo ""
+      echo "Your password is the one you gave on standard input (not shown, not saved in clear)."
+      echo "In Console: Type an address -> paste the address and the user, then type your password."
     fi
+    echo "Forgot it later? Run this again with --new-access to make a new one."
     echo "A sign-in kept only in an external secret source (a secret manager Hermes is set up"
     echo "to use) is not read by this setup: if you have one, this password was added next to it."
     ;;
   existing)
     echo ""
-    echo "The sign-in this Hermes already had was kept as it is, so no password is shown."
-    echo "Forgot it? Run this again with --new-access to make a new one."
+    echo "This computer already had a sign-in, which is kept as it is. Its password is only"
+    echo "stored scrambled, so this setup cannot show it: use the one you already have."
+    echo "In Console: Type an address -> paste the address and the user, then type that password."
+    echo "Forgot it? Run this again with --new-access: it makes a new password and signs out"
+    echo "everything that used the old one (the browser too)."
     ;;
   pinned)
     echo ""
-    echo "The password is written in $HH/.env (the lines that start with"
-    echo "HERMES_DASHBOARD_BASIC_AUTH_). This setup does not change that file."
-    echo "No new sign-in was made. Change it there and restart the Dashboard if you want another."
+    echo "The password is the one written in $HH/.env (the lines that start with"
+    echo "HERMES_DASHBOARD_BASIC_AUTH_). No new sign-in was made and that file was not changed."
+    echo "In Console: Type an address -> paste the address and the user, then type that password."
     ;;
   other)
     echo ""
-    echo "Another sign-in provider is configured for this Dashboard. No new sign-in was made"
-    echo "and the configuration was not changed."
+    echo "Another sign-in provider is configured for this Dashboard, so this setup made no"
+    echo "sign-in and changed no configuration. Use that provider's sign-in in Console."
     ;;
 esac
 if [ -f "$SERVICES/dashboard-login.json" ]; then
@@ -1950,10 +2064,28 @@ case "$SERVICE_MANAGER" in
   *) echo "Starts by itself after a restart: yes ($SERVICE_MANAGER)" ;;
 esac
 echo "Address: $BIND_HOST ($NETWORK_KIND), the only one the Dashboard listens on."
-if { command -v ufw >/dev/null 2>&1 && [ -r /etc/ufw/ufw.conf ] && grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; } || \
-   { command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; }; then
-  echo "A firewall is active here and this setup did not change it. If the app cannot connect,"
-  echo "allow TCP $DASHBOARD_PORT from your own network only, for example (ufw):"
-  echo "  sudo ufw allow from <your network> to any port $DASHBOARD_PORT proto tcp"
+case "$NETWORK_KIND" in
+  mesh) echo "Only devices signed in to your Tailscale can reach it: the phone needs Tailscale too." ;;
+  *) echo "The phone must be on this same network. Reserve this address for the computer in your router so it does not change." ;;
+esac
+if [ "$NETWORK_KIND" = "mesh" ]; then
+  FIREWALL_NET="100.64.0.0/10"
+else
+  FIREWALL_NET="$(ip -o -4 addr show 2>/dev/null | awk -v a="$BIND_HOST/" 'index($4, a) == 1 {print $4; exit}' || true)"
+  FIREWALL_NET="$("$VP" -I -c 'import ipaddress, sys; print(ipaddress.ip_interface(sys.argv[1]).network)' "$FIREWALL_NET" 2>/dev/null || true)"
+  [ -n "$FIREWALL_NET" ] || FIREWALL_NET="<your network, in CIDR form>"
+fi
+if command -v ufw >/dev/null 2>&1 && [ -r /etc/ufw/ufw.conf ] && grep -qi '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+  echo "A firewall (ufw) is active here and this setup did not change it. If Console cannot connect, allow"
+  echo "the Dashboard port from your own network only:"
+  echo "  sudo ufw allow from $FIREWALL_NET to any port $DASHBOARD_PORT proto tcp"
+fi
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  echo "A firewall (firewalld) is active here and this setup did not change it. If Console cannot connect, allow"
+  echo "the Dashboard port from your own network only:"
+  echo "  sudo firewall-cmd --permanent --add-rich-rule='rule family=\"ipv4\" source address=\"$FIREWALL_NET\" port port=\"$DASHBOARD_PORT\" protocol=\"tcp\" accept'"
+  echo "  sudo firewall-cmd --reload"
 fi
 echo "Keep the password private: whoever has it can use your Hermes."
+}
+main "$@" --end-of-script
