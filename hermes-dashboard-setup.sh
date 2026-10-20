@@ -988,6 +988,32 @@ install_hermes() {
   return "$install_status"
 }
 
+# The official installer needs git and stops without it. Installing git needs
+# privileges, so this only says what to type.
+require_git_for_installer() {
+  command -v git >/dev/null 2>&1 && return 0
+  if [ "$PLATFORM" = "macos" ]; then
+    git_cmd="xcode-select --install"
+  else
+    git_cmd=""
+    for git_pm in "apt-get install -y" "dnf install -y" "yum install -y" "pacman -S --noconfirm" "zypper install -y" "apk add"; do
+      command -v "${git_pm%% *}" >/dev/null 2>&1 || continue
+      git_cmd="${git_pm} git"
+      break
+    done
+    [ -z "$git_cmd" ] || [ "$(id -u 2>/dev/null)" = "0" ] || git_cmd="sudo $git_cmd"
+  fi
+  echo "git is required to install Hermes, and it is not installed. The official installer was not run." >&2
+  if [ -n "$git_cmd" ]; then
+    echo "Install it with:" >&2
+    echo "  $git_cmd" >&2
+  else
+    echo "Install it with your system package manager." >&2
+  fi
+  echo "Install it, then run this setup again. Nothing was changed." >&2
+  return 1
+}
+
 HB="$(find_hermes_launcher || true)"
 if [ -z "$HB" ]; then
   if find_hermes_launcher seen; then
@@ -1001,6 +1027,7 @@ if [ -z "$HB" ]; then
     echo "make two copies, so nothing was run. Nothing was changed." >&2
     exit 1
   fi
+  require_git_for_installer || exit 1
   echo "Hermes Agent is not installed on this computer: running its official installer."
   install_rc=0
   install_hermes || install_rc=$?
