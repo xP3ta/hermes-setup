@@ -15,18 +15,20 @@ class SyntaxStepTests(unittest.TestCase):
         step = source.split("- name: Validate POSIX and Bash syntax\n", 1)[1]
         block = step.split("run: |\n", 1)[1].split("\n      - name:", 1)[0]
         command = textwrap.dedent(block).strip()
-        with tempfile.TemporaryDirectory(prefix="ci-parse-closure-") as temp:
-            root = Path(temp)
-            (root / "tests").mkdir()
-            for name in ("hermes-mobile-setup.sh", "hermes-pair.sh",
-                         "tests/bootstrap-unix_test.sh"):
-                (root / name).write_text("#!/bin/sh\ntrue\n")
-            (root / "hermes-pair.sh").write_text("#!/bin/sh\nif (\n")
-            result = subprocess.run(["bash", "-e", "-c", command], cwd=root,
-                                    capture_output=True, timeout=10)
-            self.assertNotEqual(result.returncode, 0,
-                                "CI syntax gate ignored broken hermes-pair.sh")
-            self.assertIn(b"hermes-pair.sh", result.stderr)
+        # Whichever script is broken, the gate names it and fails.
+        for broken in ("hermes-pair.sh", "hermes-dashboard-setup.sh"):
+            with tempfile.TemporaryDirectory(prefix="ci-parse-closure-") as temp:
+                root = Path(temp)
+                (root / "tests").mkdir()
+                for name in ("hermes-mobile-setup.sh", "hermes-dashboard-setup.sh",
+                             "hermes-pair.sh", "tests/bootstrap-unix_test.sh"):
+                    (root / name).write_text("#!/bin/sh\ntrue\n")
+                (root / broken).write_text("#!/bin/sh\nif (\n")
+                result = subprocess.run(["bash", "-e", "-c", command], cwd=root,
+                                        capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0,
+                                    f"CI syntax gate ignored broken {broken}")
+                self.assertIn(broken.encode(), result.stderr)
 
 
 if __name__ == "__main__":

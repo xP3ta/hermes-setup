@@ -28,7 +28,7 @@ jobs:
       - name: Validate POSIX and Bash syntax
         shell: bash
         run: |
-          for script in hermes-mobile-setup.sh hermes-pair.sh; do
+          for script in hermes-mobile-setup.sh hermes-dashboard-setup.sh hermes-pair.sh; do
             sh -n "$script"
           done
           for script in tests/bootstrap-unix_test.sh; do
@@ -42,7 +42,7 @@ jobs:
           # portability idioms in the runtime scripts.
           shellcheck --severity=warning \
             --exclude=SC1007,SC1087,SC2015,SC2221,SC2222 \
-            hermes-mobile-setup.sh hermes-pair.sh
+            hermes-mobile-setup.sh hermes-dashboard-setup.sh hermes-pair.sh
           # The POSIX harness sources functions generated at runtime.
           shellcheck --severity=warning --exclude=SC1007,SC2034 \
             tests/bootstrap-unix_test.sh
@@ -76,6 +76,25 @@ jobs:
       # installed, but its file and manifest stay published for apps older than
       # 1.2.15 that still update a bridge they already have: the manifest must
       # describe the exact bytes, and the handlers keep their own suite.
+      # Dashboard-only setup (hermes-dashboard-setup.sh): the thin complement to
+      # the official Hermes installer. Sign-in decision against Hermes' own
+      # registry calls, one bind address, rollback, --new-access, and the two
+      # cleanups (--retire-gateway-exposure, --retire-bridge), in disposable
+      # homes with a stand-in Hermes (nothing is installed or fetched).
+      - name: Dashboard-only setup
+        shell: bash
+        run: python3 tests/dashboard-only_test.py
+
+      # The Windows version of the same setup (hermes-dashboard-setup.ps1). There
+      # is no PowerShell on this runner, so this suite READS the script: plain
+      # ASCII, balanced brackets, no Gateway, no API key, no download, no
+      # personal data, every guard written where it must be, and the sign-in code
+      # identical to the one the suite above runs against Hermes. It does not
+      # prove the script works on Windows: the windows job below runs it.
+      - name: Dashboard-only setup for Windows (static contract)
+        shell: bash
+        run: python3 tests/dashboard-only-windows_test.py
+
       - name: Legacy (bridge-era installs) - manifest, handlers, old installs
         shell: bash
         run: |
@@ -104,7 +123,7 @@ jobs:
       - name: Locate the offending block when /bin/sh refuses to parse
         shell: bash
         run: |
-          for script in hermes-mobile-setup.sh hermes-pair.sh; do
+          for script in hermes-mobile-setup.sh hermes-dashboard-setup.sh hermes-pair.sh; do
             if ! sh -n "$script"; then
               echo "::warning::$script does not parse with /bin/sh; bisecting"
               python3 tests/sh_parse_bisect.py /bin/sh || true
@@ -114,7 +133,7 @@ jobs:
       - name: Validate POSIX syntax on BSD userland
         shell: bash
         run: |
-          for script in hermes-mobile-setup.sh hermes-pair.sh; do
+          for script in hermes-mobile-setup.sh hermes-dashboard-setup.sh hermes-pair.sh; do
             sh -n "$script"
           done
 
@@ -185,6 +204,15 @@ jobs:
       - name: Parse and test with PowerShell 7
         shell: pwsh
         run: ./tests/powershell_test.ps1
+
+      # Dashboard-only setup for Windows: the pure functions, the Dashboard probe
+      # against a stand-in server on loopback, the generated runner under
+      # wscript, and both clean-ups in a throw-away home. Nothing is installed.
+      # Windows PowerShell 5.1 only: that is what the script targets and what it
+      # was run on; PowerShell 7 has not been tried.
+      - name: Dashboard-only setup for Windows (behaviour)
+        shell: powershell
+        run: ./tests/dashboard-only-windows.Tests.ps1
 
       # Native suite on a real Windows Server runner: Job Objects, Scheduled
       # Tasks, CIM inventory, firewall filters executable overrides and process

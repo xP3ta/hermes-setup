@@ -5,7 +5,8 @@ $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $PowerShellFiles = @(
     (Join-Path $Root "hermes-mobile-setup.ps1"),
-    (Join-Path $Root "hermes-pair.ps1")
+    (Join-Path $Root "hermes-pair.ps1"),
+    (Join-Path $Root "hermes-dashboard-setup.ps1")
 )
 
 foreach ($path in $PowerShellFiles) {
