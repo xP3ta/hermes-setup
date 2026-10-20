@@ -101,7 +101,7 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("S01", "no API server variable outside the retire", "$script:OfficialInstallUrl =", "$env:API_SERVER_HOST = \"x\"\n$script:OfficialInstallUrl =", "test_nothing_outside_the_retire_path_knows_the_api_server"),
     ("S02", "the retire never stops a service", "    Write-Say \"Your Gateway was not stopped or restarted. It keeps listening as it was\"", "    Stop-ScheduledTask -TaskName x\n    Write-Say \"Your Gateway was not stopped or restarted. It keeps listening as it was\"", "test_the_retire_path_never_stops_starts_or_removes"),
     ("S03", "the retire never runs Hermes", "    $removeKey = ($AlsoRemoveKey", "    $null = Find-HermesLauncher $HermesHome\n    $removeKey = ($AlsoRemoveKey", "test_the_retire_path_does_not_run_hermes"),
-    ("S04", "no pairing code outside the retire", "$script:OfficialInstallUrl =", "$q = \"qrcode\"\n$script:OfficialInstallUrl =", "test_no_pairing_code_and_no_qr"),
+    ("S04", "no old pairing record outside the retire", "$script:OfficialInstallUrl =", "$q = \"pairing.json\"\n$script:OfficialInstallUrl =", "test_the_only_code_is_the_dashboard_one"),
     ("S05", "it downloads nothing but the official installer", "$script:OfficialInstallUrl =", "Invoke-WebRequest -Uri x\n$script:OfficialInstallUrl =", "test_hermes_is_installed_only_by_the_official_installer"),
     ("S06", "no firewall switched off", "$script:OfficialInstallUrl =", "Set-NetFirewallProfile -Enabled False\n$script:OfficialInstallUrl =", "test_the_firewall_is_never_switched_off"),
     ("S07", "no elevation of its own", "$script:OfficialInstallUrl =", "Start-Process x -Verb RunAs\n$script:OfficialInstallUrl =", "test_it_does_not_ask_for_elevation"),
@@ -136,6 +136,20 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("G78", "the installer keeps -NonInteractive", '@("-NonInteractive", "-SkipBrowser", "-SkipComputerUse")', '@("-SkipBrowser", "-SkipComputerUse")', "test_G78_"),
     ("G79", "an old Bridge is reported with its command", "run this setup again with -RetireBridge", "run this setup again", "test_G79_"),
     ("G79b", "setup never retires the old Gateway exposure by itself", '        $oldGateway = (Test-GatewayExposurePresent $HermesHome)', '        $null = Invoke-RetireGatewayExposure $HermesHome $false\n        $oldGateway = (Test-GatewayExposurePresent $HermesHome)', "test_G79_"),
+    # S2d: the QR that Console scans
+    ("Q01", "the password goes to the builder as an argument", '@("-I", "-c", $builder) `', '@("-I", "-c", $builder, $CodePassword) `', "test_G85_"),
+    ("Q02", "a Gateway token goes into the code", '("user", user)] + ([("pass"', '("user", user), ("token", "x")] + ([("pass"', "test_G80_"),
+    ("Q03", "the old version-1 format", '[("v", "2"), ("url", url)', '[("v", "1"), ("url", url)', "test_G80_"),
+    ("Q04", "a failed drawing stops the setup", '            Write-Say "I could not draw the code here; type these three details in Console."', '            throw "I could not draw the code here; type these three details in Console."', "test_G83_"),
+    ("Q05", "the drawing is kept in a temporary file", "    Write-Say $art\n", '    $art | Out-File -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) "code.txt")\n    Write-Say $art\n', "test_G85_"),
+    ("Q06", "a code is drawn for another provider too", 'if ($login.STATE -ne "other" -and $login.USER) {', "if ($true) {", "test_G84_"),
+    ("Q07", "uv keeps its environment", '"run", "--isolated", "--no-project"', '"run", "--no-project"', "test_G82_"),
+    ("Q08", "uv takes the newest library", '"qrcode==8.2"', '"qrcode"', "test_G82_"),
+    ("Q09", "the link is drawn on the command line of the drawer", '-InputText $Link -TimeoutSeconds 120', '-TimeoutSeconds 120', "test_G81_"),
+    ("Q10", "the code is drawn twice", "        $codePassword = \"\"\n        if (Test-Path", "        Show-PairingCode -Base $base -UserName $login.USER -CodePassword $codePassword -Python $python -HermesHome $HermesHome\n        $codePassword = \"\"\n        if (Test-Path", "test_G86_"),
+    ("Q11", "an earlier sign-in gets a password in the code", "            $codePassword = $secret\n", "", "test_G84_"),
+    ("Q12", "the builder is no longer the shell one", 'safe=""))\'', 'safe="x"))\'', "test_the_builder_is_python_and_the_same_as_the_shell_one"),
+    ("Q13", "the password is not url-encoded", "u.urlencode(pairs, quote_via=u.quote, safe=\"\")", "\"&\".join(k + \"=\" + v for k, v in pairs)", "test_the_link_has_the_version"),
 ]
 
 def run_suite(script: pathlib.Path) -> tuple[int, str]:

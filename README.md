@@ -4,7 +4,7 @@ One-command installer that connects a self-hosted [Hermes Agent](https://hermes-
 
 ## Dashboard only (Console 1.3)
 
-Console 1.3 talks to the **Dashboard** and nothing else. One command does it all: if Hermes is **missing** it runs the **official installer** (`--non-interactive --skip-browser --skip-computer-use`) and nothing else, and if Hermes is already there it **never** runs it. That installer needs `git`: on Linux or macOS, if Hermes is missing and `git` is not installed, the setup runs nothing, changes nothing and prints the command to install it (for example `sudo apt-get install -y git`; on macOS `xcode-select --install`), then you run it again. It never installs `git` itself. Then it keeps the Dashboard on. It creates no API key, does not touch the Gateway and shows no pairing code:
+Console 1.3 talks to the **Dashboard** and nothing else. One command does it all: if Hermes is **missing** it runs the **official installer** (`--non-interactive --skip-browser --skip-computer-use`) and nothing else, and if Hermes is already there it **never** runs it. That installer needs `git`: on Linux or macOS, if Hermes is missing and `git` is not installed, the setup runs nothing, changes nothing and prints the command to install it (for example `sudo apt-get install -y git`; on macOS `xcode-select --install`), then you run it again. It never installs `git` itself. Then it keeps the Dashboard on. It creates no API key, does not touch the Gateway and ends with a QR code that carries only the Dashboard sign-in:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/hermes-dashboard-setup.sh | sh
@@ -12,7 +12,9 @@ curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/her
 
 How it decides: Hermes counts as installed when its launcher is in the places the installers use (`~/.hermes/hermes-agent/...`, `~/.hermes/bin`, `~/.local/bin`) and answers. A launcher that is there but does not answer, or a `hermes` found elsewhere on `PATH`, stops the setup with nothing changed (the official installer would update or repair it, or make a second copy). If the official installation does not finish, the setup says so and changes nothing.
 
-The commands point at a reviewed release label (`setup-v1.6.0`), not at `main`: what you run is what was reviewed. The setup ends by printing three details: the **address**, the **user** and the **password**. In Console, choose **Type an address** and paste them.
+The commands point at a reviewed release label (`setup-v1.6.0`), not at `main`: what you run is what was reviewed. The setup ends by printing three details: the **address**, the **user** and the **password**, and a **QR code**: scan it from Console and it is connected, nothing typed. Without a camera, choose **Type an address** and paste the three details.
+
+The QR code (Console 1.3, also on Windows) is `hermes://pair?v=2&url=<Dashboard address>&user=<user>&pass=<password>` and nothing else: no Gateway token, host or port, and nothing is read from `.env`. When a sign-in already existed there is no password to show, so the code carries only `v=2`, the address and the user, and Console asks for the password once. It is drawn with what is already there, in this order, and nothing is installed for good: `qrencode`, the Python of Hermes if it has `qrcode`, or a throwaway `uv` environment (`qrcode==8.2`, discarded afterwards). The password goes to the drawer on standard input, never on a command line or in a file (on Windows the picture is not written to a file either); the code is shown once, in this terminal only, not saved, not logged and not printed as a link. If none of the three can draw it, the setup still succeeds and says to type the details. Whoever photographs the code has the password: run `--new-access` to change it. Console 1.2.x does not read this code (it shows "not a valid code").
 
 The second command keeps the Dashboard on at all times (a user service that starts with the machine and restarts itself: `systemd --user` on Linux, `launchd` on macOS), listening on **one** LAN or Tailscale address, behind a sign-in. It asks nothing: it picks the address (Tailscale first, then the private LAN) and shows the generated password **once**, at the end: four groups of five letters and digits without look-alikes (no `0`, `o`, `1`, `l`; about 100 bits), easy to read out and type on a phone. The address is worked out again every time the Dashboard starts, so a new DHCP address or a late Tailscale does not leave it dead (a line in `logs/dashboard.log` says when it changed; an address you chose with `HERMES_DASHBOARD_HOST` stays as chosen). Reserve the computer's address in your router anyway. The password is stored only as Hermes' own scrypt hash in `config.yaml`; it is never an argument of any command and never written in clear.
 
@@ -39,7 +41,7 @@ The all-in-one installer in the next section keeps working for Console 1.2.15 to
 The same complement for native Windows (**Windows PowerShell 5.1 or newer**, not
 WSL; tried on Windows 11, see the end of this subsection). One command: if Hermes is missing it runs the official installer
 (`-NonInteractive -SkipBrowser -SkipComputerUse`, in a PowerShell of its own) and nothing else; if Hermes is there it never runs it.
-It creates no API key, does not touch the Gateway and shows no pairing code:
+It creates no API key, does not touch the Gateway and ends with the same QR code (below):
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/xP3ta/hermes-setup/setup-v1.6.0/hermes-dashboard-setup.ps1)))

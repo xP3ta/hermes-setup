@@ -6,7 +6,8 @@
 # runs the official installer and nothing else; if Hermes is there it never runs
 # it. It does not touch the Gateway. It does the one thing the official
 # installer leaves undone: it keeps the Dashboard on all the time, on one LAN or
-# Tailscale address, behind a sign-in, and shows the generated password once.
+# Tailscale address, behind a sign-in, shows the generated password once and
+# draws a QR code that Console scans to connect (the Dashboard sign-in only).
 
 # Everything below is one function, called on the last line. A download that
 # stops half way (curl | sh) ends inside it, and a shell never runs half a
@@ -81,6 +82,7 @@ if [ "$ACTION" = "help" ]; then
   echo ""
   echo "  (no option)       Keep the Dashboard on at all times, on your LAN or Tailscale"
   echo "                    address, behind a sign-in. A password is generated and shown once."
+  echo "                    It ends with a QR code for Console (nothing is installed to draw it)."
   echo "                    If Hermes is missing, its official installer runs first."
   echo "                    A sign-in that already exists is kept as it is."
   echo "  --new-access      Make a new Dashboard password and end the sessions of the old one."
@@ -2074,12 +2076,71 @@ fi
 echo "Dashboard answers at $DASHBOARD_BASE, refuses whoever is not signed in${NEW_PASSWORD:+ and accepts the new sign-in}"
 
 commit_transaction
+# The code carries the password only when this run made it (or was given it).
+QR_PASS=""
+[ "$LOGIN_STATE" != "created" ] || QR_PASS="${NEW_PASSWORD:-$DASH_PASSWORD}"
 DASH_PASSWORD=""
 # The earlier setup kept its Dashboard password in clear in this file. A new
 # sign-in makes that record stale, so it goes with it.
 if [ "$LOGIN_STATE" = "created" ]; then
   rm -f "$SERVICES/dashboard-login.json"
 fi
+
+# The QR Console scans: hermes://pair with v=2, url, user and, when this run made
+# the password, pass. Only the Dashboard sign-in goes in; no Gateway key, host or port is read or written.
+# The password reaches the builder and the drawer on standard input: never on a
+# command line, never in a file; the picture goes to this terminal only, once.
+# Drawing uses what is there, in this order, and leaves nothing behind:
+# qrencode, the Python of Hermes if it has qrcode, a throwaway uv environment.
+draw_pairing_code() {
+  QR_ART=""
+  QR_LINK="$(printf '%s\n%s\n%s\n' "$DASHBOARD_BASE" "$LOGIN_USER" "$QR_PASS" | "$VP" -I -c 'import sys, urllib.parse as u
+url, user, secret = (sys.stdin.buffer.readline().decode("utf-8").rstrip("\r\n") for _ in range(3))
+pairs = [("v", "2"), ("url", url), ("user", user)] + ([("pass", secret)] if secret else [])
+print("hermes://pair?" + u.urlencode(pairs, quote_via=u.quote, safe=""))' 2>/dev/null)" || QR_LINK=""
+  QRPY='import sys, qrcode
+sys.stdout.reconfigure(encoding="utf-8")
+q = qrcode.QRCode(border=1)
+q.add_data(sys.stdin.read())
+q.make()
+q.print_ascii(invert=True)'
+  qr_try() { QR_ART="$(printf '%s' "$QR_LINK" | "$@" 2>/dev/null)" && [ -n "$QR_ART" ]; }
+  QR_DRAWN=""
+  if [ -z "$QR_LINK" ]; then
+    :
+  elif command -v qrencode >/dev/null 2>&1 && qr_try qrencode -t ANSIUTF8 -l M; then
+    QR_DRAWN=1
+  elif "$VP" -I -c 'import qrcode' >/dev/null 2>&1 </dev/null && qr_try "$VP" -I -c "$QRPY"; then
+    QR_DRAWN=1
+  else
+    UV="$HH/bin/uv"
+    [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
+    if [ -n "$UV" ] && qr_try "$UV" run --isolated --no-project --no-cache --with qrcode==8.2 python -c "$QRPY"; then
+      QR_DRAWN=1
+    fi
+  fi
+  echo ""
+  if [ -z "$QR_DRAWN" ]; then
+    if [ -n "$QR_PASS" ]; then
+      echo "I could not draw the code here; type these three details in Console."
+    else
+      echo "I could not draw the code here; type the address and the user in Console, then the password."
+    fi
+  else
+    echo "== SCAN THIS CODE WITH CONSOLE =="
+    echo ""
+    printf '%s\n' "$QR_ART"
+    echo ""
+    if [ -n "$QR_PASS" ]; then
+      echo "Scan it from Console. It carries the password: keep it off photos and shared screens."
+      echo "It is drawn here once and is not saved."
+    else
+      echo "Scan it from Console: it carries the address and the user; Console asks for the password once."
+    fi
+  fi
+  QR_ART=""
+  QR_LINK=""
+}
 
 printf '\n== DASHBOARD READY ==\n\n'
 if [ "$LOGIN_STATE" = "other" ]; then
@@ -2125,6 +2186,10 @@ case "$LOGIN_STATE" in
     echo "sign-in and changed no configuration. Use that provider's sign-in in Console."
     ;;
 esac
+if [ "$LOGIN_STATE" != "other" ] && [ -n "$LOGIN_USER" ]; then
+  draw_pairing_code
+fi
+QR_PASS=""
 if [ -f "$SERVICES/dashboard-login.json" ]; then
   echo ""
   echo "WARNING: $SERVICES/dashboard-login.json still holds a Dashboard password"
