@@ -680,7 +680,7 @@ class SourceContractTests(unittest.TestCase):
             self.assertNotIn(fragment, self.source)
         # No address written out in full except the two that are not anyone's.
         quads = set(re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", self.source))
-        self.assertLessEqual(quads, {"100.64.0.0", "0.0.0.0"}, quads)
+        self.assertLessEqual(quads, {"100.64.0.0", "0.0.0.0", "127.0.0.1"}, quads)
         tests_text = pathlib.Path(__file__).read_text(encoding="utf-8")
         self.assertNotIn("/home/xp" + "eta", tests_text)
 
@@ -1186,6 +1186,165 @@ class SystemdTests(DashRig):
 
 
 @unittest.skipUnless(LINUX, "drives the Linux managers")
+class ExistingServiceSafetyTests(DashRig):
+    """Issue 220: an installed Dashboard service is never replaced without a diff,
+    a confirmation and a backup. Everything runs in the rig's temporary home with
+    a stand-in systemctl; nothing of the machine running the tests is touched."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.use_systemd()
+        self.unit = self.home / ".config" / "systemd" / "user" / "hermes-dashboard.service"
+        self.runner = self.services / "hermes-dashboard.sh"
+
+    def installed(self):
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
+        return completed
+
+    def edit_unit(self, old, new):
+        text = self.unit.read_text()
+        self.assertIn(old, text)
+        self.unit.write_text(text.replace(old, new), encoding="utf-8")
+        self.unit.chmod(0o640)
+        return self.unit.read_bytes()
+
+    def backups(self, path):
+        return sorted(path.parent.glob(path.name + ".bak-*"))
+
+    def restarts(self):
+        return self.log("systemctl").count("--user restart hermes-dashboard")
+
+    def test_no_existing_unit_installs_without_a_prompt_or_backup(self) -> None:
+        completed = self.installed()
+        self.assertTrue(self.unit.exists())
+        self.assertEqual(self.backups(self.unit), [])
+        self.assertEqual(self.backups(self.runner), [])
+        self.assertNotIn("--yes", completed.stdout + completed.stderr)
+
+    def test_dry_run_on_a_clean_machine_changes_nothing(self) -> None:
+        before = tree(self.home)
+        completed = self.dash("--dry-run")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
+        self.assertIn("Dry run", completed.stdout)
+        self.assertFalse(self.unit.exists())
+        self.assertFalse(self.runner.exists())
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(tree(self.home), before)
+
+    def test_an_identical_unit_is_not_rewritten_or_restarted(self) -> None:
+        self.installed()
+        unit_before = self.unit.read_bytes()
+        runner_before = self.runner.read_bytes()
+        mtimes = (self.unit.stat().st_mtime_ns, self.runner.stat().st_mtime_ns)
+        restarts = self.restarts()
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
+        self.assertIn("already up to date", completed.stdout.lower())
+        self.assertEqual(self.unit.read_bytes(), unit_before)
+        self.assertEqual(self.runner.read_bytes(), runner_before)
+        self.assertEqual((self.unit.stat().st_mtime_ns, self.runner.stat().st_mtime_ns), mtimes)
+        self.assertEqual(self.restarts(), restarts)
+        self.assertEqual(self.backups(self.unit), [])
+
+    def test_a_different_unit_without_yes_aborts_and_leaves_every_file_alone(self) -> None:
+        self.installed()
+        self.edit_unit("RestartSec=2\n", "RestartSec=2\nEnvironment=MINE=1\n")
+        before = tree(self.home)
+        restarts = self.restarts()
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 3, completed.stdout[-3000:] + completed.stderr[-3000:])
+        self.assertIn("--yes", completed.stderr)
+        self.assertIn("-Environment=MINE=1", completed.stdout)
+        self.assertEqual(tree(self.home), before)
+        self.assertEqual(self.restarts(), restarts)
+
+    def test_yes_backs_up_the_old_unit_then_writes_the_new_one_and_restore_works(self) -> None:
+        self.installed()
+        modified = self.edit_unit("RestartSec=2\n", "RestartSec=2\nEnvironment=MINE=1\n")
+        runner_before = self.runner.read_bytes()
+        completed = self.dash("--yes")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
+        backups = self.backups(self.unit)
+        self.assertEqual(len(backups), 1, completed.stdout)
+        self.assertRegex(backups[0].name, r"^hermes-dashboard\.service\.bak-\d{8}T\d{6}$")
+        self.assertEqual(backups[0].read_bytes(), modified)
+        self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o640)
+        self.assertNotIn("Environment=MINE=1", self.unit.read_text())
+        self.assertEqual(self.runner.read_bytes(), runner_before)
+        self.assertIn(str(backups[0]), completed.stdout)
+        self.assertIn("cp -p", completed.stdout)
+        # Restoring is the documented plain copy.
+        shutil.copy2(backups[0], self.unit)
+        self.assertEqual(self.unit.read_bytes(), modified)
+
+    def test_the_restart_policy_of_the_installed_unit_is_kept(self) -> None:
+        self.installed()
+        self.edit_unit("Restart=on-failure", "Restart=always")
+        completed = self.dash()
+        self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
+        self.assertIn("Restart=always", self.unit.read_text())
+        self.assertIn("already up to date", completed.stdout.lower())
+        self.edit_unit("RestartSec=2\n", "RestartSec=2\nEnvironment=MINE=1\n")
+        completed = self.dash("--force")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
+        self.assertIn("Restart=always", self.unit.read_text())
+
+    def test_dry_run_over_a_different_unit_shows_the_plan_and_changes_nothing(self) -> None:
+        self.installed()
+        self.edit_unit("RestartSec=2\n", "RestartSec=2\nEnvironment=MINE=1\n")
+        before = tree(self.home)
+        changing = ("daemon-reload", "enable", "disable", "restart", "start", "stop")
+        calls = [l for l in self.log("systemctl").splitlines() if l.split()[1:2] and l.split()[1] in changing]
+        completed = self.dash("--dry-run")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
+        self.assertIn("-Environment=MINE=1", completed.stdout)
+        self.assertIn("Backups that would be made", completed.stdout)
+        self.assertIn("Dry run", completed.stdout)
+        self.assertEqual(tree(self.home), before)
+        self.assertEqual([l for l in self.log("systemctl").splitlines() if l.split()[1:2] and l.split()[1] in changing], calls)
+
+    def test_an_existing_loopback_bind_is_kept_and_reported(self) -> None:
+        self.installed()
+        text = self.runner.read_text()
+        self.assertIn('PIN="%s"' % self.host, text)
+        self.runner.write_text(text.replace('PIN="%s"' % self.host, 'PIN="127.0.0.1"'), encoding="utf-8")
+        self.runner.chmod(0o700)
+        completed = self.dash("--dry-run", HERMES_DASHBOARD_HOST="")
+        self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
+        self.assertIn("bind 127.0.0.1 (chosen by hand)", completed.stdout)
+        self.assertIn("This run:       bind 127.0.0.1", completed.stdout)
+        self.assertIn("already up to date", completed.stdout.lower())
+
+    def test_moving_the_bind_needs_confirmation_and_is_backed_up(self) -> None:
+        self.installed()
+        text = self.runner.read_text()
+        self.runner.write_text(text.replace('PIN="%s"' % self.host, 'PIN="127.0.0.1"'), encoding="utf-8")
+        self.runner.chmod(0o700)
+        before = tree(self.home)
+        refused = self.dash()
+        self.assertEqual(refused.returncode, 3, refused.stdout[-3000:] + refused.stderr[-3000:])
+        self.assertIn("127.0.0.1 (chosen by hand)", refused.stdout)
+        self.assertIn(self.host, refused.stdout)
+        self.assertEqual(tree(self.home), before)
+        confirmed = self.dash("--yes")
+        self.assertEqual(confirmed.returncode, 0, confirmed.stdout[-3000:] + confirmed.stderr[-3000:])
+        backups = self.backups(self.runner)
+        self.assertEqual(len(backups), 1)
+        self.assertIn('PIN="127.0.0.1"', backups[0].read_text())
+        self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o700)
+        self.assertIn('PIN="%s"' % self.host, self.runner.read_text())
+        self.assertRegex(confirmed.stdout, r"Bind: was 127\.0\.0\.1 \(chosen by hand\) -> now " + re.escape(self.host))
+
+    def test_the_new_flags_are_checked(self) -> None:
+        for arguments in (("--bind", self.host, "--rebind"), ("--bind",), ("--dry-run", "--remove"), ("--yes", "--retire-bridge")):
+            before = tree(self.home)
+            completed = self.dash(*arguments)
+            self.assertEqual(completed.returncode, 2, (arguments, completed.stdout[-1500:], completed.stderr[-1500:]))
+            self.assertEqual(tree(self.home), before)
+
+
+@unittest.skipUnless(LINUX, "drives the Linux managers")
 class RetireGatewayExposureTests(DashRig):
     """Against what the previous script really leaves: it is run first."""
 
@@ -1252,8 +1411,11 @@ class RetireGatewayExposureTests(DashRig):
     def test_new_access_over_an_old_install_drops_its_clear_password_record(self) -> None:
         link = self.old_setup()
         self.assertTrue(self.login_file.exists())
-        completed = self.dash("--new-access")
+        completed = self.dash("--new-access", "--yes")
         self.assertEqual(completed.returncode, 0, completed.stdout[-2000:] + completed.stderr[-2000:])
+        records = sorted(self.login_file.parent.glob("dashboard-login.json.bak-*"))
+        self.assertEqual(len(records), 1, completed.stdout[-2000:])
+        self.assertIn("Backups of what was replaced", completed.stdout)
         renewed = self.password_from(completed)
         self.assertFalse(self.login_file.exists())
         self.assertEqual(self.sign_in(renewed)[0], 200)
@@ -1394,7 +1556,7 @@ class RetireGatewayExposureTests(DashRig):
         helper_before = (self.services / "service-manager.sh").read_bytes()
         # The old dashboard listens on every address; setup narrows it to one.
         self.assertFalse(self.refused(host="127.0.0.1") and False)
-        completed = self.dash()
+        completed = self.dash("--yes")
         self.assertEqual(completed.returncode, 0, completed.stdout[-3000:] + completed.stderr[-3000:])
         self.assertIn("kept as it is", completed.stdout)
         self.assertNotIn("  password:", completed.stdout)

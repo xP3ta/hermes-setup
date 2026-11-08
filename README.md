@@ -24,9 +24,9 @@ The setup keeps the Dashboard on at all times (a user service that starts with t
 - Forgot it? `curl -fsSL https://raw.githubusercontent.com/xP3ta/hermes-setup/main/hermes-dashboard-setup.sh | sh -s -- --new-access` makes a new one and ends the sessions of the old one (the browser and Desktop too).
 - `--remove` stops the Dashboard and removes its service (the systemd unit, the launchd job or the portable runner). It does not touch `config.yaml` (the sign-in stays: `dashboard.basic_auth`), Hermes or the Gateway, and it is safe to repeat.
 - Piped from `curl`, the script is one function called on its last line, with an end marker: a download that stops half way runs nothing.
-- Choose the address or port: `HERMES_DASHBOARD_HOST=<private address>`, `HERMES_DASHBOARD_PORT=<port>`. Only a private LAN, Tailscale or unique-local address is accepted, never `0.0.0.0`.
+- Choose the address or port: `--bind <private address>` (or `HERMES_DASHBOARD_HOST=<private address>`), `HERMES_DASHBOARD_PORT=<port>`. Only a private LAN, Tailscale or unique-local address is accepted when *you* choose one, never `0.0.0.0` or loopback. An address or port the installed service already uses is kept on a re-run (see below).
 - A sign-in that exists only in an external secret source (a secret manager Hermes is set up to use) is not read by this setup, which looks at `config.yaml` and `.env`; if you have one, the new password is added next to it, and the setup says so.
-- If the earlier Console setup left `console-services/dashboard-login.json` (the Dashboard password in clear), the setup warns about it whenever it keeps that file, and deletes it when it makes a new sign-in.
+- If the earlier Console setup left `console-services/dashboard-login.json` (the Dashboard password in clear), the setup warns about it whenever it keeps that file, and, when it makes a new sign-in, backs it up (`dashboard-login.json.bak-<timestamp>`, same permissions) and then deletes it.
 - The service restarts itself if the network is not up yet when the machine starts (no start-rate limit, so a slow Tailscale cannot leave it failed).
 - Your own password: save the script, then `sh hermes-dashboard-setup.sh --password-stdin < file` (the first line is the password).
 - `--retire-gateway-exposure` undoes only what the earlier Console setup exposed on the Gateway: the network address and port (`API_SERVER_HOST` and `API_SERVER_PORT`, in the Gateway runner and in its systemd drop-in) and the pairing record. **Your `API_SERVER_KEY` is kept**: the earlier setup reuses a key that was already in `.env`, so it can belong to Open WebUI, a cron provider or another client of yours, and without a usable key Hermes does not start its API server at all. It does not stop the Gateway: it keeps listening as it was until the Gateway is restarted, and then Hermes' API server binds its default, this computer only (unless you set a host yourself).
@@ -34,6 +34,29 @@ The setup keeps the Dashboard on at all times (a user service that starts with t
 - `--retire-bridge` is the same cleanup of the old Mobile Bridge described under [Legacy](#legacy-bridge-era-installs).
 - If the earlier Console setup (Console 1.2) left its Gateway exposure (network address and port, or pairing record) or the old Mobile Bridge, the setup **tells you at the end and names the two options, but changes nothing**: a phone still on Console 1.2 would stop working. Run them yourself when every phone uses Console 1.3.
 - The official installer runs with `--non-interactive`, so the model/provider stays unset: choose it from the Dashboard (Console). On Windows, use the PowerShell version in the next subsection.
+
+### Running it again on a machine that already has the Dashboard service
+
+The Dashboard setup is idempotent only in this sense: running it again converges on the same service files, and it **never replaces a different, already-installed `hermes-dashboard.service` (or its runner) silently**. Before anything is written it reads what is installed (the unit, the runner `console-services/hermes-dashboard.sh`, which holds the address and port, and the `Restart=` policy) and then:
+
+- **Nothing installed:** it installs the service, no questions asked.
+- **Identical to what it would write:** it prints `already up to date` and neither rewrites the files nor restarts the service (it still checks the sign-in and the Dashboard, and starts the service if it is not running).
+- **Different:** it prints a unified diff and the old bind/port to the new bind/port, and asks `[y/N]` when run from a terminal. Run non-interactively (for example piped from `curl`, or from a script) it **aborts with exit code 3 and changes nothing** unless you pass `--yes` (or `--force`).
+- **Always before replacing:** a timestamped backup is made next to the original with the same permissions: `hermes-dashboard.service.bak-YYYYmmddTHHMMSS`, `hermes-dashboard.sh.bak-...` (on macOS the launchd plist), and `dashboard-login.json.bak-...` before that file is removed. The final summary lists them with the restore command.
+- **The existing bind is kept by default.** If the installed runner already listens on `0.0.0.0`, on loopback, or on a Tailscale/LAN address this computer still has, a re-run keeps it (and the installed port, unless you set `HERMES_DASHBOARD_PORT`). It moves only if you pass `--bind <address>` (or set `HERMES_DASHBOARD_HOST`), or `--rebind` (choose Tailscale, then the private LAN, as on a first install); the move is shown in the diff and needs confirmation. A previous address that this computer no longer has is replaced by the automatic one, also shown and confirmed. On a fresh install nothing changes: the Dashboard is never opened to `0.0.0.0` by the setup itself.
+- **`Restart=`:** the installed policy (for example `always`) is kept; a new unit gets `on-failure`.
+
+Flags (setup and `--new-access` only): `--dry-run` shows the diff, the old to new bind and the backups it would make, then exits 0 without writing, restarting or removing anything (a throw-away working folder and the usual one-setup-at-a-time lock are the only things it touches, both removed on exit); `--yes` / `--force` confirms the replacement without asking; `--bind <address>`; `--rebind`. `--remove` does not take a backup of the files it removes.
+
+To restore a backup:
+
+```sh
+cp -p ~/.config/systemd/user/hermes-dashboard.service.bak-20260101T120000 ~/.config/systemd/user/hermes-dashboard.service
+cp -p ~/.hermes/console-services/hermes-dashboard.sh.bak-20260101T120000 ~/.hermes/console-services/hermes-dashboard.sh
+systemctl --user daemon-reload && systemctl --user restart hermes-dashboard
+```
+
+Only the Linux/macOS shell script has these safeguards; the PowerShell script is unchanged.
 
 Tried on a clean Debian 13 (shell version): Hermes installed with the official installer, a repeat run with no call to the installer, a restart, `--new-access`, `--remove`, and the QR code drawn and decoded (`v=2`, `url`, `user`, `pass`; no token, host or port). **Not tried**: macOS and a real VPS.
 
