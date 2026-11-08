@@ -8,6 +8,9 @@
 # installer leaves undone: it keeps the Dashboard on all the time, on one LAN or
 # Tailscale address, behind a sign-in, shows the generated password once and
 # draws a QR code that Console scans to connect (the Dashboard sign-in only).
+#
+# An existing, different Dashboard service is never replaced silently: it is shown
+# as a diff, confirmed (or --yes), and backed up first (see --help, --dry-run).
 
 # Everything below is one function, called on the last line. A download that
 # stops half way (curl | sh) ends inside it, and a shell never runs half a
@@ -27,8 +30,18 @@ ACTION="setup"
 ACTION_SET=""
 PASSWORD_STDIN=0
 ALSO_REMOVE_KEY=0
+DRY_RUN=0
+ASSUME_YES=0
+REBIND=0
+BIND_ARG=""
+_hermes_want_bind=0
 for _hermes_arg in "$@"; do
   _hermes_next=""
+  if [ "$_hermes_want_bind" -eq 1 ] && [ "$_hermes_arg" != "--end-of-script" ]; then
+    BIND_ARG="$_hermes_arg"
+    _hermes_want_bind=0
+    continue
+  fi
   case "$_hermes_arg" in
     --end-of-script) ;;
     --new-access) _hermes_next="new-access" ;;
@@ -38,6 +51,11 @@ for _hermes_arg in "$@"; do
     -h|--help) _hermes_next="help" ;;
     --password-stdin) PASSWORD_STDIN=1 ;;
     --also-remove-api-key) ALSO_REMOVE_KEY=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --yes|--force) ASSUME_YES=1 ;;
+    --rebind) REBIND=1 ;;
+    --bind) _hermes_want_bind=1 ;;
+    --bind=*) BIND_ARG="${_hermes_arg#--bind=}"; [ -n "$BIND_ARG" ] || BIND_ARG="-" ;;
     --password|--password=*)
       # The value is never echoed: a password on a command line is a leak.
       echo "Unknown option: --password"
@@ -60,6 +78,27 @@ for _hermes_arg in "$@"; do
     ACTION="$_hermes_next"
   fi
 done
+if [ "$_hermes_want_bind" -eq 1 ]; then
+  echo "--bind needs an address: --bind <private LAN or Tailscale address>."
+  exit 2
+fi
+if [ "$BIND_ARG" = "-" ]; then
+  echo "--bind needs an address: --bind <private LAN or Tailscale address>."
+  exit 2
+fi
+if [ -n "$BIND_ARG" ] && [ "$REBIND" -eq 1 ]; then
+  echo "Choose one: --bind <address> or --rebind."
+  exit 2
+fi
+case "$ACTION" in
+  setup|new-access) ;;
+  *)
+    if [ "$DRY_RUN" -eq 1 ] || [ "$ASSUME_YES" -eq 1 ] || [ "$REBIND" -eq 1 ] || [ -n "$BIND_ARG" ]; then
+      echo "--dry-run, --yes, --force, --bind and --rebind only go with setup or --new-access."
+      exit 2
+    fi
+    ;;
+esac
 if [ "$ALSO_REMOVE_KEY" -eq 1 ] && [ "$ACTION" != "retire-gateway-exposure" ]; then
   echo "--also-remove-api-key only goes with --retire-gateway-exposure."
   exit 2
@@ -86,6 +125,15 @@ if [ "$ACTION" = "help" ]; then
   echo "                    If Hermes is missing, its official installer runs first."
   echo "                    A sign-in that already exists is kept as it is."
   echo "  --new-access      Make a new Dashboard password and end the sessions of the old one."
+  echo "                    An existing Dashboard service that would change is shown as a diff"
+  echo "                    and needs your confirmation (or --yes); its old files are backed up."
+  echo "  --dry-run         Show what would be installed, changed and backed up, and stop."
+  echo "                    Nothing is written, restarted or removed."
+  echo "  --yes, --force    Do not ask: replace an existing, different Dashboard service"
+  echo "                    (a timestamped backup is always kept). Needed when not run from a terminal."
+  echo "  --bind <address>  Listen on this private LAN or Tailscale address (same as"
+  echo "                    HERMES_DASHBOARD_HOST). Without it an existing bind is kept."
+  echo "  --rebind          Ignore the existing bind and choose Tailscale, then the private LAN."
   echo "  --password-stdin  Take the password from the first line of standard input"
   echo "                    instead of generating one (run the saved script, not a pipe)."
   echo "  --remove          Stop the Dashboard and take its service away. Your Dashboard"
@@ -123,7 +171,7 @@ esac
 if [ "$PLATFORM" = "linux" ] && { [ -n "${WSL_INTEROP:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; }; then
   case "$ACTION" in
     setup|new-access)
-      if [ -z "${HERMES_DASHBOARD_HOST:-}" ]; then
+      if [ -z "${HERMES_DASHBOARD_HOST:-}" ] && [ -z "$BIND_ARG" ]; then
         echo "WSL detected. Its automatic IP is not reliably reachable from a phone, so"
         echo "nothing was changed. Advanced routed WSL setups may set HERMES_DASHBOARD_HOST"
         echo "explicitly to an address the phone can reach."
@@ -1029,6 +1077,11 @@ if [ -z "$HB" ]; then
     echo "make two copies, so nothing was run. Nothing was changed." >&2
     exit 1
   fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "Dry run: Hermes Agent is not installed here, so a real run would first run its official installer"
+    echo "and then install the Dashboard service. Nothing was changed."
+    exit 0
+  fi
   require_git_for_installer || exit 1
   echo "Hermes Agent is not installed on this computer: running its official installer."
   install_rc=0
@@ -1112,7 +1165,13 @@ fi
 # (an address that changes with DHCP or a late Tailscale would otherwise leave
 # the Dashboard dead), so this run asks that same runner, written to the private
 # working folder first, which address it would use now.
-DASHBOARD_PORT="${HERMES_DASHBOARD_PORT:-9119}"
+# What an earlier run left is read, never run: the port and the address it chose
+# are kept unless this run is told otherwise (HERMES_DASHBOARD_PORT, --bind, --rebind).
+OLD_RUNNER_PORT=""
+if [ -f "$DASHBOARD_RUNNER" ] && [ ! -L "$DASHBOARD_RUNNER" ]; then
+  OLD_RUNNER_PORT="$(sed -n 's/^PORT="\([0-9][0-9]*\)"$/\1/p' "$DASHBOARD_RUNNER" | head -1)"
+fi
+DASHBOARD_PORT="${HERMES_DASHBOARD_PORT:-${OLD_RUNNER_PORT:-9119}}"
 case "$DASHBOARD_PORT" in
   *[!0-9]*|'') echo "ERROR: HERMES_DASHBOARD_PORT must be a TCP port. Nothing was changed." >&2; exit 1 ;;
 esac
@@ -1134,9 +1193,9 @@ private = ip.version == 4 and ip.is_private and not ip.is_loopback and not ip.is
 raise SystemExit(0 if (private or cgnat or ula) and not ip.is_unspecified else 1)
 PY_HOST
 }
-PIN_HOST="${HERMES_DASHBOARD_HOST:-}"
+PIN_HOST="${BIND_ARG:-${HERMES_DASHBOARD_HOST:-}}"
 if [ -n "$PIN_HOST" ] && ! valid_dashboard_address "$PIN_HOST"; then
-  echo "ERROR: HERMES_DASHBOARD_HOST must be one private LAN, Tailscale or unique-local address (not 0.0.0.0, loopback or a public one)." >&2
+  echo "ERROR: --bind / HERMES_DASHBOARD_HOST must be one private LAN, Tailscale or unique-local address (not 0.0.0.0, loopback or a public one)." >&2
   echo "Nothing was changed." >&2
   exit 1
 fi
@@ -1191,6 +1250,81 @@ printf '%s\n' "$2" > "$LAST"
 exec "$HB" dashboard --host "$2" --port "$PORT" --no-open >> "$LOG" 2>&1
 EOF
 }
+
+# ---- the bind an existing runner already has --------------------------------
+# The runner (not the systemd unit) holds the address. It is read as text.
+OLD_BIND_DESC="none (no Dashboard service of this setup is installed)"
+OLD_BIND_KEEP=""
+OLD_BIND_NOTE=""
+if [ -f "$DASHBOARD_RUNNER" ] && [ ! -L "$DASHBOARD_RUNNER" ]; then
+  old_pin="$(sed -n 's/^PIN="\([^"$`\\]*\)"$/\1/p' "$DASHBOARD_RUNNER" | head -1)"
+  old_host="$(sed -n 's/^exec .*[[:space:]]dashboard[[:space:]][[:space:]]*--host[[:space:]][[:space:]]*\([^[:space:]]*\).*/\1/p' "$DASHBOARD_RUNNER" | head -1)"
+  old_host="$(printf '%s' "$old_host" | tr -d "\"'")"
+  old_last="$(sed -n '1p' "$SERVICES/dashboard.address" 2>/dev/null || true)"
+  # shellcheck disable=SC2016  # '$2' is the text the runner template writes
+  if [ -n "$old_host" ] && [ "$old_host" != '$2' ]; then
+    OLD_BIND_DESC="$old_host (fixed in the runner)"
+    case "$old_host" in *'$'*|*'`'*) ;; *) OLD_BIND_KEEP="$old_host" ;; esac
+  elif [ -n "$old_pin" ]; then
+    OLD_BIND_DESC="$old_pin (chosen by hand)"
+    OLD_BIND_KEEP="$old_pin"
+  else
+    OLD_BIND_DESC="automatic: Tailscale, then the private LAN${old_last:+ (last used: $old_last)}"
+  fi
+fi
+# 0.0.0.0, loopback and an address this computer has are all kept; anything else is not.
+classify_bind() {
+  "$VP" -I - "$1" <<'PY_CLASSIFY'
+import ipaddress, sys
+
+try:
+    ip = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    print("invalid")
+    raise SystemExit(0)
+print("any" if ip.is_unspecified else "loopback" if ip.is_loopback else "address")
+PY_CLASSIFY
+}
+host_has_address() {
+  wanted="$1"
+  listed=""
+  if command -v ip >/dev/null 2>&1; then
+    listed="$(ip -o addr show 2>/dev/null | awk '{print $4}' | sed 's|/.*||' || true)"
+  elif command -v ifconfig >/dev/null 2>&1; then
+    listed="$(ifconfig 2>/dev/null | awk '/inet6? /{a=$2; sub(/^addr:/,"",a); sub(/%.*/,"",a); print a}' || true)"
+  fi
+  if command -v tailscale >/dev/null 2>&1; then
+    listed="$listed
+$(tailscale ip 2>/dev/null || true)"
+  fi
+  # No way to list the addresses: do not second-guess a pin the user set.
+  [ -n "$(printf '%s' "$listed" | tr -d '[:space:]')" ] || return 0
+  printf '%s\n' "$listed" | grep -Fxq -- "$wanted"
+}
+BIND_KIND="auto"
+if [ -n "$PIN_HOST" ]; then
+  BIND_KIND="explicit"
+elif [ "$REBIND" -eq 0 ] && [ -n "$OLD_BIND_KEEP" ]; then
+  # Default decision: an address the previous service already used stays, so a
+  # re-run never moves a Dashboard that something (a loopback consumer, a reverse
+  # proxy, a phone) depends on. Moving it takes --bind <address> or --rebind.
+  old_kind="$(classify_bind "$OLD_BIND_KEEP")"
+  keep_ok=0
+  case "$old_kind" in
+    any|loopback) keep_ok=1; BIND_KIND="$old_kind" ;;
+    address)
+      if { valid_dashboard_address "$OLD_BIND_KEEP" && host_has_address "$OLD_BIND_KEEP"; }; then
+        keep_ok=1; BIND_KIND="kept"
+      fi
+      ;;
+  esac
+  if [ "$keep_ok" -eq 1 ]; then
+    PIN_HOST="$OLD_BIND_KEEP"
+  else
+    OLD_BIND_NOTE="The previous bind ($OLD_BIND_KEEP) is not an address this computer can use now, so the automatic one is chosen."
+  fi
+fi
+
 write_dashboard_runner "$WORK/hermes-dashboard.sh"
 PICKED="$(sh "$WORK/hermes-dashboard.sh" --print-address || true)"
 NETWORK_KIND="${PICKED%% *}"
@@ -1203,14 +1337,30 @@ if [ -z "$BIND_HOST" ]; then
   echo "Nothing was changed, and nothing was opened to the internet." >&2
   exit 1
 fi
-if ! valid_dashboard_address "$BIND_HOST"; then
-  echo "ERROR: the address found ($BIND_HOST) is not a private LAN, Tailscale or unique-local one. Nothing was changed." >&2
-  exit 1
+if [ "$BIND_KIND" = "any" ] || [ "$BIND_KIND" = "loopback" ]; then
+  # Kept from the previous service. The setup reaches it on loopback or, for
+  # 0.0.0.0, on the address a phone would use, when there is one.
+  PROBE_HOST="127.0.0.1"
+  case "$BIND_HOST" in ::1) PROBE_HOST="[::1]" ;; 127.*) PROBE_HOST="$BIND_HOST" ;; esac
+  if [ "$BIND_KIND" = "any" ]; then
+    _hermes_pin_save="$PIN_HOST"
+    PIN_HOST=""
+    write_dashboard_runner "$WORK/hermes-dashboard-auto.sh"
+    PIN_HOST="$_hermes_pin_save"
+    auto_picked="$(sh "$WORK/hermes-dashboard-auto.sh" --print-address || true)"
+    [ -z "${auto_picked#* }" ] || PROBE_HOST="${auto_picked#* }"
+  fi
+  BASE_HOST="$PROBE_HOST"
+else
+  if ! valid_dashboard_address "$BIND_HOST"; then
+    echo "ERROR: the address found ($BIND_HOST) is not a private LAN, Tailscale or unique-local one. Nothing was changed." >&2
+    exit 1
+  fi
+  case "$BIND_HOST" in
+    *:*) BASE_HOST="[$BIND_HOST]" ;;
+    *) BASE_HOST="$BIND_HOST" ;;
+  esac
 fi
-case "$BIND_HOST" in
-  *:*) BASE_HOST="[$BIND_HOST]" ;;
-  *) BASE_HOST="$BIND_HOST" ;;
-esac
 DASHBOARD_BASE="http://$BASE_HOST:$DASHBOARD_PORT"
 
 # ---- service helpers --------------------------------------------------------
@@ -1835,6 +1985,185 @@ service_failure() {
 }
 
 # ---------------------------------------------------------------------------
+# ---- what is installed now, and what this run would write -------------------
+# Nothing is changed until this block has shown the difference and, when a
+# different service is already installed, someone has agreed to it.
+OLD_RESTART=""
+if [ "$SERVICE_MANAGER" = "systemd" ] && [ -f "$DASH_UNIT" ] && [ ! -L "$DASH_UNIT" ]; then
+  OLD_RESTART="$(sed -n 's/^Restart=//p' "$DASH_UNIT" | head -1 | tr -d '[:space:]')"
+  case "$OLD_RESTART" in
+    no|always|on-success|on-failure|on-abnormal|on-abort|on-watchdog) ;;
+    *) OLD_RESTART="" ;;
+  esac
+fi
+OLD_RESTART_SHOWN="${OLD_RESTART:-(none)}"
+[ -n "$OLD_RESTART" ] || OLD_RESTART="on-failure"
+UNIT_STAGED=""
+# The unit is rendered into the private working folder first, so it can be compared
+# with what is installed before anything is touched. Restart= keeps the policy of
+# the unit already installed (always stays always); a new unit gets on-failure.
+render_systemd_unit() {
+  mkdir -p "$WORK/unit"
+  UNIT_STAGED="$WORK/unit/hermes-dashboard.service"
+  "$VP" -I - "$UNIT_STAGED" "$DASHBOARD_RUNNER" "$HH" "$OLD_RESTART" <<'PY'
+import pathlib, sys
+
+unit, runner, workdir, restart = sys.argv[1:]
+
+
+def specifiers(value):
+    return value.replace("%", "%%")
+
+
+def exec_argument(value):
+    escaped = specifiers(value).replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + escaped + '"'
+
+
+def directive_path(value):
+    out = []
+    for character in specifiers(value):
+        codepoint = ord(character)
+        if character == "\\":
+            out.append("\\x5c")
+        elif character == " ":
+            out.append("\\x20")
+        elif character == '"':
+            out.append("\\x22")
+        elif codepoint < 0x20 or codepoint == 0x7f:
+            out.append(f"\\x{codepoint:02x}")
+        else:
+            out.append(character)
+    return "".join(out)
+
+
+payload = f"""[Unit]
+Description=Hermes Console dashboard
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+[Service]
+ExecStart={exec_argument(runner)}
+WorkingDirectory={directive_path(workdir)}
+Restart={restart}
+RestartSec=2
+[Install]
+WantedBy=default.target
+"""
+pathlib.Path(unit).write_text(payload, encoding="utf-8")
+PY
+  chmod 644 "$UNIT_STAGED"
+}
+
+BACKUP_TS="$(date '+%Y%m%dT%H%M%S')"
+BACKUPS_MADE=""
+# A backup sits next to the original, with the same permissions, and never
+# overwrites an earlier one.
+backup_file() {
+  src="$1"
+  [ -f "$src" ] || return 0
+  dst="$src.bak-$BACKUP_TS"
+  n=0
+  while [ -e "$dst" ]; do n=$((n + 1)); dst="$src.bak-$BACKUP_TS.$n"; done
+  cp -p "$src" "$dst" || { echo "ERROR: could not back up $src; nothing was replaced." >&2; return 1; }
+  BACKUPS_MADE="$BACKUPS_MADE$src|$dst
+"
+  echo "Backup: $src -> $dst"
+}
+show_restore() {
+  [ -n "$BACKUPS_MADE" ] || return 0
+  echo "To go back to what you had, copy each backup over its original:"
+  printf '%s' "$BACKUPS_MADE" | while IFS='|' read -r orig bak; do
+    [ -z "$orig" ] || echo "  cp -p \"$bak\" \"$orig\""
+  done
+  case "$SERVICE_MANAGER" in
+    systemd) echo "  systemctl --user daemon-reload && systemctl --user restart hermes-dashboard" ;;
+    launchd) echo "  launchctl bootout gui/$(id -u)/$DASH_LABEL; launchctl bootstrap gui/$(id -u) \"$DASH_PLIST\"" ;;
+  esac
+}
+
+step "Looking at the Dashboard service that is installed now"
+[ "$SERVICE_MANAGER" != "systemd" ] || render_systemd_unit
+RUNNER_EXISTS=0; UNIT_EXISTS=0
+RUNNER_DIFFERS=0; UNIT_DIFFERS=0
+[ ! -f "$DASHBOARD_RUNNER" ] || RUNNER_EXISTS=1
+[ "$SERVICE_MANAGER" != "systemd" ] || [ ! -f "$DASH_UNIT" ] || UNIT_EXISTS=1
+if [ "$RUNNER_EXISTS" -eq 1 ] && ! cmp -s "$DASHBOARD_RUNNER" "$WORK/hermes-dashboard.sh"; then RUNNER_DIFFERS=1; fi
+if [ "$UNIT_EXISTS" -eq 1 ] && ! cmp -s "$DASH_UNIT" "$UNIT_STAGED"; then UNIT_DIFFERS=1; fi
+UP_TO_DATE=0
+if [ "$SERVICE_MANAGER" = "systemd" ] && [ "$RUNNER_EXISTS" -eq 1 ] && [ "$UNIT_EXISTS" -eq 1 ] && \
+   [ "$RUNNER_DIFFERS" -eq 0 ] && [ "$UNIT_DIFFERS" -eq 0 ]; then
+  UP_TO_DATE=1
+fi
+EXISTING=0
+if [ "$RUNNER_EXISTS" -eq 1 ] || [ "$UNIT_EXISTS" -eq 1 ] || { [ "$SERVICE_MANAGER" = "launchd" ] && [ -f "$DASH_PLIST" ]; }; then
+  EXISTING=1
+fi
+CHANGES=0
+if [ "$RUNNER_DIFFERS" -eq 1 ] || [ "$UNIT_DIFFERS" -eq 1 ]; then CHANGES=1; fi
+# Only one of the runner and the unit installed is also a change.
+if [ "$EXISTING" -eq 1 ] && [ "$SERVICE_MANAGER" = "systemd" ] && [ "$UP_TO_DATE" -eq 0 ]; then CHANGES=1; fi
+
+if [ "$EXISTING" -eq 0 ]; then
+  echo "No Dashboard service of this setup is installed here: a new one will be installed."
+else
+  echo "Installed now:  bind $OLD_BIND_DESC"
+  echo "                port ${OLD_RUNNER_PORT:-(unknown)}, Restart= $OLD_RESTART_SHOWN"
+  echo "This run:       bind ${BIND_HOST} ($NETWORK_KIND), port $DASHBOARD_PORT, Restart= $OLD_RESTART"
+  [ -z "$OLD_BIND_NOTE" ] || echo "$OLD_BIND_NOTE"
+  if [ "$UP_TO_DATE" -eq 1 ]; then
+    echo "The service unit and the runner are identical to what this run would write: already up to date."
+  elif [ "$CHANGES" -eq 1 ]; then
+    echo ""
+    echo "A different Dashboard service is installed. This run would change:"
+    if [ "$UNIT_DIFFERS" -eq 1 ]; then
+      diff -u -L "installed: $DASH_UNIT" -L "new" "$DASH_UNIT" "$UNIT_STAGED" || true
+    elif [ "$UNIT_EXISTS" -eq 0 ] && [ "$SERVICE_MANAGER" = "systemd" ]; then
+      echo "(the unit $DASH_UNIT is missing and would be written)"
+    fi
+    if [ "$RUNNER_DIFFERS" -eq 1 ]; then
+      diff -u -L "installed: $DASHBOARD_RUNNER" -L "new" "$DASHBOARD_RUNNER" "$WORK/hermes-dashboard.sh" || true
+    elif [ "$RUNNER_EXISTS" -eq 0 ]; then
+      echo "(the runner $DASHBOARD_RUNNER is missing and would be written)"
+    fi
+    echo ""
+    echo "Backups that would be made first (next to each file, same permissions, suffix .bak-$BACKUP_TS):"
+    [ "$UNIT_DIFFERS" -eq 0 ] || echo "  $DASH_UNIT"
+    [ "$RUNNER_DIFFERS" -eq 0 ] || echo "  $DASHBOARD_RUNNER"
+  fi
+  if [ "$SERVICE_MANAGER" = "launchd" ] && [ -f "$DASH_PLIST" ]; then
+    echo "The launchd job $DASH_PLIST would be backed up (.bak-$BACKUP_TS) and replaced."
+  fi
+fi
+if [ -f "$SERVICES/dashboard-login.json" ]; then
+  echo "$SERVICES/dashboard-login.json would be backed up before it is removed, if this run makes a new sign-in."
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo ""
+  echo "Dry run: nothing was written, restarted or removed."
+  exit 0
+fi
+if [ "$EXISTING" -eq 1 ] && [ "$CHANGES" -eq 1 ]; then
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    echo "--yes given: the installed service will be replaced (backups are kept)."
+  elif [ -t 0 ] && [ "$PASSWORD_STDIN" -eq 0 ]; then
+    printf 'Replace the installed Dashboard service with this one? [y/N] '
+    answer=""
+    read -r answer || answer=""
+    case "$answer" in
+      y|Y|yes|YES|Yes) ;;
+      *) echo "Not confirmed. Nothing was changed." >&2; exit 3 ;;
+    esac
+  else
+    echo "ERROR: a different Dashboard service is already installed (see the difference above)." >&2
+    echo "This run is not interactive, so it will not replace it silently. Nothing was changed." >&2
+    echo "Run it again with --yes (or --force) to replace it; the old files are backed up first." >&2
+    echo "Use --dry-run to only look." >&2
+    exit 3
+  fi
+fi
+
 step "Checking the Dashboard port"
 if port_listening "$DASHBOARD_PORT" && ! dashboard_active; then
   echo "ERROR: TCP $DASHBOARD_PORT is occupied by something that is not this Dashboard service:" >&2
@@ -1895,67 +2224,33 @@ case "$LOGIN_STATE" in
   other) echo "Dashboard sign-in: another provider is configured, kept as it is" ;;
 esac
 
+# Identical files are not rewritten and the service is not restarted, unless this
+# run changed the sign-in (--new-access, or a new one) or the service is not running.
+SKIP_SERVICE_WRITE=0
+if [ "$UP_TO_DATE" -eq 1 ] && [ "$ACTION" = "setup" ] && [ "$LOGIN_STATE" != "created" ] && dashboard_active; then
+  SKIP_SERVICE_WRITE=1
+fi
+
 step "Writing the Dashboard service"
-write_dashboard_runner "$DASHBOARD_RUNNER.new"
-chmod 700 "$DASHBOARD_RUNNER.new"
-mv "$DASHBOARD_RUNNER.new" "$DASHBOARD_RUNNER"
+if [ "$SKIP_SERVICE_WRITE" -eq 1 ]; then
+  echo "Already up to date: the service unit and the runner are identical, so nothing is rewritten or restarted."
+else
+  [ "$RUNNER_DIFFERS" -eq 0 ] || backup_file "$DASHBOARD_RUNNER"
+  [ "$UNIT_DIFFERS" -eq 0 ] || backup_file "$DASH_UNIT"
+  [ "$SERVICE_MANAGER" != "launchd" ] || backup_file "$DASH_PLIST"
+  write_dashboard_runner "$DASHBOARD_RUNNER.new"
+  chmod 700 "$DASHBOARD_RUNNER.new"
+  mv "$DASHBOARD_RUNNER.new" "$DASHBOARD_RUNNER"
+fi
 
 install_systemd_unit() {
-  mkdir -p "$(dirname -- "$DASH_UNIT")" "$WORK/unit"
-  staged="$WORK/unit/hermes-dashboard.service"
-  "$VP" -I - "$staged" "$DASHBOARD_RUNNER" "$HH" <<'PY'
-import pathlib, sys
-
-unit, runner, workdir = sys.argv[1:]
-
-
-def specifiers(value):
-    return value.replace("%", "%%")
-
-
-def exec_argument(value):
-    escaped = specifiers(value).replace("\\", "\\\\").replace('"', '\\"')
-    return '"' + escaped + '"'
-
-
-def directive_path(value):
-    out = []
-    for character in specifiers(value):
-        codepoint = ord(character)
-        if character == "\\":
-            out.append("\\x5c")
-        elif character == " ":
-            out.append("\\x20")
-        elif character == '"':
-            out.append("\\x22")
-        elif codepoint < 0x20 or codepoint == 0x7f:
-            out.append(f"\\x{codepoint:02x}")
-        else:
-            out.append(character)
-    return "".join(out)
-
-
-payload = f"""[Unit]
-Description=Hermes Console dashboard
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=0
-[Service]
-ExecStart={exec_argument(runner)}
-WorkingDirectory={directive_path(workdir)}
-Restart=on-failure
-RestartSec=2
-[Install]
-WantedBy=default.target
-"""
-pathlib.Path(unit).write_text(payload, encoding="utf-8")
-PY
-  chmod 644 "$staged"
-  if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze --user verify "$staged"; then
+  mkdir -p "$(dirname -- "$DASH_UNIT")"
+  # Verified here, once the runner it points at is in place.
+  if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze --user verify "$UNIT_STAGED"; then
     echo "ERROR: systemd did not accept the Dashboard unit (systemd-analyze --user verify, its answer is above)." >&2
     return 1
   fi
-  cp "$staged" "$DASH_UNIT.new"
+  cp "$UNIT_STAGED" "$DASH_UNIT.new"
   mv "$DASH_UNIT.new" "$DASH_UNIT"
 }
 
@@ -1998,6 +2293,7 @@ PY
 }
 
 step "Starting the Dashboard in the background"
+start_dashboard_service() {
 echo "The first start can take a few minutes: Hermes builds its web pages once."
 SERVICE_LIFECYCLE_TOUCHED=1
 case "$SERVICE_MANAGER" in
@@ -2026,6 +2322,12 @@ case "$SERVICE_MANAGER" in
     echo "The Dashboard works in this session but will not survive a reboot until a startup manager is configured."
     ;;
 esac
+}
+if [ "$SKIP_SERVICE_WRITE" -eq 1 ]; then
+  echo "Left running as it is."
+else
+  start_dashboard_service
+fi
 
 # The first start of a freshly built Hermes on a cold machine compiles the web UI
 # and can take minutes; a warm restart answers at once. The wait goes on while
@@ -2085,6 +2387,7 @@ DASH_PASSWORD=""
 # The earlier setup kept its Dashboard password in clear in this file. A new
 # sign-in makes that record stale, so it goes with it.
 if [ "$LOGIN_STATE" = "created" ]; then
+  backup_file "$SERVICES/dashboard-login.json"
   rm -f "$SERVICES/dashboard-login.json"
 fi
 
@@ -2208,7 +2511,19 @@ case "$SERVICE_MANAGER" in
   portable) echo "Starts by itself after a restart: no (this system has no service manager)" ;;
   *) echo "Starts by itself after a restart: yes ($SERVICE_MANAGER)" ;;
 esac
-echo "Address: $BIND_HOST ($NETWORK_KIND), the only one the Dashboard listens on."
+echo "Bind: was $OLD_BIND_DESC -> now $BIND_HOST ($NETWORK_KIND), port $DASHBOARD_PORT"
+case "$BIND_KIND" in
+  any) echo "The Dashboard listens on every interface (0.0.0.0), as the previous service did. Pass --rebind to move it to your Tailscale or LAN address only." ;;
+  loopback) echo "The Dashboard listens on loopback only, as the previous service did: a phone cannot reach it. Pass --rebind to use your Tailscale or LAN address." ;;
+  *) echo "Address: $BIND_HOST ($NETWORK_KIND), the only one the Dashboard listens on." ;;
+esac
+if [ -n "$BACKUPS_MADE" ]; then
+  echo ""
+  echo "Backups of what was replaced:"
+  printf '%s' "$BACKUPS_MADE" | while IFS='|' read -r orig bak; do echo "  $bak  (was $orig)"; done
+  show_restore
+  echo ""
+fi
 case "$NETWORK_KIND" in
   mesh) echo "Only devices signed in to your Tailscale can reach it: the phone needs Tailscale too." ;;
   *) echo "The phone must be on this same network. Reserve this address for the computer in your router so it does not change." ;;
